@@ -8,20 +8,28 @@ use std::{
 
 use anyhow::Result;
 use gpui::{
-    App, AppContext, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
+    Anchor, App, AppContext, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter,
+    TextStyle,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
-    actions, uniform_list,
+    AnyWindowHandle, SharedString, TitlebarOptions, WindowBounds, WindowOptions, actions, px, size,
+    uniform_list,
 };
+use editor::{Editor, EditorElement, EditorStyle, actions as editor_actions};
 use project::{Project, ProjectPath};
 use regex::Regex;
 use serde_json::Value;
-use ui::{Label, LabelSize, ListItem, Tooltip, prelude::*};
+use ui::{
+    Button, ContextMenu, IconButtonShape, Label, LabelSize, ListItem, PopoverMenu, Tooltip,
+    prelude::*,
+};
+use settings::Settings as _;
 use util::ResultExt as _;
-use workspace::dock::{DockPosition, PanelEvent};
-use workspace::{OpenOptions, Panel, Workspace};
 
-actions!(php_panel, [ToggleFocus]);
+use workspace::dock::{DockPosition, PanelEvent};
+use workspace::{OpenOptions, Panel, StatusItemView, Workspace};
+
+actions!(php_panel, [ToggleFocus, OpenDeploymentDialog, BrowseRemoteHost]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PanelTab {
@@ -60,8 +68,12 @@ struct RemoteServer {
     name: String,
     protocol: Option<String>,
     host: Option<String>,
+    port: Option<String>,
     user: Option<String>,
     remote_root: Option<String>,
+    local_root: Option<String>,
+    web_url: Option<String>,
+    excluded: Vec<String>,
     upload_on_save: bool,
     root: PathBuf,
 }
@@ -90,7 +102,6 @@ struct DatabaseEntry {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FormKind {
-    Server,
     Database,
     Sql,
 }
@@ -114,15 +125,6 @@ enum FormKeyOutcome {
 impl FormState {
     fn new(kind: FormKind) -> Self {
         let fields = match kind {
-            FormKind::Server => vec![
-                String::new(),
-                "local".to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                ".".to_string(),
-            ],
             FormKind::Database => vec![
                 String::new(),
                 "sqlite".to_string(),
@@ -153,15 +155,6 @@ impl FormState {
 
     fn labels(&self) -> &'static [&'static str] {
         match self.kind {
-            FormKind::Server => &[
-                "name",
-                "protocol",
-                "host",
-                "port",
-                "user",
-                "remote_root",
-                "local_root",
-            ],
             FormKind::Database => &["name", "driver", "target", "user", "database"],
             FormKind::Sql => &["sql"],
         }
@@ -209,6 +202,1020 @@ impl FormState {
         FormKeyOutcome::Continue
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeployTab {
+    Connection,
+    Mappings,
+    Excluded,
+}
+
+impl DeployTab {
+    fn label(self) -> &'static str {
+        match self {
+            DeployTab::Connection => "Connection",
+            DeployTab::Mappings => "Mappings",
+            DeployTab::Excluded => "Excluded Paths",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct DialogBuffer {
+    name: String,
+    host: String,
+    port: String,
+    user: String,
+    remote_root: String,
+    local_root: String,
+    web_url: String,
+    excluded: String,
+}
+
+impl DialogBuffer {
+    fn load(server: Option<&RemoteServer>) -> Self {
+        match server {
+            Some(server) => Self {
+                name: server.name.clone(),
+                host: server.host.clone().unwrap_or_default(),
+                port: server.port.clone().unwrap_or_default(),
+                user: server.user.clone().unwrap_or_default(),
+                remote_root: server.remote_root.clone().unwrap_or_default(),
+                local_root: server.local_root.clone().unwrap_or_default(),
+                web_url: server.web_url.clone().unwrap_or_default(),
+                excluded: excluded_text(Some(server.excluded.as_slice())),
+            },
+            None => Self::default(),
+        }
+    }
+
+    fn connection_fields(&self, protocol: &str) -> Vec<String> {
+        vec![
+            self.name.clone(),
+            protocol.to_string(),
+            self.host.clone(),
+            self.port.clone(),
+            self.user.clone(),
+            self.remote_root.clone(),
+        ]
+    }
+
+    fn mapping_fields(&self) -> Vec<String> {
+        vec![
+            self.local_root.clone(),
+            self.remote_root.clone(),
+            self.web_url.clone(),
+        ]
+    }
+
+    fn apply(&mut self, server: &mut RemoteServer, protocol: &str) {
+        apply_connection_fields(server, &self.connection_fields(protocol));
+        apply_mapping_fields(server, &self.mapping_fields());
+        apply_excluded_field(server, &[self.excluded.clone()]);
+    }
+}
+
+fn dialog_add_server(servers: &mut Vec<RemoteServer>, root: &Path, next_number: &mut usize) {
+    let label = *next_number;
+    *next_number += 1;
+    let mut blank = blank_server(root.to_path_buf());
+    blank.name = format!("server{label}");
+    servers.push(blank);
+}
+
+
+pub struct DeployDialogWindow(pub Option<AnyWindowHandle>);
+
+impl gpui::Global for DeployDialogWindow {}
+pub struct DeploymentDialog {
+    root: PathBuf,
+    servers: Vec<RemoteServer>,
+    selected: Option<usize>,
+    tab: DeployTab,
+    protocol: String,
+    next_number: usize,
+    message: Option<(String, Color)>,
+    panel: Option<WeakEntity<PhpPanel>>,
+    name_editor: Entity<Editor>,
+    host_editor: Entity<Editor>,
+    port_editor: Entity<Editor>,
+    user_editor: Entity<Editor>,
+    remote_root_editor: Entity<Editor>,
+    local_root_editor: Entity<Editor>,
+    web_url_editor: Entity<Editor>,
+    excluded_editor: Entity<Editor>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Focusable for DeploymentDialog {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.name_editor.focus_handle(cx)
+    }
+}
+
+impl DeploymentDialog {
+    fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut dialog = Self {
+            root,
+            servers: Vec::new(),
+            selected: None,
+            tab: DeployTab::Connection,
+            protocol: "local".to_string(),
+            next_number: 1,
+            message: None,
+            panel: None,
+            name_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            host_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            port_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            user_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            remote_root_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            local_root_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            web_url_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            excluded_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            _subscriptions: Vec::new(),
+        };
+        dialog.seed_from_disk(window, cx);
+        dialog
+    }
+
+    fn seed_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.servers = load_deploy_servers(&self.root);
+        let names = self
+            .servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        let config = read_json(&self.root.join(".zed/deploy.json"));
+        let configured_active = config
+            .as_ref()
+            .and_then(|config| config.get("active"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let configured_default = config
+            .as_ref()
+            .and_then(|config| config.get("default"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.selected = resolve_active_server(configured_active, configured_default, &names)
+            .and_then(|name| self.servers.iter().position(|server| server.name == name))
+            .or(if self.servers.is_empty() { None } else { Some(0) });
+        if cx.has_global::<DeployShared>() {
+            self.panel = cx.global::<DeployShared>().panel.clone();
+        }
+        self.update_next_number();
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn resume_with_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.root = root;
+        self.tab = DeployTab::Connection;
+        self.message = None;
+        self.seed_from_disk(window, cx);
+    }
+
+    fn update_next_number(&mut self) {
+        self.next_number = dialog_next_number(&self.servers);
+    }
+
+    fn load_editors(&mut self, window: &mut Window, cx: &mut App) {
+        let buffer = DialogBuffer::load(self.selected.and_then(|index| self.servers.get(index)));
+        self.protocol = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .and_then(|server| server.protocol.clone())
+            .filter(|protocol| !protocol.is_empty())
+            .unwrap_or_else(|| "local".to_string());
+        let mut set = |editor: &Entity<Editor>, value: String| {
+            editor.update(cx, |editor, cx| editor.set_text(value, window, cx));
+        };
+        set(&self.name_editor, buffer.name.clone());
+        set(&self.host_editor, buffer.host.clone());
+        set(&self.port_editor, buffer.port.clone());
+        set(&self.user_editor, buffer.user.clone());
+        set(&self.remote_root_editor, buffer.remote_root.clone());
+        set(&self.local_root_editor, buffer.local_root.clone());
+        set(&self.web_url_editor, buffer.web_url.clone());
+        set(&self.excluded_editor, buffer.excluded.clone());
+    }
+
+    fn buffer(&self, cx: &App) -> DialogBuffer {
+        let text = |editor: &Entity<Editor>| editor.read(cx).text(cx);
+        DialogBuffer {
+            name: text(&self.name_editor),
+            host: text(&self.host_editor),
+            port: text(&self.port_editor),
+            user: text(&self.user_editor),
+            remote_root: text(&self.remote_root_editor),
+            local_root: text(&self.local_root_editor),
+            web_url: text(&self.web_url_editor),
+            excluded: text(&self.excluded_editor),
+        }
+    }
+
+    fn apply_editors(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let protocol = self.protocol.clone();
+        let mut buffer = self.buffer(cx);
+        if let Some(server) = self.servers.get_mut(index) {
+            buffer.apply(server, &protocol);
+        }
+        self.update_next_number();
+    }
+
+    fn select_server(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected == Some(index) {
+            return;
+        }
+        self.apply_editors(cx);
+        self.selected = Some(index);
+        self.tab = DeployTab::Connection;
+        self.message = None;
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn select_tab(&mut self, tab: DeployTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
+        self.apply_editors(cx);
+        self.tab = tab;
+        self.message = None;
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn add_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        dialog_add_server(&mut self.servers, &self.root, &mut self.next_number);
+        self.selected = Some(self.servers.len() - 1);
+        self.tab = DeployTab::Connection;
+        self.message = None;
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn remove_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else {
+            self.message = Some(("no server selected".to_string(), Color::Error));
+            cx.notify();
+            return;
+        };
+        self.servers.remove(index);
+        self.selected = if self.servers.is_empty() {
+            None
+        } else {
+            Some(index.min(self.servers.len() - 1))
+        };
+        self.tab = DeployTab::Connection;
+        self.message = None;
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_protocol(&mut self, cx: &mut Context<Self>) {
+        self.protocol = if self.protocol == "local" {
+            "sftp".to_string()
+        } else {
+            "local".to_string()
+        };
+        cx.notify();
+    }
+
+    fn test_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected else {
+            self.message = Some(("no server selected".to_string(), Color::Error));
+            cx.notify();
+            return;
+        };
+        self.apply_editors(cx);
+        let Some(server) = self.servers.get(selected).cloned() else {
+            return;
+        };
+        let content = serde_json::json!({
+            "servers": [deploy_server_entry(&server)],
+            "active": server.name,
+        });
+        let test_path = self.root.join(".zed/deploy.test.json");
+        if let Err(error) = std::fs::create_dir_all(test_path.parent().expect("test config parent"))
+            .and_then(|_| {
+                std::fs::write(
+                    &test_path,
+                    serde_json::to_string(&content).expect("serialize test config"),
+                )
+            })
+        {
+            self.message = Some((format!("cannot write test config: {error}"), Color::Error));
+            cx.notify();
+            return;
+        }
+        self.message = Some(("testing...".to_string(), Color::Muted));
+        cx.notify();
+
+        let root = self.root.clone();
+        let name = server.name.clone();
+        let weak = cx.weak_entity();
+        let task = cx.background_spawn(async move {
+            let mut command = util::command::new_command("php-deploy");
+            command
+                .arg("ls")
+                .arg("--config")
+                .arg(&test_path)
+                .arg("--server")
+                .arg(&name)
+                .arg("--path")
+                .arg(".")
+                .arg("--json")
+                .current_dir(&root);
+            command_result(command.output().await, "connection failed")
+        });
+
+        cx.spawn(async move |_, cx| {
+            let result = task.await;
+            weak.update(cx, |dialog, cx| {
+                dialog.message = Some(match result {
+                    Ok(()) => ("connection ok".to_string(), Color::Success),
+                    Err(message) => (format!("connection failed - {message}"), Color::Error),
+                });
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        if self.servers.is_empty() {
+            self.message = Some(("no servers to save".to_string(), Color::Error));
+            cx.notify();
+            return;
+        }
+        if let Some(problem) = validate_staged_servers(&self.servers) {
+            self.message = Some((problem, Color::Error));
+            cx.notify();
+            return;
+        }
+        let names = self
+            .servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        let configured = read_json(&self.root.join(".zed/deploy.json"))
+            .and_then(|config| {
+                config
+                    .get("active")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let active = configured
+            .filter(|name| names.iter().any(|known| known == name))
+            .or_else(|| names.first().cloned());
+        let servers = self.servers.clone();
+        let root = self.root.clone();
+        if let Err(message) = save_deploy_config(&root, &servers, active.as_deref()) {
+            self.message = Some((message, Color::Error));
+            cx.notify();
+            return;
+        }
+        self.refresh_shared(cx);
+        if let Some(panel) = self.panel.clone() {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.reload_remote(cx);
+                    panel.saved_message = Some("deployment updated".to_string());
+                })
+                .log_err();
+        }
+        self.close(window, cx);
+    }
+
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close(window, cx);
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cx.has_global::<DeployDialogWindow>() {
+            cx.global_mut::<DeployDialogWindow>().0 = None;
+        }
+        window.remove_window();
+        cx.notify();
+    }
+
+    fn refresh_shared(&mut self, cx: &mut App) {
+        let names = self
+            .servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        let active = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.name.clone())
+            .or_else(|| names.first().cloned());
+        let panel = self.panel.clone();
+        cx.set_global(DeployShared {
+            servers: names,
+            active,
+            panel,
+            root: Some(self.root.clone()),
+        });
+    }
+}
+
+fn dialog_text_style(cx: &App) -> TextStyle {
+    let settings = theme_settings::ThemeSettings::get_global(cx);
+    let font = settings.ui_font.clone();
+    TextStyle {
+        color: cx.theme().colors().text,
+        font_family: font.family.clone(),
+        font_features: font.features.clone(),
+        font_fallbacks: font.fallbacks.clone(),
+        font_size: rems(0.75).into(),
+        font_weight: font.weight,
+        line_height: relative(1.3),
+        ..TextStyle::default()
+    }
+}
+
+fn dialog_editor_element(editor: &Entity<Editor>, cx: &App) -> AnyElement {
+    let style = EditorStyle {
+        background: cx.theme().colors().editor_background,
+        local_player: cx.theme().players().local(),
+        text: dialog_text_style(cx),
+        ..EditorStyle::default()
+    };
+    EditorElement::new(editor, style).into_any_element()
+}
+
+fn dialog_editor_box(
+    id: &'static str,
+    editor: &Entity<Editor>,
+    width: Option<Pixels>,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let mut box_div = div()
+        .id(id)
+        .flex_1()
+        .min_w_0()
+        .bg(colors.editor_background)
+        .border_1()
+        .border_color(colors.border_variant)
+        .rounded_sm()
+        .px_1()
+        .py_0p5()
+        .cursor_text()
+        .child(dialog_editor_element(editor, cx));
+    if let Some(width) = width {
+        box_div = box_div.flex_none().w(width);
+    }
+    box_div.into_any_element()
+}
+
+fn dialog_field(
+    id: &'static str,
+    label: &'static str,
+    editor: &Entity<Editor>,
+    width: Option<Pixels>,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .py_1()
+        .child(
+            div()
+                .flex_none()
+                .w(px(90.))
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        )
+        .child(dialog_editor_box(id, editor, width, cx))
+        .into_any_element()
+}
+
+impl Render for DeploymentDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let protocol = self.protocol.clone();
+        let message = self.message.clone();
+
+        let mut server_rows = Vec::new();
+        for (index, server) in self.servers.iter().enumerate() {
+            let is_selected = self.selected == Some(index);
+            let badge = server
+                .protocol
+                .clone()
+                .unwrap_or_else(|| "server".to_string());
+            server_rows.push(
+                h_flex()
+                    .id(("deploy-server-row", index))
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_selected, |this| this.bg(colors.element_selected))
+                    .hover(|style| style.bg(colors.element_hover))
+                    .child(
+                        Label::new(badge)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .flex_none(),
+                    )
+                    .child(
+                        Label::new(server.name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(if is_selected {
+                                Color::Accent
+                            } else {
+                                Color::Default
+                            })
+                            .truncate(),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select_server(index, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if server_rows.is_empty() {
+            server_rows.push(
+                h_flex()
+                    .px_1()
+                    .py_0p5()
+                    .child(
+                        Label::new("no servers")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let mut tab_rows = Vec::new();
+        for tab in [DeployTab::Connection, DeployTab::Mappings, DeployTab::Excluded] {
+            let selected = tab == self.tab;
+            tab_rows.push(
+                h_flex()
+                    .id(("deploy-tab", tab as usize))
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(selected, |this| {
+                        this.border_b_2().border_color(colors.border_focused)
+                    })
+                    .child(
+                        Label::new(tab.label())
+                            .size(LabelSize::Small)
+                            .color(if selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select_tab(tab, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let type_button = Button::new("deploy-type", self.protocol.clone())
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::XSmall)
+            .style(ButtonStyle::Subtle)
+            .end_icon(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_protocol(cx);
+            }))
+            .into_any_element();
+
+        let test_button = Button::new("deploy-test", "Test Connection")
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::XSmall)
+            .style(ButtonStyle::Subtle)
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.test_connection(cx);
+            }));
+
+        let test_row = match message.as_ref().filter(|_| self.tab == DeployTab::Connection) {
+            Some((text, color)) => h_flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .py_1()
+                .child(test_button)
+                .child(
+                    Label::new(text.clone())
+                        .size(LabelSize::XSmall)
+                        .color(*color)
+                        .flex_1()
+                        .truncate(),
+                )
+                .into_any_element(),
+            None => h_flex()
+                .flex_none()
+                .items_center()
+                .px_1()
+                .py_1()
+                .child(test_button)
+                .into_any_element(),
+        };
+
+        let tab_content: AnyElement = match self.tab {
+            DeployTab::Connection => v_flex()
+                .id("deploy-tab-connection")
+                .w_full()
+                .children(vec![
+                    dialog_field(
+                        "deploy-name-editor",
+                        "Name:",
+                        &self.name_editor,
+                        None,
+                        cx,
+                    ),
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div().flex_none().w(px(90.)).child(
+                                Label::new("Type:")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .child(type_button)
+                        .into_any_element(),
+                    dialog_field(
+                        "deploy-host-editor",
+                        "Host:",
+                        &self.host_editor,
+                        None,
+                        cx,
+                    ),
+                    dialog_field(
+                        "deploy-port-editor",
+                        "Port:",
+                        &self.port_editor,
+                        Some(px(60.)),
+                        cx,
+                    ),
+                    dialog_field(
+                        "deploy-user-editor",
+                        "Username:",
+                        &self.user_editor,
+                        None,
+                        cx,
+                    ),
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .px_1()
+                        .child(
+                            Label::new("password saved permanently")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                    test_row,
+                    dialog_field(
+                        "deploy-root-editor",
+                        "Root path:",
+                        &self.remote_root_editor,
+                        None,
+                        cx,
+                    ),
+                    dialog_field(
+                        "deploy-url-editor",
+                        "Web server URL:",
+                        &self.web_url_editor,
+                        None,
+                        cx,
+                    ),
+                ])
+                .into_any_element(),
+            DeployTab::Mappings => v_flex()
+                .id("deploy-tab-mappings")
+                .w_full()
+                .children(vec![
+                    dialog_field(
+                        "deploy-local-root-editor",
+                        "Local path:",
+                        &self.local_root_editor,
+                        None,
+                        cx,
+                    ),
+                    dialog_field(
+                        "deploy-deploy-path-editor",
+                        "Deployment path:",
+                        &self.remote_root_editor,
+                        None,
+                        cx,
+                    ),
+                    dialog_field(
+                        "deploy-web-path-editor",
+                        "Web path:",
+                        &self.web_url_editor,
+                        None,
+                        cx,
+                    ),
+                ])
+                .into_any_element(),
+            DeployTab::Excluded => v_flex()
+                .id("deploy-tab-excluded")
+                .w_full()
+                .gap_1()
+                .child(
+                    Label::new("excluded paths, comma separated")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(dialog_editor_box(
+                    "deploy-excluded-editor",
+                    &self.excluded_editor,
+                    None,
+                    cx,
+                ))
+                .into_any_element(),
+        };
+
+        let message_line: Option<AnyElement> = message.as_ref().map(|(text, color)| {
+            h_flex()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .child(
+                    Label::new(text.clone())
+                        .size(LabelSize::XSmall)
+                        .color(*color)
+                        .truncate(),
+                )
+                .into_any_element()
+        });
+
+        v_flex()
+            .id("deploy-dialog")
+            .size_full()
+            .bg(colors.background)
+            .text_ui(cx)
+            .on_action(cx.listener(|this, _: &editor_actions::Cancel, window, cx| {
+                this.cancel(window, cx);
+            }))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        Label::new("Deployment")
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        IconButton::new("deploy-dialog-close", IconName::Close)
+                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.cancel(window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .border_t_1()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(
+                        v_flex()
+                            .w(px(150.))
+                            .flex_none()
+                            .h_full()
+                            .border_r_1()
+                            .border_color(colors.border)
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap_0p5()
+                                    .px_1()
+                                    .py_1()
+                                    .child(
+                                        IconButton::new("deploy-add", IconName::Plus)
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::XSmall)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.add_server(window, cx);
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        IconButton::new("deploy-remove", IconName::SquareMinus)
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::XSmall)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.remove_server(window, cx);
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("deploy-server-list")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .children(server_rows),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .px_2()
+                                    .border_b_1()
+                                    .border_color(colors.border)
+                                    .children(tab_rows),
+                            )
+                            .child(
+                                div()
+                                    .id("deploy-tab-content")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .p_2()
+                                    .child(tab_content),
+                            ),
+                    ),
+            )
+            .children(message_line)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        Button::new("deploy-cancel", "Cancel")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.cancel(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("deploy-ok", "OK")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.confirm(window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
+fn load_deploy_servers(root: &Path) -> Vec<RemoteServer> {
+    let Some(config) = read_json(&root.join(".zed/deploy.json")) else {
+        return Vec::new();
+    };
+    let Some(servers) = config.get("servers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter_map(|server| parse_deploy_server(server, root))
+        .collect()
+}
+
+pub fn open_deployment_window(root: PathBuf, cx: &mut App) {
+    let config = read_json(&root.join(".zed/deploy.json"));
+    let names = load_deploy_servers(&root)
+        .iter()
+        .map(|server| server.name.clone())
+        .collect::<Vec<_>>();
+    let configured_active = config
+        .as_ref()
+        .and_then(|config| config.get("active"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let configured_default = config
+        .as_ref()
+        .and_then(|config| config.get("default"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let panel = if cx.has_global::<DeployShared>() {
+        cx.global::<DeployShared>().panel.clone()
+    } else {
+        None
+    };
+    cx.set_global(DeployShared {
+        servers: names.clone(),
+        active: resolve_active_server(configured_active, configured_default, &names),
+        panel,
+        root: Some(root.clone()),
+    });
+
+    if !cx.has_global::<DeployDialogWindow>() {
+        cx.set_global(DeployDialogWindow(None));
+    }
+    let existing = cx.global::<DeployDialogWindow>().0;
+    if let Some(handle) = existing.and_then(|any| any.downcast::<DeploymentDialog>()) {
+        let resumed = handle.update(cx, |dialog, window, cx| {
+            dialog.resume_with_root(root.clone(), window, cx);
+            window.activate_window();
+            cx.notify();
+        });
+        if resumed.is_ok() {
+            return;
+        }
+        cx.global_mut::<DeployDialogWindow>().0 = None;
+    }
+
+    let window_bounds = WindowBounds::centered(size(px(660.), px(460.)), cx);
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from("Deployment")),
+                    ..Default::default()
+                }),
+                window_bounds: Some(window_bounds),
+                ..Default::default()
+            },
+            |window, cx| {
+                window.set_window_title("Deployment");
+                let view = cx.new(|cx| DeploymentDialog::new(root.clone(), window, cx));
+                window.activate_window();
+                view.focus_handle(cx).focus(window, cx);
+                view
+            },
+        )
+        .log_err();
+    if let Some(handle) = handle {
+        cx.global_mut::<DeployDialogWindow>().0 = Some(handle.into());
+    }
+}
+
+fn dialog_next_number(servers: &[RemoteServer]) -> usize {
+    let mut next = 1;
+    for server in servers {
+        if let Some(suffix) = server.name.strip_prefix("server") {
+            if let Ok(number) = suffix.parse::<usize>() {
+                next = next.max(number + 1);
+            }
+        }
+    }
+    next
+}
+
+pub struct DeployShared {
+    pub servers: Vec<String>,
+    pub active: Option<String>,
+    pub panel: Option<WeakEntity<PhpPanel>>,
+    pub root: Option<PathBuf>,
+}
+
+impl gpui::Global for DeployShared {}
 
 const SERVER_PROTOCOLS: [&str; 2] = ["local", "sftp"];
 const DATABASE_DRIVERS: [&str; 8] = [
@@ -396,6 +1403,7 @@ fn scan_symbols(path: &Path, file: &ProjectPath) -> Vec<Symbol> {
     symbols
 }
 
+#[derive(Clone)]
 enum SyncStatus {
     Syncing,
     Ok,
@@ -815,6 +1823,7 @@ pub struct PhpPanel {
     test_run: Option<TestRunState>,
     test_active_file: Option<String>,
     form: Option<FormState>,
+    server_menu_open: bool,
     saved_message: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -825,6 +1834,37 @@ impl PhpPanel {
             workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
                 workspace.toggle_panel_focus::<PhpPanel>(window, cx);
             });
+            workspace.register_action(|workspace, _: &OpenDeploymentDialog, _, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+                open_deployment_window(root, cx);
+            });
+            workspace.register_action(
+                |workspace, _: &BrowseRemoteHost, window, cx| {
+                    if cx.has_global::<DeployShared>() {
+                        if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                            panel
+                                .update(cx, |panel, cx| panel.select_tab(PanelTab::Remote, cx))
+                                .ok();
+                        }
+                    }
+                    workspace.toggle_panel_focus::<PhpPanel>(window, cx);
+                },
+            );
         })
         .detach();
     }
@@ -833,11 +1873,11 @@ impl PhpPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
-        workspace.update_in(&mut cx, |workspace, _window, cx| {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
             let project = workspace.project().clone();
             let workspace_handle = cx.entity().downgrade();
 
-            cx.new(|cx| {
+            let panel = cx.new(|cx| {
                 let focus_handle = cx.focus_handle();
                 let subscription = cx.subscribe(&project, |_: &mut Self, _, event, cx| {
                     if matches!(
@@ -884,14 +1924,20 @@ impl PhpPanel {
                     test_run: None,
                     test_active_file: None,
                     form: None,
+                    server_menu_open: false,
                     saved_message: None,
                     _subscriptions: vec![subscription],
                 }
-            })
+            });
+            let indicator = cx.new(|cx| DeployServerIndicator::new(cx));
+            workspace.status_bar().update(cx, |status_bar, cx| {
+                status_bar.add_right_item(indicator, window, cx);
+            });
+            panel
         })
     }
 
-    fn refresh(&mut self, cx: &App) {
+    fn refresh(&mut self, cx: &mut Context<Self>) {
         let project = self.project.read(cx);
         let mut files = Vec::new();
         let mut http_requests = Vec::new();
@@ -948,21 +1994,9 @@ impl PhpPanel {
             if let Some(config) = read_json(&root.join(".zed/deploy.json")) {
                 if let Some(servers) = config.get("servers").and_then(Value::as_array) {
                     for server in servers {
-                        let Some(name) = string_field(server, "name") else {
-                            continue;
-                        };
-                        remote_servers.push(RemoteServer {
-                            name,
-                            protocol: string_field(server, "protocol"),
-                            host: string_field(server, "host"),
-                            user: string_field(server, "user"),
-                            remote_root: string_field(server, "remote_root"),
-                            upload_on_save: server
-                                .get("upload_on_save")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                            root: root.clone(),
-                        });
+                        if let Some(parsed) = parse_deploy_server(server, &root) {
+                            remote_servers.push(parsed);
+                        }
                     }
                 }
                 if deploy_config.is_none() {
@@ -1049,6 +2083,13 @@ impl PhpPanel {
             .map(str::to_string);
         self.active_server =
             resolve_active_server(configured_active, configured_default, &names);
+
+        cx.set_global(DeployShared {
+            servers: names.clone(),
+            active: self.active_server.clone(),
+            panel: Some(cx.weak_entity()),
+            root: self.remote_servers.first().map(|server| server.root.clone()),
+        });
     }
 
     fn open_first_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1145,6 +2186,7 @@ impl PhpPanel {
         self.active_tab = tab;
         self.form = None;
         self.saved_message = None;
+        self.server_menu_open = false;
         if tab == PanelTab::Remote {
             self.ensure_remote_selected(cx);
         }
@@ -1176,6 +2218,7 @@ impl PhpPanel {
     fn switch_remote_server(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
         if self.active_server.as_deref() == Some(name.as_str()) {
             self.ensure_remote_selected(cx);
+            self.server_menu_open = false;
             cx.notify();
             return;
         }
@@ -1186,7 +2229,9 @@ impl PhpPanel {
         self.remote_expanded_paths.clear();
         self.remote_current_path.clear();
         self.remote_selected_file = None;
-        let _ = persist_active_server(&root, &name);
+        self.server_menu_open = false;
+        let servers = self.remote_servers.clone();
+        let _ = persist_active_server(&root, &servers, &name);
         self.ensure_remote_selected(cx);
         cx.notify();
     }
@@ -1814,11 +2859,10 @@ impl PhpPanel {
             return;
         }
 
-        let saved = match kind {
-            FormKind::Server => save_server_config(&root, &fields),
-            FormKind::Database => save_database_config(&root, &fields),
-            FormKind::Sql => return,
-        };
+        if kind == FormKind::Sql {
+            return;
+        }
+        let saved = save_database_config(&root, &fields);
 
         match saved {
             Ok(name) => {
@@ -1827,12 +2871,6 @@ impl PhpPanel {
                 self.saved_message = Some("saved".to_string());
                 self.refresh(cx);
                 match kind {
-                    FormKind::Server => {
-                        self.active_server = Some(name.clone());
-                        let _ = persist_active_server(&root, &name);
-                        self.ensure_remote_selected(cx);
-                        self.run_server_check(name, root, cx);
-                    }
                     FormKind::Database => self.run_database_check(name, root, cx),
                     FormKind::Sql => {}
                 }
@@ -1845,6 +2883,119 @@ impl PhpPanel {
                 cx.notify();
             }
         }
+    }
+
+    fn clear_active_server(&mut self, cx: &mut Context<Self>) {
+        self.server_menu_open = false;
+        let servers = self.remote_servers.clone();
+        let root = self.worktree_root(cx);
+        self.remote_entries.clear();
+        self.remote_dir_entries.clear();
+        self.remote_status.clear();
+        self.remote_expanded_paths.clear();
+        self.remote_current_path.clear();
+        self.remote_selected_file = None;
+        if let Some(root) = root {
+            let _ = save_deploy_config(&root, &servers, None);
+        }
+        self.active_server = None;
+        cx.notify();
+    }
+
+    pub fn set_active_server_from_status_bar(
+        &mut self,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(name) = name.as_ref() {
+            let exists = self
+                .remote_servers
+                .iter()
+                .any(|server| &server.name == name);
+            if !exists {
+                self.refresh(cx);
+                // config may have been written before the entry lands; ignore failures
+            }
+        }
+        self.server_menu_open = false;
+        match name {
+            Some(name) => {
+                let root = self
+                    .remote_servers
+                    .iter()
+                    .find(|server| server.name == name)
+                    .map(|server| server.root.clone())
+                    .or_else(|| self.worktree_root(cx));
+                if self.active_server.as_deref() == Some(name.as_str()) {
+                    return;
+                }
+                self.active_server = Some(name.clone());
+                self.remote_entries.clear();
+                self.remote_dir_entries.clear();
+                self.remote_status.clear();
+                self.remote_expanded_paths.clear();
+                self.remote_current_path.clear();
+                self.remote_selected_file = None;
+                if let Some(root) = root {
+                    let servers = self.remote_servers.clone();
+                    let _ = persist_active_server(&root, &servers, &name);
+                }
+                self.ensure_remote_selected(cx);
+            }
+            None => {
+                self.remote_entries.clear();
+                self.remote_dir_entries.clear();
+                self.remote_status.clear();
+                self.remote_expanded_paths.clear();
+                self.remote_current_path.clear();
+                self.remote_selected_file = None;
+                if let Some(root) = self.worktree_root(cx) {
+                    let servers = self.remote_servers.clone();
+                    let _ = save_deploy_config(&root, &servers, None);
+                }
+                self.active_server = None;
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn reload_remote(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.worktree_root(cx) else {
+            return;
+        };
+        let servers = load_deploy_servers(&root);
+        let names = servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        let config = read_json(&root.join(".zed/deploy.json"));
+        let configured_active = config
+            .as_ref()
+            .and_then(|config| config.get("active"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let configured_default = config
+            .as_ref()
+            .and_then(|config| config.get("default"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.remote_servers = servers;
+        self.active_server = resolve_active_server(configured_active, configured_default, &names);
+        self.remote_entries.clear();
+        self.remote_dir_entries.clear();
+        self.remote_status.clear();
+        self.remote_expanded_paths.clear();
+        self.remote_current_path.clear();
+        self.remote_selected_file = None;
+        self.server_menu_open = false;
+        cx.set_global(DeployShared {
+            servers: names.clone(),
+            active: self.active_server.clone(),
+            panel: Some(cx.weak_entity()),
+            root: Some(root),
+        });
+        self.ensure_remote_selected(cx);
+        cx.notify();
     }
 
     fn run_server_check(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
@@ -2169,11 +3320,260 @@ fn resolve_active_server(
         .or_else(|| names.first().cloned())
 }
 
-fn persist_active_server(root: &Path, name: &str) -> std::result::Result<(), String> {
+fn persist_active_server(
+    root: &Path,
+    servers: &[RemoteServer],
+    name: &str,
+) -> std::result::Result<(), String> {
+    save_deploy_config(root, servers, Some(name))
+}
+
+fn deploy_server_entry(server: &RemoteServer) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("name".to_string(), Value::String(server.name.clone()));
+    let protocol = server.protocol.as_deref().unwrap_or_default();
+    if !protocol.is_empty() {
+        entry.insert("protocol".to_string(), Value::String(protocol.to_string()));
+    }
+    let host = server.host.as_deref().unwrap_or_default();
+    if !host.is_empty() {
+        entry.insert("host".to_string(), Value::String(host.to_string()));
+    }
+    if let Some(port) = server.port.as_deref() {
+        if !port.is_empty() {
+            match port.parse::<u16>() {
+                Ok(number) => entry.insert("port".to_string(), Value::from(number)),
+                Err(_) => entry.insert("port".to_string(), Value::String(port.to_string())),
+            };
+        }
+    }
+    let user = server.user.as_deref().unwrap_or_default();
+    if !user.is_empty() {
+        entry.insert("user".to_string(), Value::String(user.to_string()));
+    }
+    if let Some(remote_root) = server.remote_root.as_deref() {
+        if !remote_root.is_empty() {
+            entry.insert(
+                "remote_root".to_string(),
+                Value::String(remote_root.to_string()),
+            );
+        }
+    }
+    if let Some(local_root) = server.local_root.as_deref() {
+        if !local_root.is_empty() {
+            entry.insert(
+                "local_root".to_string(),
+                Value::String(local_root.to_string()),
+            );
+        }
+    }
+    if let Some(web_url) = server.web_url.as_deref() {
+        if !web_url.is_empty() {
+            entry.insert("web_url".to_string(), Value::String(web_url.to_string()));
+        }
+    }
+    entry.insert(
+        "exclude".to_string(),
+        Value::Array(
+            server
+                .excluded
+                .iter()
+                .map(|pattern| Value::String(pattern.clone()))
+                .collect(),
+        ),
+    );
+    if server.upload_on_save {
+        entry.insert("upload_on_save".to_string(), Value::Bool(true));
+    }
+    Value::Object(entry)
+}
+
+fn save_deploy_config(
+    root: &Path,
+    servers: &[RemoteServer],
+    active: Option<&str>,
+) -> std::result::Result<(), String> {
     let path = root.join(".zed/deploy.json");
     let mut config = load_config_object(&path)?;
-    config.insert("active".to_string(), Value::String(name.to_string()));
+    let entries = servers.iter().map(deploy_server_entry).collect::<Vec<_>>();
+    config.insert("servers".to_string(), Value::Array(entries));
+    match active {
+        Some(name) => {
+            config.insert("active".to_string(), Value::String(name.to_string()));
+        }
+        None => {
+            config.remove("active");
+        }
+    }
     write_config_object(&path, &config)
+}
+
+fn parse_deploy_server(server: &Value, root: &Path) -> Option<RemoteServer> {
+    let name = string_field(server, "name")?;
+    Some(RemoteServer {
+        name,
+        protocol: string_field(server, "protocol"),
+        host: string_field(server, "host"),
+        port: port_field(server),
+        user: string_field(server, "user"),
+        remote_root: string_field(server, "remote_root"),
+        local_root: string_field(server, "local_root"),
+        web_url: string_field(server, "web_url"),
+        excluded: excluded_paths(server),
+        upload_on_save: server
+            .get("upload_on_save")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        root: root.to_path_buf(),
+    })
+}
+
+fn port_field(server: &Value) -> Option<String> {
+    match server.get("port") {
+        Some(Value::Number(number)) => Some(number.to_string()),
+        Some(Value::String(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn excluded_paths(server: &Value) -> Vec<String> {
+    for key in ["exclude", "excluded"] {
+        if let Some(Value::Array(patterns)) = server.get(key) {
+            return patterns
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn blank_server(root: PathBuf) -> RemoteServer {
+    RemoteServer {
+        name: String::new(),
+        protocol: Some("local".to_string()),
+        host: None,
+        port: None,
+        user: None,
+        remote_root: None,
+        local_root: None,
+        web_url: None,
+        excluded: Vec::new(),
+        upload_on_save: false,
+        root,
+    }
+}
+
+fn connection_fields(server: Option<&RemoteServer>) -> Vec<String> {
+    match server {
+        Some(server) => vec![
+            server.name.clone(),
+            server.protocol.clone().unwrap_or_default(),
+            server.host.clone().unwrap_or_default(),
+            server.port.clone().unwrap_or_default(),
+            server.user.clone().unwrap_or_default(),
+            server.remote_root.clone().unwrap_or_default(),
+        ],
+        None => vec![String::new(); 6],
+    }
+}
+
+fn mapping_fields(server: Option<&RemoteServer>) -> Vec<String> {
+    match server {
+        Some(server) => vec![
+            server.local_root.clone().unwrap_or_default(),
+            server.remote_root.clone().unwrap_or_default(),
+            server.web_url.clone().unwrap_or_default(),
+        ],
+        None => vec![String::new(); 3],
+    }
+}
+
+fn excluded_text(excluded: Option<&[String]>) -> String {
+    excluded.unwrap_or(&[]).join(", ")
+}
+
+fn parse_excluded(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn apply_connection_fields(server: &mut RemoteServer, fields: &[String]) {
+    let name = form_field(fields, 0);
+    if !name.is_empty() {
+        server.name = name;
+    }
+    let protocol = form_field(fields, 1).to_ascii_lowercase();
+    if protocol.is_empty() {
+        server.protocol = None;
+    } else {
+        server.protocol = Some(protocol);
+    }
+    let host = form_field(fields, 2);
+    server.host = if host.is_empty() { None } else { Some(host) };
+    let port = form_field(fields, 3);
+    server.port = if port.is_empty() { None } else { Some(port) };
+    let user = form_field(fields, 4);
+    server.user = if user.is_empty() { None } else { Some(user) };
+    let remote_root = form_field(fields, 5);
+    server.remote_root = if remote_root.is_empty() {
+        None
+    } else {
+        Some(remote_root)
+    };
+}
+
+fn apply_mapping_fields(server: &mut RemoteServer, fields: &[String]) {
+    let local_root = form_field(fields, 0);
+    server.local_root = if local_root.is_empty() {
+        None
+    } else {
+        Some(local_root)
+    };
+    let remote_root = form_field(fields, 1);
+    server.remote_root = if remote_root.is_empty() {
+        None
+    } else {
+        Some(remote_root)
+    };
+    let web_url = form_field(fields, 2);
+    server.web_url = if web_url.is_empty() { None } else { Some(web_url) };
+}
+
+fn apply_excluded_field(server: &mut RemoteServer, fields: &[String]) {
+    server.excluded =
+        parse_excluded(fields.first().map(String::as_str).unwrap_or_default());
+}
+
+fn validate_staged_servers(servers: &[RemoteServer]) -> Option<String> {
+    for server in servers {
+        if server.name.trim().is_empty() {
+            return Some("server name is required".to_string());
+        }
+        if let Some(protocol) = server.protocol.as_deref() {
+            if !protocol.is_empty() && !SERVER_PROTOCOLS.contains(&protocol) {
+                return Some(format!("\"{}\" protocol must be local or sftp", server.name));
+            }
+        }
+        if let Some(port) = server.port.as_deref() {
+            if !port.is_empty() && port.parse::<u16>().is_err() {
+                return Some(format!("\"{}\" port must be a number", server.name));
+            }
+        }
+    }
+    for (index, server) in servers.iter().enumerate() {
+        if servers[..index]
+            .iter()
+            .any(|other| other.name == server.name)
+        {
+            return Some(format!("duplicate server name \"{}\"", server.name));
+        }
+    }
+    None
 }
 
 fn save_server_config(root: &Path, fields: &[String]) -> std::result::Result<String, String> {
@@ -2727,116 +4127,55 @@ impl Render for PhpPanel {
         let selected_remote = self.current_remote_server().cloned();
         let active_name = self.active_server.clone();
 
-        let configuration_rows = self
-            .remote_servers
-            .iter()
-            .map(|server| {
-                let is_active = active_name.as_deref() == Some(server.name.as_str());
-                let text = format!(
-                    "{} · {} · {} · {}",
-                    server.name,
-                    display_field(&server.protocol),
-                    display_field(&server.host),
-                    display_field(&server.remote_root),
-                );
-                let server_name = server.name.clone();
-                let root = server.root.clone();
-                ListItem::new(format!("remote-config-{}", server.name))
-                    .selectable(true)
-                    .toggle_state(is_active)
-                    .child(
-                        Label::new(text)
-                            .size(LabelSize::XSmall)
-                            .color(if is_active {
-                                Color::Accent
-                            } else {
-                                Color::Default
-                            })
-                            .truncate(),
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                        this.switch_remote_server(server_name.clone(), root.clone(), cx);
-                    }))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-
-        let remote_configurations = v_flex()
-            .id("remote-configurations")
-            .w_full()
-            .flex_none()
-            .max_h(relative(0.3))
-            .overflow_y_scroll()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                h_flex().px_2().py_1().child(
-                    Label::new(format!("Configurations · {}", self.remote_servers.len()))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
+        let picker_servers = self.remote_servers.clone();
+        let picker_active = active_name.clone();
+        let picker = selected_remote.as_ref().map(|server| {
+            (
+                server.protocol.clone().unwrap_or_default(),
+                server.name.clone(),
             )
-            .children(if configuration_rows.is_empty() {
-                vec![empty_row("no servers configured")]
-            } else {
-                configuration_rows
-            });
-
-        let server_chips = self
-            .remote_servers
-            .iter()
-            .map(|server| {
-                let is_active = active_name.as_deref() == Some(server.name.as_str());
-                let server_name = server.name.clone();
-                let root = server.root.clone();
-                h_flex()
-                    .id(format!("remote-chip-{}", server.name))
-                    .flex_none()
-                    .items_center()
-                    .px_1()
-                    .py_0p5()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(is_active, |this| {
-                        this.bg(cx.theme().colors().element_selected)
-                    })
-                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .child(
-                        Label::new(server.name.clone())
-                            .size(LabelSize::XSmall)
-                            .color(if is_active {
-                                Color::Accent
-                            } else {
-                                Color::Muted
-                            }),
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                        this.switch_remote_server(server_name.clone(), root.clone(), cx);
-                    }))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-
-        let remote_bottom_bar = h_flex()
-            .id("remote-bottom-bar")
-            .w_full()
+        });
+        let remote_server_picker = h_flex()
+            .id("remote-server-picker")
             .flex_none()
-            .flex_wrap()
             .items_center()
             .gap_1()
-            .px_2()
-            .py_1()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
+            .px_1()
+            .py_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .max_w_2_3()
+            .when(self.server_menu_open, |this| {
+                this.bg(cx.theme().colors().element_selected)
+            })
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
             .child(
-                Label::new(format!(
-                    "Server: {}",
-                    active_name.as_deref().unwrap_or("none")
-                ))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Label::new(match picker {
+                            Some((protocol, name)) if !protocol.is_empty() => {
+                                format!("{protocol} · {name}")
+                            }
+                            Some((_, name)) => name,
+                            None => "no server".to_string(),
+                        })
+                        .size(LabelSize::XSmall)
+                        .truncate(),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
             )
-            .children(server_chips);
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.server_menu_open = !this.server_menu_open;
+                this.ensure_remote_selected(cx);
+                cx.notify();
+            }));
 
         let refresh_target = selected_remote
             .as_ref()
@@ -2853,12 +4192,16 @@ impl Render for PhpPanel {
             .py_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
+            .child(remote_server_picker)
             .child(
-                h_flex().flex_1().min_w_0().child(
-                    Label::new("Remote")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
+                Button::new("remote-configure", "...")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::XSmall)
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text("Deployment configuration"))
+                    .on_click(cx.listener(|_: &mut Self, _: &ClickEvent, window, cx| {
+                        window.dispatch_action(Box::new(OpenDeploymentDialog), cx);
+                    })),
             )
             .child(
                 Button::new("remote-refresh", "Refresh")
@@ -2883,17 +4226,90 @@ impl Render for PhpPanel {
                             this.sync_server(name, root, cx);
                         }
                     })),
-            )
-            .child(
-                Button::new("remote-add-server", "+")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
-                    .style(ButtonStyle::Subtle)
-                    .tooltip(Tooltip::text("Add server"))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.open_form(FormKind::Server, window, cx);
-                    })),
             );
+
+        let remote_server_menu = if self.server_menu_open {
+            let mut menu_rows = picker_servers
+                .iter()
+                .enumerate()
+                .map(|(index, server)| {
+                    let is_active = picker_active.as_deref() == Some(server.name.as_str());
+                    let server_name = server.name.clone();
+                    let root = server.root.clone();
+                    let badge = server
+                        .protocol
+                        .clone()
+                        .unwrap_or_else(|| "server".to_string());
+                    h_flex()
+                        .id(("remote-server-menu", index))
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_0p5()
+                        .cursor_pointer()
+                        .when(is_active, |this| {
+                            this.bg(cx.theme().colors().element_selected)
+                        })
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .child(
+                            Label::new(badge)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .flex_none(),
+                        )
+                        .child(
+                            Label::new(server.name.clone())
+                                .size(LabelSize::XSmall)
+                                .color(if is_active {
+                                    Color::Accent
+                                } else {
+                                    Color::Default
+                                })
+                                .truncate(),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            this.switch_remote_server(server_name.clone(), root.clone(), cx);
+                        }))
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            menu_rows.push(
+                h_flex()
+                    .id("remote-server-menu-none")
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Label::new("<no default server>")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.clear_active_server(cx);
+                    }))
+                    .into_any_element(),
+            );
+            Some(
+                v_flex()
+                    .id("remote-server-menu")
+                    .w_full()
+                    .flex_none()
+                    .max_h(relative(0.4))
+                    .overflow_y_scroll()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .min_w_0()
+                    .children(menu_rows),
+            )
+        } else {
+            None
+        };
 
         let (remote_status_line, remote_error_line) = if let Some(server) = &selected_remote {
             let host = match (&server.user, &server.host) {
@@ -3019,6 +4435,49 @@ impl Render for PhpPanel {
         let mut remote_rows = Vec::new();
         let mut remote_line = 0usize;
         if let Some(server) = &selected_remote {
+            let host_display = match (&server.user, &server.host) {
+                (Some(user), Some(host)) => format!("{user}@{host}"),
+                (None, Some(host)) => host.clone(),
+                (Some(user), None) => user.clone(),
+                (None, None) => String::new(),
+            };
+            let host_part = if host_display.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({}{})",
+                    host_display,
+                    server
+                        .remote_root
+                        .as_deref()
+                        .map(|root| format!("/{}", root))
+                        .unwrap_or_default()
+                )
+            };
+            remote_rows.push(
+                h_flex()
+                    .id("remote-root-row")
+                    .px_3()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        Label::new("▼")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(server.name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        Label::new(host_part.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .into_any_element(),
+            );
             if let Some(entries) = self.remote_entries.get(&server.name) {
                 self.push_remote_rows(
                     server,
@@ -3616,20 +5075,6 @@ impl Render for PhpPanel {
                 .color(Color::Muted),
             );
 
-        let add_server_row = h_flex()
-            .id("add-server")
-            .px_3()
-            .py_1()
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                this.open_form(FormKind::Server, window, cx);
-            }))
-            .child(
-                Label::new("+ add server")
-                    .size(LabelSize::Small)
-                    .color(Color::Accent),
-            )
-            .into_any_element();
-
         let add_database_row = h_flex()
             .id("add-database")
             .px_3()
@@ -3741,28 +5186,22 @@ impl Render for PhpPanel {
                 )
                 .into_any_element(),
             PanelTab::Remote => v_flex()
+                .id("remote-content")
+                .relative()
                 .flex_1()
                 .min_h_0()
                 .child(remote_toolbar)
-                .child(remote_configurations)
+                .children(remote_server_menu)
                 .child(remote_status)
                 .child(remote_breadcrumb)
-                .when_some(
-                    self.form
-                        .as_ref()
-                        .filter(|form| form.kind == FormKind::Server),
-                    |this, form| this.child(render_form(form)),
-                )
                 .child(
                     div()
                         .id("php-remote-tree")
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
-                        .children(remote_rows)
-                        .child(add_server_row),
+                        .children(remote_rows),
                 )
-                .child(remote_bottom_bar)
                 .into_any_element(),
             PanelTab::Databases => v_flex()
                 .flex_1()
@@ -3927,7 +5366,6 @@ fn render_tab_bar(active: PanelTab, cx: &Context<PhpPanel>) -> gpui::AnyElement 
 fn render_form(form: &FormState) -> gpui::AnyElement {
     let mut rows = Vec::new();
     let title = match form.kind {
-        FormKind::Server => "new server",
         FormKind::Database => "new database",
         FormKind::Sql => "sql console",
     };
@@ -3988,7 +5426,7 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
 
     let footer = match form.kind {
         FormKind::Sql => "Enter run · Esc cancel",
-        FormKind::Server | FormKind::Database => "Tab next · Enter save · Esc cancel",
+        FormKind::Database => "Tab next · Enter save · Esc cancel",
     };
     rows.push(
         h_flex()
@@ -4030,6 +5468,105 @@ fn empty_row(message: &'static str) -> gpui::AnyElement {
         .into_any_element()
 }
 
+pub struct DeployServerIndicator {
+    _marker: (),
+}
+
+impl DeployServerIndicator {
+    fn new(_cx: &mut gpui::Context<Self>) -> Self {
+        Self { _marker: () }
+    }
+}
+
+impl Render for DeployServerIndicator {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !cx.has_global::<DeployShared>() {
+            return div().into_any_element();
+        }
+        let shared = cx.global::<DeployShared>();
+        if shared.servers.is_empty() {
+            return div().into_any_element();
+        }
+        let active = shared
+            .active
+            .clone()
+            .or_else(|| shared.servers.first().cloned());
+
+        let trigger = Button::new("deploy-server-indicator", active.unwrap_or_else(|| "no server".to_string()))
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::Small)
+            .tooltip(Tooltip::text("Deployment server"));
+
+        PopoverMenu::new("deploy-server-menu")
+            .menu(|window, cx| {
+                let shared = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>()
+                } else {
+                    return None;
+                };
+                let servers = shared.servers.clone();
+                let active = shared.active.clone();
+                let panel = shared.panel.clone();
+                let root = shared.root.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for server in servers.iter() {
+                        let is_active = active.as_deref() == Some(server.as_str());
+                        let server_name = server.clone();
+                        let menu_panel = panel.clone();
+                        let entry = ui::ContextMenuEntry::new(server.clone())
+                            .toggleable(ui::IconPosition::Start, is_active)
+                            .handler(move |_window: &mut Window, cx: &mut App| {
+                                if let Some(panel) =
+                                    menu_panel.clone().and_then(|panel| panel.upgrade())
+                                {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.set_active_server_from_status_bar(
+                                            Some(server_name.clone()),
+                                            cx,
+                                        );
+                                    });
+                                }
+                            });
+                        menu = menu.item(entry);
+                    }
+                    menu = menu.separator();
+                    let clear_panel = panel.clone();
+                    menu = menu.entry("<no default server>", None, move |_window, cx| {
+                        if let Some(panel) = clear_panel.clone().and_then(|panel| panel.upgrade()) {
+                            panel.update(cx, |panel, cx| {
+                                let root = panel.worktree_root(cx);
+                                let servers = panel.remote_servers.clone();
+                                if let Some(root) = root {
+                                    let _ = save_deploy_config(&root, &servers, None);
+                                }
+                                panel.set_active_server_from_status_bar(None, cx);
+                            });
+                        }
+                    });
+                    let _ = root;
+                    menu
+                }))
+            })
+            .anchor(Anchor::BottomRight)
+            .trigger(trigger)
+            .into_any_element()
+    }
+}
+
+impl StatusItemView for DeployServerIndicator {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn workspace::ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _cx: &App) -> Option<workspace::HideStatusItem> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4051,14 +5588,11 @@ mod tests {
 
     #[test]
     fn form_defaults_match_field_labels() {
-        for kind in [FormKind::Server, FormKind::Database, FormKind::Sql] {
+        for kind in [FormKind::Database, FormKind::Sql] {
             let form = FormState::new(kind);
             assert_eq!(form.fields.len(), form.labels().len());
             assert_eq!(form.active, 0);
         }
-        let server = FormState::new(FormKind::Server);
-        assert_eq!(server.fields[1], "local");
-        assert_eq!(server.fields[6], ".");
         let database = FormState::new(FormKind::Database);
         assert_eq!(database.fields[1], "sqlite");
         let sql = FormState::sql("app".to_string());
@@ -4087,53 +5621,35 @@ mod tests {
 
     #[test]
     fn form_key_sequence_matches_typing_model() {
-        let mut form = FormState::new(FormKind::Server);
-        for character in "dev".chars() {
+        let mut database = FormState::new(FormKind::Database);
+        assert_eq!(database.fields.len(), 5);
+
+        for character in "notes".chars() {
             let character = character.to_string();
             assert_eq!(
-                form.handle_key("", Some(&character)),
+                database.handle_key("", Some(&character)),
                 FormKeyOutcome::Continue
             );
         }
-        form.handle_key("tab", None);
-        for _ in 0..5 {
-            form.handle_key("backspace", None);
-        }
-        for character in "local".chars() {
-            let character = character.to_string();
-            form.handle_key("", Some(&character));
-        }
-        for _ in 0..4 {
-            form.handle_key("tab", None);
-        }
-        for character in "/tmp/settings-target".chars() {
-            let character = character.to_string();
-            form.handle_key("", Some(&character));
-        }
+        database.handle_key("space", None);
+        assert_eq!(database.fields[0], "notes ");
+        database.handle_key("tab", None);
+        assert_eq!(database.active, 1);
+        database.handle_key("up", None);
+        assert_eq!(database.active, 0);
+        assert_eq!(database.handle_key("enter", None), FormKeyOutcome::Save);
+        assert_eq!(database.handle_key("escape", None), FormKeyOutcome::Cancel);
 
-        assert_eq!(form.fields[0], "dev");
-        assert_eq!(form.fields[1], "local");
-        assert_eq!(form.fields[5], "/tmp/settings-target");
-        assert_eq!(form.active, 5);
-        assert_eq!(form.handle_key("enter", None), FormKeyOutcome::Save);
-        assert_eq!(form.handle_key("escape", None), FormKeyOutcome::Cancel);
-
-        let mut spaced = FormState::new(FormKind::Server);
-        for character in "my".chars() {
+        let mut sql = FormState::sql("app".to_string());
+        for character in "my query".chars() {
             let character = character.to_string();
-            spaced.handle_key("", Some(&character));
+            sql.handle_key("", Some(&character));
         }
-        spaced.handle_key("space", None);
-        for character in "server".chars() {
-            let character = character.to_string();
-            spaced.handle_key("", Some(&character));
-        }
-        assert_eq!(spaced.fields[0], "my server");
-        spaced.handle_key("up", None);
-        assert_eq!(spaced.active, spaced.fields.len() - 1);
+        assert_eq!(sql.fields[0], "my query");
+        assert_eq!(sql.handle_key("enter", None), FormKeyOutcome::Save);
     }
 
-    #[test]
+#[test]
     fn save_server_creates_config_with_numeric_port() {
         let root = temp_root("server_create");
         let name = save_server_config(
@@ -4232,7 +5748,39 @@ mod tests {
         )
         .expect("seed deploy.json");
 
-        persist_active_server(&root, "sftp").expect("persist active server");
+        persist_active_server(
+            &root,
+            &[
+                RemoteServer {
+                    name: "local".to_string(),
+                    protocol: Some("local".to_string()),
+                    host: None,
+                    port: None,
+                    user: None,
+                    remote_root: Some("remote".to_string()),
+                    local_root: None,
+                    web_url: None,
+                    excluded: Vec::new(),
+                    upload_on_save: false,
+                    root: root.clone(),
+                },
+                RemoteServer {
+                    name: "sftp".to_string(),
+                    protocol: Some("sftp".to_string()),
+                    host: Some("127.0.0.1".to_string()),
+                    port: Some("2222".to_string()),
+                    user: Some("deploy".to_string()),
+                    remote_root: Some("/var/www/app".to_string()),
+                    local_root: Some(".".to_string()),
+                    web_url: None,
+                    excluded: Vec::new(),
+                    upload_on_save: false,
+                    root: root.clone(),
+                },
+            ],
+            "sftp",
+        )
+        .expect("persist active server");
 
         let contents = std::fs::read_to_string(zed.join("deploy.json")).expect("read config");
         assert!(contents.starts_with("{\n  "));
@@ -4361,6 +5909,220 @@ mod tests {
         assert_eq!(result.summary.failed, 1);
         assert_eq!(result.summary.skipped, 1);
         assert_eq!(result.summary.text(), "1 passed · 1 failed · 1 skipped");
+    }
+
+    #[test]
+    fn parse_deploy_server_reads_new_fields() {
+        let root = Path::new("/tmp");
+        let numeric = r#"{"name":"sftp","protocol":"sftp","host":"127.0.0.1","port":2222,"user":"deploy","remote_root":"/var/www/app","local_root":".","web_url":"https://app.test","exclude":["vendor/","node_modules/"],"upload_on_save":true}"#;
+        let value: Value = serde_json::from_str(numeric).expect("parse config");
+        let server = parse_deploy_server(&value, root).expect("parse server");
+        assert_eq!(server.port.as_deref(), Some("2222"));
+        assert_eq!(
+            server.local_root.as_deref(),
+            Some(".")
+        );
+        assert_eq!(server.web_url.as_deref(), Some("https://app.test"));
+        assert_eq!(
+            server.excluded,
+            vec!["vendor/".to_string(), "node_modules/".to_string()]
+        );
+        assert!(server.upload_on_save);
+
+        let string = r#"{"name":"stage","port":"2200"}"#;
+        let value: Value = serde_json::from_str(string).expect("parse config");
+        let server = parse_deploy_server(&value, root).expect("parse server");
+        assert_eq!(server.port.as_deref(), Some("2200"));
+
+        let alias = r#"{"name":"alias","excluded":["vendor/","tmp/"]}"#;
+        let value: Value = serde_json::from_str(alias).expect("parse config");
+        let server = parse_deploy_server(&value, root).expect("parse server");
+        assert_eq!(
+            server.excluded,
+            vec!["vendor/".to_string(), "tmp/".to_string()]
+        );
+    }
+
+    #[test]
+    fn save_deploy_config_round_trips_servers_and_preserves_other_keys() {
+        let root = temp_root("deploy_round_trip");
+        let zed = root.join(".zed");
+        std::fs::create_dir_all(&zed).expect("create .zed");
+        std::fs::write(
+            zed.join("deploy.json"),
+            r#"{
+  "default": "local",
+  "active": "sftp",
+  "extra": {"keep": true},
+  "servers": [
+    {
+      "name": "sftp",
+      "protocol": "sftp",
+      "host": "127.0.0.1",
+      "port": 2222,
+      "user": "deploy",
+      "remote_root": "/var/www/app",
+      "local_root": ".",
+      "web_url": "https://app.test",
+      "exclude": ["vendor/", "node_modules/"]
+    },
+    {
+      "name": "local",
+      "protocol": "local",
+      "local_root": ".",
+      "remote_root": "remote",
+      "exclude": []
+    }
+  ]
+}"#,
+        )
+        .expect("seed deploy.json");
+
+        let first = read_json(&zed.join("deploy.json")).expect("read config");
+        let servers = first["servers"]
+            .as_array()
+            .expect("servers array")
+            .iter()
+            .filter_map(|server| parse_deploy_server(server, &root))
+            .collect::<Vec<_>>();
+
+        save_deploy_config(&root, &servers, Some("sftp")).expect("save config");
+
+        let second = read_json(&zed.join("deploy.json")).expect("read config");
+        let reparsed = second["servers"]
+            .as_array()
+            .expect("servers array")
+            .iter()
+            .filter_map(|server| parse_deploy_server(server, &root))
+            .collect::<Vec<_>>();
+        assert_eq!(reparsed.len(), 2);
+
+        let sftp = reparsed
+            .iter()
+            .find(|server| server.name == "sftp")
+            .expect("sftp preserved");
+        assert_eq!(sftp.protocol.as_deref(), Some("sftp"));
+        assert_eq!(sftp.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(sftp.port.as_deref(), Some("2222"));
+        assert_eq!(sftp.user.as_deref(), Some("deploy"));
+        assert_eq!(sftp.remote_root.as_deref(), Some("/var/www/app"));
+        assert_eq!(sftp.local_root.as_deref(), Some("."));
+        assert_eq!(sftp.web_url.as_deref(), Some("https://app.test"));
+        assert_eq!(
+            sftp.excluded,
+            vec!["vendor/".to_string(), "node_modules/".to_string()]
+        );
+
+        let local = reparsed
+            .iter()
+            .find(|server| server.name == "local")
+            .expect("local preserved");
+        assert_eq!(local.protocol.as_deref(), Some("local"));
+        assert!(local.excluded.is_empty());
+
+        assert_eq!(second["active"], json!("sftp"));
+        assert_eq!(second["default"], json!("local"));
+        assert_eq!(second["extra"], json!({"keep": true}));
+
+        save_deploy_config(&root, &reparsed, None).expect("clear active");
+        let cleared = read_json(&zed.join("deploy.json")).expect("read config");
+        assert!(cleared.get("active").is_none());
+        assert_eq!(cleared["default"], json!("local"));
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn dialog_staging_converts_fields_into_servers() {
+        let root = temp_root("deploy_staging");
+
+        let initial = vec![blank_server(root.clone())];
+        let buffer = DialogBuffer::load(initial.first());
+        assert!(buffer.name.is_empty());
+
+        let mut buffer = DialogBuffer {
+            name: "web1".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "2222".to_string(),
+            user: "deploy".to_string(),
+            remote_root: "/tmp/web1".to_string(),
+            excluded: String::new(),
+            ..DialogBuffer::default()
+        };
+        let mut servers = vec![blank_server(root.clone())];
+        buffer.apply(servers.get_mut(0).expect("server"), "local");
+        let staged = servers.first().cloned().expect("staged server");
+        assert_eq!(staged.name, "web1");
+        assert_eq!(staged.protocol.as_deref(), Some("local"));
+        assert_eq!(staged.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(staged.port.as_deref(), Some("2222"));
+        assert_eq!(staged.user.as_deref(), Some("deploy"));
+        assert_eq!(staged.remote_root.as_deref(), Some("/tmp/web1"));
+        assert!(staged.excluded.is_empty());
+
+        // mapping edits staged afterwards keep the connection fields
+        buffer.local_root = ".".to_string();
+        buffer.web_url = "http://localhost:8000".to_string();
+        buffer.apply(servers.get_mut(0).expect("server"), "local");
+        let staged = servers.first().cloned().expect("staged server");
+        assert_eq!(staged.local_root.as_deref(), Some("."));
+        assert_eq!(staged.remote_root.as_deref(), Some("/tmp/web1"));
+        assert_eq!(staged.web_url.as_deref(), Some("http://localhost:8000"));
+        assert_eq!(staged.protocol.as_deref(), Some("local"));
+
+        // excluded paths staged through the buffer
+        buffer.excluded = "vendor/, dist/".to_string();
+        buffer.apply(servers.get_mut(0).expect("server"), "local");
+        let staged = servers.first().cloned().expect("staged server");
+        assert_eq!(
+            staged.excluded,
+            vec!["vendor/".to_string(), "dist/".to_string()]
+        );
+
+        // + appends a blank local server; - removes it again
+        let mut next_number = dialog_next_number(&servers);
+        dialog_add_server(&mut servers, &root, &mut next_number);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(
+            servers.last().map(|server| server.protocol.clone()),
+            Some(Some("local".to_string()))
+        );
+        servers.remove(1);
+        assert_eq!(servers.len(), 1);
+
+        // round trip: loading a staged server back into a fresh buffer preserves it
+        let mut server = servers.first().cloned().expect("server");
+        let mut reloaded = DialogBuffer::load(Some(&server));
+        reloaded.apply(&mut server, "sftp");
+        assert_eq!(server.name, "web1");
+        assert_eq!(server.port.as_deref(), Some("2222"));
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn excluded_paths_convert_between_text_and_list() {
+        assert_eq!(
+            parse_excluded("vendor/, node_modules/ ,tmp"),
+            vec!["vendor/".to_string(), "node_modules/".to_string(), "tmp".to_string()]
+        );
+        assert_eq!(parse_excluded(""), Vec::<String>::new());
+        assert_eq!(excluded_text(Some(&parse_excluded("a,b"))), "a, b");
+        assert_eq!(excluded_text(None), "");
+
+        let mut server = blank_server(PathBuf::from("/tmp"));
+        server.excluded = vec!["vendor/".to_string()];
+        assert_eq!(
+            excluded_text(Some(server.excluded.as_slice())),
+            "vendor/"
+        );
+        apply_excluded_field(&mut server, &fields(&["src/, dist/"]));
+        assert_eq!(
+            server.excluded,
+            vec!["src/".to_string(), "dist/".to_string()]
+        );
+        apply_excluded_field(&mut server, &fields(&[""]));
+        assert_eq!(server.excluded, Vec::<String>::new());
     }
 
     #[test]

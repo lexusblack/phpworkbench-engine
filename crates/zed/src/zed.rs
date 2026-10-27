@@ -6184,7 +6184,7 @@ mod tests {
             git_ui::init(cx);
             project_panel::init(cx);
             outline_panel::init(cx);
-            php_panel::init(cx);
+            php_panel::PhpPanel::init(cx);
             terminal_view::init(cx);
             let credentials_provider = zed_credentials_provider::global(cx);
             copilot_chat::init(

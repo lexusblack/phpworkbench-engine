@@ -13327,10 +13327,14 @@ name = "php_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "editor",
  "gpui",
  "project",
  "regex",
  "serde_json",
+ "settings",
+ "theme",
+ "theme_settings",
  "ui",
  "util",
  "workspace",
