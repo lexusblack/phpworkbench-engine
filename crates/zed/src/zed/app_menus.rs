@@ -3,6 +3,7 @@ use gpui::{App, Menu, MenuItem, OsAction};
 use project::DisableAiSettings;
 use release_channel::ReleaseChannel;
 use settings::Settings;
+use php_panel;
 use terminal_view::terminal_panel;
 use zed_actions::{Quit, assistant, debug_panel, dev, git_panel, project_panel};
 
@@ -289,6 +290,17 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Toggle Breakpoint", editor::actions::ToggleBreakpoint),
                 MenuItem::action("Edit Breakpoint", editor::actions::EditLogBreakpoint),
                 MenuItem::action("Clear All Breakpoints", debugger_ui::ClearAllBreakpoints),
+            ],
+        },
+        Menu {
+            name: "Tools".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action(
+                    "Deployment Configuration...",
+                    php_panel::OpenDeploymentDialog,
+                ),
+                MenuItem::action("Browse Remote Host", php_panel::BrowseRemoteHost),
             ],
         },
         Menu {
