@@ -586,7 +586,7 @@ fn main() {
 
         zed::init(cx);
         #[cfg(target_os = "macos")]
-        zed::move_to_applications::init(cx);
+        // phpworkbench: dev builds must never offer to copy target/debug to /Applications
         project::Project::init(&client, cx);
         debugger_ui::init(cx);
         debugger_tools::init(cx);
