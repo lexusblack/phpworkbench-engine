@@ -795,7 +795,7 @@ pub struct PhpPanel {
     http_requests: Vec<HttpRequest>,
     collections: Vec<PostmanCollection>,
     remote_servers: Vec<RemoteServer>,
-    selected_remote_server: Option<String>,
+    active_server: Option<String>,
     remote_current_path: HashMap<String, String>,
     remote_selected_file: Option<(String, String)>,
     remote_entries: HashMap<String, Vec<RemoteEntry>>,
@@ -864,7 +864,7 @@ impl PhpPanel {
                     http_requests: Vec::new(),
                     collections: Vec::new(),
                     remote_servers: Vec::new(),
-                    selected_remote_server: None,
+                    active_server: None,
                     remote_current_path: HashMap::new(),
                     remote_selected_file: None,
                     remote_entries: HashMap::new(),
@@ -897,6 +897,7 @@ impl PhpPanel {
         let mut http_requests = Vec::new();
         let mut collections = Vec::new();
         let mut remote_servers = Vec::new();
+        let mut deploy_config = None;
         let mut databases = Vec::new();
         let mut symbol_candidates = Vec::new();
 
@@ -964,6 +965,9 @@ impl PhpPanel {
                         });
                     }
                 }
+                if deploy_config.is_none() {
+                    deploy_config = Some(config);
+                }
             }
 
             if let Some(config) = read_json(&root.join(".zed/databases.json")) {
@@ -1028,17 +1032,23 @@ impl PhpPanel {
         self.remote_servers = remote_servers;
         self.databases = databases;
 
-        let selection_valid = self.selected_remote_server.as_ref().is_some_and(|name| {
-            self.remote_servers
-                .iter()
-                .any(|server| &server.name == name)
-        });
-        if !selection_valid {
-            self.selected_remote_server = self
-                .remote_servers
-                .first()
-                .map(|server| server.name.clone());
-        }
+        let names = self
+            .remote_servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        let configured_active = deploy_config
+            .as_ref()
+            .and_then(|config| config.get("active"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let configured_default = deploy_config
+            .as_ref()
+            .and_then(|config| config.get("default"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.active_server =
+            resolve_active_server(configured_active, configured_default, &names);
     }
 
     fn open_first_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1115,7 +1125,7 @@ impl PhpPanel {
     }
 
     fn current_remote_server(&self) -> Option<&RemoteServer> {
-        self.selected_remote_server
+        self.active_server
             .as_ref()
             .and_then(|name| self.remote_servers.iter().find(|server| &server.name == name))
             .or_else(|| self.remote_servers.first())
@@ -1148,8 +1158,8 @@ impl PhpPanel {
         let Some(server) = self.current_remote_server().cloned() else {
             return;
         };
-        if self.selected_remote_server.as_deref() != Some(server.name.as_str()) {
-            self.selected_remote_server = Some(server.name.clone());
+        if self.active_server.as_deref() != Some(server.name.as_str()) {
+            self.active_server = Some(server.name.clone());
         }
         let key = (server.name.clone(), ".".to_string());
         self.remote_expanded_paths.insert(key.clone());
@@ -1163,31 +1173,26 @@ impl PhpPanel {
         }
     }
 
-    fn cycle_remote_server(&mut self, cx: &mut Context<Self>) {
-        if self.remote_servers.is_empty() {
+    fn switch_remote_server(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
+        if self.active_server.as_deref() == Some(name.as_str()) {
+            self.ensure_remote_selected(cx);
+            cx.notify();
             return;
         }
-        let current_index = self
-            .selected_remote_server
-            .as_ref()
-            .and_then(|name| {
-                self.remote_servers
-                    .iter()
-                    .position(|server| &server.name == name)
-            })
-            .unwrap_or(0);
-        let next_index = (current_index + 1) % self.remote_servers.len();
-        let server = self.remote_servers[next_index].clone();
-        self.selected_remote_server = Some(server.name.clone());
-        self.remote_current_path
-            .entry(server.name.clone())
-            .or_insert_with(|| ".".to_string());
+        self.active_server = Some(name.clone());
+        self.remote_entries.clear();
+        self.remote_dir_entries.clear();
+        self.remote_status.clear();
+        self.remote_expanded_paths.clear();
+        self.remote_current_path.clear();
+        self.remote_selected_file = None;
+        let _ = persist_active_server(&root, &name);
         self.ensure_remote_selected(cx);
         cx.notify();
     }
 
     fn refresh_remote(&mut self, server: String, root: PathBuf, cx: &mut Context<Self>) {
-        self.selected_remote_server = Some(server.clone());
+        self.active_server = Some(server.clone());
         self.remote_entries.remove(&server);
         self.remote_dir_entries
             .retain(|(cached_server, _), _| cached_server != &server);
@@ -1204,7 +1209,7 @@ impl PhpPanel {
     }
 
     fn select_remote_file(&mut self, server: String, path: String, cx: &mut Context<Self>) {
-        self.selected_remote_server = Some(server.clone());
+        self.active_server = Some(server.clone());
         self.remote_current_path
             .insert(server.clone(), remote_parent_path(&path));
         self.remote_selected_file = Some((server, path));
@@ -1227,7 +1232,7 @@ impl PhpPanel {
         cx: &mut Context<Self>,
     ) {
         let key = (server.clone(), path.clone());
-        self.selected_remote_server = Some(server.clone());
+        self.active_server = Some(server.clone());
         if self.remote_expanded_paths.contains(&key) {
             self.remote_expanded_paths.remove(&key);
             self.remote_current_path
@@ -1326,7 +1331,7 @@ impl PhpPanel {
         if matches!(self.remote_status.get(&key), Some(RemoteStatus::Loading)) {
             return;
         }
-        self.selected_remote_server = Some(server.clone());
+        self.active_server = Some(server.clone());
         self.remote_current_path
             .insert(server.clone(), remote_parent_path(&path));
         self.remote_selected_file = Some((server.clone(), path.clone()));
@@ -1823,7 +1828,8 @@ impl PhpPanel {
                 self.refresh(cx);
                 match kind {
                     FormKind::Server => {
-                        self.selected_remote_server = Some(name.clone());
+                        self.active_server = Some(name.clone());
+                        let _ = persist_active_server(&root, &name);
                         self.ensure_remote_selected(cx);
                         self.run_server_check(name, root, cx);
                     }
@@ -2149,6 +2155,25 @@ fn write_config_object(
         .map_err(|error| format!("cannot serialize {}: {error}", path.display()))?;
     std::fs::write(path, format!("{text}\n"))
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+fn resolve_active_server(
+    active: Option<String>,
+    default: Option<String>,
+    names: &[String],
+) -> Option<String> {
+    let known = |name: &str| names.iter().any(|known| known == name);
+    active
+        .filter(|name| known(name))
+        .or_else(|| default.filter(|name| known(name)))
+        .or_else(|| names.first().cloned())
+}
+
+fn persist_active_server(root: &Path, name: &str) -> std::result::Result<(), String> {
+    let path = root.join(".zed/deploy.json");
+    let mut config = load_config_object(&path)?;
+    config.insert("active".to_string(), Value::String(name.to_string()));
+    write_config_object(&path, &config)
 }
 
 fn save_server_config(root: &Path, fields: &[String]) -> std::result::Result<String, String> {
@@ -2582,7 +2607,7 @@ impl Panel for PhpPanel {
     fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {}
 
     fn default_size(&self, _: &Window, _: &App) -> gpui::Pixels {
-        gpui::px(360.)
+        gpui::px(320.)
     }
 
     fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
@@ -2700,29 +2725,118 @@ impl Render for PhpPanel {
         .flex_1();
 
         let selected_remote = self.current_remote_server().cloned();
+        let active_name = self.active_server.clone();
 
-        let server_selector = if let Some(server) = &selected_remote {
-            Button::new(
-                format!("remote-server-{}", server.name),
-                format!("{} ▾", server.name),
+        let configuration_rows = self
+            .remote_servers
+            .iter()
+            .map(|server| {
+                let is_active = active_name.as_deref() == Some(server.name.as_str());
+                let text = format!(
+                    "{} · {} · {} · {}",
+                    server.name,
+                    display_field(&server.protocol),
+                    display_field(&server.host),
+                    display_field(&server.remote_root),
+                );
+                let server_name = server.name.clone();
+                let root = server.root.clone();
+                ListItem::new(format!("remote-config-{}", server.name))
+                    .selectable(true)
+                    .toggle_state(is_active)
+                    .child(
+                        Label::new(text)
+                            .size(LabelSize::XSmall)
+                            .color(if is_active {
+                                Color::Accent
+                            } else {
+                                Color::Default
+                            })
+                            .truncate(),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.switch_remote_server(server_name.clone(), root.clone(), cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        let remote_configurations = v_flex()
+            .id("remote-configurations")
+            .w_full()
+            .flex_none()
+            .max_h(relative(0.3))
+            .overflow_y_scroll()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex().px_2().py_1().child(
+                    Label::new(format!("Configurations · {}", self.remote_servers.len()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
             )
-            .size(ButtonSize::Compact)
-            .label_size(LabelSize::XSmall)
-            .style(ButtonStyle::Subtle)
-            .truncate(true)
-            .tooltip(Tooltip::text("Switch server"))
-            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                this.cycle_remote_server(cx);
-            }))
-            .into_any_element()
-        } else {
-            Button::new("remote-server-none", "no servers")
-                .size(ButtonSize::Compact)
-                .label_size(LabelSize::XSmall)
-                .style(ButtonStyle::Subtle)
-                .disabled(true)
-                .into_any_element()
-        };
+            .children(if configuration_rows.is_empty() {
+                vec![empty_row("no servers configured")]
+            } else {
+                configuration_rows
+            });
+
+        let server_chips = self
+            .remote_servers
+            .iter()
+            .map(|server| {
+                let is_active = active_name.as_deref() == Some(server.name.as_str());
+                let server_name = server.name.clone();
+                let root = server.root.clone();
+                h_flex()
+                    .id(format!("remote-chip-{}", server.name))
+                    .flex_none()
+                    .items_center()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_active, |this| {
+                        this.bg(cx.theme().colors().element_selected)
+                    })
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Label::new(server.name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(if is_active {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.switch_remote_server(server_name.clone(), root.clone(), cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        let remote_bottom_bar = h_flex()
+            .id("remote-bottom-bar")
+            .w_full()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Label::new(format!(
+                    "Server: {}",
+                    active_name.as_deref().unwrap_or("none")
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .children(server_chips);
 
         let refresh_target = selected_remote
             .as_ref()
@@ -2739,7 +2853,13 @@ impl Render for PhpPanel {
             .py_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(h_flex().flex_1().min_w_0().child(server_selector))
+            .child(
+                h_flex().flex_1().min_w_0().child(
+                    Label::new("Remote")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
             .child(
                 Button::new("remote-refresh", "Refresh")
                     .size(ButtonSize::Compact)
@@ -3624,6 +3744,7 @@ impl Render for PhpPanel {
                 .flex_1()
                 .min_h_0()
                 .child(remote_toolbar)
+                .child(remote_configurations)
                 .child(remote_status)
                 .child(remote_breadcrumb)
                 .when_some(
@@ -3641,6 +3762,7 @@ impl Render for PhpPanel {
                         .children(remote_rows)
                         .child(add_server_row),
                 )
+                .child(remote_bottom_bar)
                 .into_any_element(),
             PanelTab::Databases => v_flex()
                 .flex_1()
@@ -4077,6 +4199,49 @@ mod tests {
         assert!(local.get("host").is_none());
         assert!(local.get("port").is_none());
         assert_eq!(servers[1]["name"], json!("staging"));
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn active_server_resolution_prefers_active_then_default_then_first() {
+        let names = vec!["local".to_string(), "sftp".to_string()];
+        assert_eq!(
+            resolve_active_server(Some("sftp".to_string()), Some("local".to_string()), &names),
+            Some("sftp".to_string())
+        );
+        assert_eq!(
+            resolve_active_server(Some("missing".to_string()), Some("sftp".to_string()), &names),
+            Some("sftp".to_string())
+        );
+        assert_eq!(
+            resolve_active_server(None, None, &names),
+            Some("local".to_string())
+        );
+        assert_eq!(resolve_active_server(None, None, &[]), None);
+    }
+
+    #[test]
+    fn persist_active_server_preserves_other_fields() {
+        let root = temp_root("server_active");
+        let zed = root.join(".zed");
+        std::fs::create_dir_all(&zed).expect("create .zed");
+        std::fs::write(
+            zed.join("deploy.json"),
+            r#"{"default":"local","servers":[{"name":"local","protocol":"local","remote_root":"remote"},{"name":"sftp","protocol":"sftp","host":"127.0.0.1","remote_root":"/var/www/app"}],"extra":{"keep":true}}"#,
+        )
+        .expect("seed deploy.json");
+
+        persist_active_server(&root, "sftp").expect("persist active server");
+
+        let contents = std::fs::read_to_string(zed.join("deploy.json")).expect("read config");
+        assert!(contents.starts_with("{\n  "));
+        assert!(contents.ends_with("}\n"));
+        let config = read_json(&zed.join("deploy.json")).expect("parse config");
+        assert_eq!(config["active"], json!("sftp"));
+        assert_eq!(config["default"], json!("local"));
+        assert_eq!(config["extra"], json!({"keep": true}));
+        assert_eq!(config["servers"].as_array().expect("servers").len(), 2);
 
         std::fs::remove_dir_all(&root).expect("clean temporary project root");
     }
