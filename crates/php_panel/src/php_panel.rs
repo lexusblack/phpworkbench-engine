@@ -19,6 +19,7 @@ use editor::{Editor, EditorElement, EditorStyle, actions as editor_actions};
 use project::{Project, ProjectPath};
 use regex::Regex;
 use serde_json::Value;
+use file_icons::FileIcons;
 use ui::{
     Button, ContextMenu, IconButtonShape, Label, LabelSize, ListItem, PopoverMenu, Tooltip,
     prelude::*,
@@ -2464,14 +2465,19 @@ impl PhpPanel {
             let status = self.remote_status.get(&key);
             let expanded = self.remote_expanded_paths.contains(&key);
             let selected = self.remote_selected_file.as_ref() == Some(&key);
-            let icon = if entry.is_directory {
-                if expanded {
+            let start_icon = if entry.is_directory {
+                Icon::new(if expanded {
                     IconName::FolderOpen
                 } else {
                     IconName::Folder
-                }
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Accent)
             } else {
-                IconName::File
+                match FileIcons::get_icon(Path::new(&entry.name), cx) {
+                    Some(icon_path) => Icon::from_path(icon_path).size(IconSize::XSmall),
+                    None => Icon::new(IconName::File).size(IconSize::XSmall),
+                }
             };
 
             let mut item = ListItem::new(("remote-entry", *line))
@@ -2479,7 +2485,7 @@ impl PhpPanel {
                 .selectable(true)
                 .toggle_state(selected)
                 .always_show_disclosure_icon(true)
-                .start_slot(Icon::new(icon).size(IconSize::XSmall))
+                .start_slot(start_icon)
                 .child(Label::new(entry.name.clone()).truncate())
                 .tooltip(Tooltip::text(entry.path.clone()));
             *line += 1;
@@ -4007,7 +4013,7 @@ impl Panel for PhpPanel {
     fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {}
 
     fn default_size(&self, _: &Window, _: &App) -> gpui::Pixels {
-        gpui::px(320.)
+        gpui::px(480.)
     }
 
     fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
@@ -4137,39 +4143,66 @@ impl Render for PhpPanel {
         });
         let remote_server_picker = h_flex()
             .id("remote-server-picker")
-            .flex_none()
+            .flex_1()
+            .h(px(26.))
+            .min_w_0()
             .items_center()
             .gap_1()
             .px_1()
-            .py_0p5()
             .rounded_sm()
             .cursor_pointer()
-            .max_w_2_3()
+            .border_1()
+            .border_color(if self.server_menu_open {
+                cx.theme().colors().element_selected
+            } else {
+                cx.theme().colors().border
+            })
             .when(self.server_menu_open, |this| {
                 this.bg(cx.theme().colors().element_selected)
             })
             .hover(|style| style.bg(cx.theme().colors().element_hover))
             .child(
                 h_flex()
-                    .flex_none()
+                    .flex_1()
+                    .min_w_0()
                     .items_center()
                     .gap_1()
-                    .child(
-                        Label::new(match picker {
-                            Some((protocol, name)) if !protocol.is_empty() => {
-                                format!("{protocol} · {name}")
-                            }
-                            Some((_, name)) => name,
-                            None => "no server".to_string(),
-                        })
-                        .size(LabelSize::XSmall)
-                        .truncate(),
-                    )
-                    .child(
-                        Icon::new(IconName::ChevronDown)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                    .child(remote_protocol_badge(
+                        &picker
+                            .as_ref()
+                            .map(|(protocol, _)| {
+                                if protocol.is_empty() {
+                                    "server".to_string()
+                                } else {
+                                    protocol.clone()
+                                }
+                            })
+                            .unwrap_or_else(|| "-".to_string()),
+                        cx,
+                    ))
+                    .when_some(picker.as_ref().map(|(_, name)| name.clone()), |this, name| {
+                        this.child(
+                            Label::new(name)
+                                .size(LabelSize::Small)
+                                .color(Color::Default)
+                                .truncate(),
+                        )
+                    })
+                    .when(picker.is_none(), |this| {
+                        this.child(
+                            Label::new("no server")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .child(Icon::new(IconName::ChevronDown)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted)),
             )
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                 this.server_menu_open = !this.server_menu_open;
@@ -4194,20 +4227,23 @@ impl Render for PhpPanel {
             .border_color(cx.theme().colors().border)
             .child(remote_server_picker)
             .child(
-                Button::new("remote-configure", "...")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
-                    .style(ButtonStyle::Subtle)
+                IconButton::new("remote-configure", IconName::Ellipsis)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Deployment configuration"))
+                    .aria_label("Deployment configuration")
                     .on_click(cx.listener(|_: &mut Self, _: &ClickEvent, window, cx| {
                         window.dispatch_action(Box::new(OpenDeploymentDialog), cx);
                     })),
             )
             .child(
-                Button::new("remote-refresh", "Refresh")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
-                    .style(ButtonStyle::Subtle)
+                IconButton::new("remote-refresh", IconName::RotateCw)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Refresh"))
+                    .aria_label("Refresh remote listing")
                     .disabled(refresh_target.is_none())
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                         if let Some((name, root)) = refresh_target.clone() {
@@ -4216,10 +4252,12 @@ impl Render for PhpPanel {
                     })),
             )
             .child(
-                Button::new("remote-sync", "Sync")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
-                    .style(ButtonStyle::Subtle)
+                IconButton::new("remote-sync", IconName::Share)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Sync"))
+                    .aria_label("Sync files to server")
                     .disabled(sync_target.is_none())
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                         if let Some((name, root)) = sync_target.clone() {
@@ -4253,15 +4291,10 @@ impl Render for PhpPanel {
                             this.bg(cx.theme().colors().element_selected)
                         })
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
-                        .child(
-                            Label::new(badge)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .flex_none(),
-                        )
+                        .child(remote_protocol_badge(&badge, cx))
                         .child(
                             Label::new(server.name.clone())
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Small)
                                 .color(if is_active {
                                     Color::Accent
                                 } else {
@@ -4300,11 +4333,16 @@ impl Render for PhpPanel {
                     .id("remote-server-menu")
                     .w_full()
                     .flex_none()
-                    .max_h(relative(0.4))
-                    .overflow_y_scroll()
-                    .border_b_1()
+                    .gap_0p5()
+                    .px_1()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
                     .border_color(cx.theme().colors().border)
-                    .min_w_0()
+                    .bg(cx.theme().colors().elevated_surface_background)
+                    .shadow_sm()
+                    .max_h(px(220.))
+                    .overflow_y_scroll()
                     .children(menu_rows),
             )
         } else {
@@ -4420,17 +4458,24 @@ impl Render for PhpPanel {
                     .into_any_element(),
             );
         }
-        let remote_breadcrumb = h_flex()
-            .id("remote-breadcrumb")
-            .w_full()
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .overflow_hidden()
-            .tooltip(Tooltip::text(crumb_text))
-            .children(crumb_children);
+        let remote_breadcrumb = if crumb_parts.len() > 1 {
+            Some(
+                h_flex()
+                    .id("remote-breadcrumb-2")
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .overflow_hidden()
+                    .tooltip(Tooltip::text(crumb_text))
+                    .children(crumb_children)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
 
         let mut remote_rows = Vec::new();
         let mut remote_line = 0usize;
@@ -4461,18 +4506,22 @@ impl Render for PhpPanel {
                     .py_1()
                     .gap_1()
                     .child(
-                        Label::new("▼")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        div()
+                            .flex_none()
+                            .child(Icon::new(IconName::ChevronDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted)),
                     )
+                    .child(remote_protocol_badge(&remote_root_badge(&selected_remote), cx))
                     .child(
                         Label::new(server.name.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Default),
+                            .size(LabelSize::Small)
+                            .color(Color::Default)
+                            .flex_none(),
                     )
                     .child(
                         Label::new(host_part.clone())
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Small)
                             .color(Color::Muted)
                             .truncate(),
                     )
@@ -5193,7 +5242,7 @@ impl Render for PhpPanel {
                 .child(remote_toolbar)
                 .children(remote_server_menu)
                 .child(remote_status)
-                .child(remote_breadcrumb)
+                .when_some(remote_breadcrumb, |this, crumb| this.child(crumb))
                 .child(
                     div()
                         .id("php-remote-tree")
@@ -5454,6 +5503,28 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
     }
 
     v_flex().children(rows).into_any_element()
+}
+
+fn remote_protocol_badge(protocol: &str, cx: &App) -> gpui::AnyElement {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(cx.theme().colors().element_hover)
+        .child(
+            Label::new(format!("{} ", protocol))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
+fn remote_root_badge(server: &Option<RemoteServer>) -> String {
+    server
+        .as_ref()
+        .and_then(|s| s.protocol.clone())
+        .filter(|protocol| !protocol.is_empty())
+        .unwrap_or_else(|| "server".to_string())
 }
 
 fn empty_row(message: &'static str) -> gpui::AnyElement {
