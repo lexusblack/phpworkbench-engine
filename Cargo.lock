@@ -13323,6 +13323,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "php_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "project",
+ "regex",
+ "serde_json",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "picker"
 version = "0.1.0"
 dependencies = [
@@ -22473,6 +22487,7 @@ dependencies = [
  "outline_panel",
  "parking_lot",
  "paths",
+ "php_panel",
  "picker",
  "pkg-config",
  "pretty_assertions",
