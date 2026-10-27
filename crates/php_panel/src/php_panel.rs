@@ -98,6 +98,8 @@ struct DatabaseEntry {
     name: String,
     driver: Option<String>,
     target: Option<String>,
+    user: Option<String>,
+    host: Option<String>,
     root: PathBuf,
 }
 
@@ -1220,10 +1222,10 @@ impl gpui::Global for DeployShared {}
 
 const SERVER_PROTOCOLS: [&str; 2] = ["local", "sftp"];
 const DATABASE_DRIVERS: [&str; 8] = [
-    "sqlite",
     "postgres",
     "mysql",
     "mariadb",
+    "sqlite",
     "sqlserver",
     "oracle",
     "mongodb",
@@ -1246,6 +1248,12 @@ struct DatabaseTable {
 enum DatabaseStatus {
     Loading,
     Loaded(Vec<DatabaseTable>),
+    Failed(String),
+}
+
+enum DbListStatus {
+    Loading,
+    Loaded(Vec<String>),
     Failed(String),
 }
 
@@ -1818,6 +1826,12 @@ pub struct PhpPanel {
     table_status: HashMap<(String, String), TableStatus>,
     query_status: HashMap<String, TableStatus>,
     expanded_tables: HashSet<(String, String)>,
+    db_expanded_conns: HashSet<String>,
+    db_expanded_views: HashSet<String>,
+    db_expanded_names: HashSet<String>,
+    db_names_status: HashMap<String, DbListStatus>,
+    database_views_status: HashMap<String, DatabaseStatus>,
+    db_menu_open: bool,
     http_status: HashMap<String, HttpStatus>,
     test_list_status: TestListStatus,
     test_files: Vec<String>,
@@ -1919,6 +1933,12 @@ impl PhpPanel {
                     table_status: HashMap::new(),
                     query_status: HashMap::new(),
                     expanded_tables: HashSet::new(),
+                    db_expanded_conns: HashSet::new(),
+                    db_expanded_views: HashSet::new(),
+                    db_expanded_names: HashSet::new(),
+                    db_names_status: HashMap::new(),
+                    database_views_status: HashMap::new(),
+                    db_menu_open: false,
                     http_status: HashMap::new(),
                     test_list_status: TestListStatus::Unloaded,
                     test_files: Vec::new(),
@@ -2025,6 +2045,8 @@ impl PhpPanel {
                                         },
                                     )
                                 }),
+                            user: string_field(connection, "user"),
+                            host: string_field(connection, "host"),
                             root: root.clone(),
                         });
                     }
@@ -2188,6 +2210,7 @@ impl PhpPanel {
         self.form = None;
         self.saved_message = None;
         self.server_menu_open = false;
+        self.db_menu_open = false;
         if tab == PanelTab::Remote {
             self.ensure_remote_selected(cx);
         }
@@ -2265,8 +2288,14 @@ impl PhpPanel {
     fn refresh_databases(&mut self, cx: &mut Context<Self>) {
         self.database_status.clear();
         self.database_check_status.clear();
+        self.database_views_status.clear();
+        self.db_names_status.clear();
         self.table_status.clear();
         self.expanded_tables.clear();
+        self.db_expanded_conns.clear();
+        self.db_expanded_views.clear();
+        self.db_expanded_names.clear();
+        self.db_menu_open = false;
         cx.notify();
     }
 
@@ -3061,21 +3090,6 @@ impl PhpPanel {
         .detach();
     }
 
-    fn toggle_database_schema(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
-        if matches!(
-            self.database_status.get(&name),
-            Some(DatabaseStatus::Loading)
-        ) {
-            return;
-        }
-        if self.database_status.contains_key(&name) {
-            self.database_status.remove(&name);
-            cx.notify();
-        } else {
-            self.load_database_schema(name, root, cx);
-        }
-    }
-
     fn load_database_schema(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
         self.database_status
             .insert(name.clone(), DatabaseStatus::Loading);
@@ -3115,6 +3129,160 @@ impl PhpPanel {
                     Err(message) => DatabaseStatus::Failed(message),
                 };
                 this.database_status.insert(name, status);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn toggle_connection_expand(
+        &mut self,
+        name: String,
+        is_sqlite: bool,
+        root: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.db_expanded_conns.remove(&name) {
+            self.db_expanded_conns.insert(name.clone());
+            if !matches!(
+                self.database_status.get(&name),
+                Some(DatabaseStatus::Loaded(_))
+            ) {
+                self.load_database_schema(name.clone(), root.clone(), cx);
+            }
+            if is_sqlite
+                && !matches!(
+                    self.database_views_status.get(&name),
+                    Some(DatabaseStatus::Loaded(_))
+                )
+            {
+                self.load_database_views(name, root, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_database_names(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
+        if !self.db_expanded_names.remove(&name) {
+            self.db_expanded_names.insert(name.clone());
+            if !matches!(
+                self.db_names_status.get(&name),
+                Some(DbListStatus::Loading) | Some(DbListStatus::Loaded(_))
+            ) {
+                self.load_database_names(name, root, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_db_menu(&mut self, cx: &mut Context<Self>) {
+        self.db_menu_open = !self.db_menu_open;
+        cx.notify();
+    }
+
+    fn open_database_form(
+        &mut self,
+        driver: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_form(FormKind::Database, window, cx);
+        if let Some(driver) = driver {
+            if let Some(form) = self.form.as_mut() {
+                form.fields[1] = driver.to_string();
+                form.fields[0] = next_connection_name(driver, &self.databases);
+            }
+        }
+        self.db_menu_open = false;
+        cx.notify();
+    }
+
+    fn load_database_names(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
+        self.db_names_status
+            .insert(name.clone(), DbListStatus::Loading);
+        cx.notify();
+
+        let connection_name = name.clone();
+        let task = cx.background_spawn(async move {
+            let output = std::process::Command::new("php-db")
+                .arg("databases")
+                .arg(&connection_name)
+                .arg("--json")
+                .current_dir(&root)
+                .output();
+
+            match output {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    parse_database_names(&stdout)
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Err(
+                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                            .unwrap_or_else(|| "databases command failed".to_string()),
+                    )
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                let status = match result {
+                    Ok(names) => DbListStatus::Loaded(names),
+                    Err(message) => DbListStatus::Failed(message),
+                };
+                this.db_names_status.insert(name, status);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn load_database_views(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
+        self.database_views_status
+            .insert(name.clone(), DatabaseStatus::Loading);
+        cx.notify();
+
+        let connection_name = name.clone();
+        let task = cx.background_spawn(async move {
+            let output = std::process::Command::new("php-db")
+                .arg("views")
+                .arg(&connection_name)
+                .arg("--json")
+                .current_dir(&root)
+                .output();
+
+            match output {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    parse_database_views(&stdout)
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Err(
+                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                            .unwrap_or_else(|| "views command failed".to_string()),
+                    )
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                let status = match result {
+                    Ok(views) => DatabaseStatus::Loaded(views),
+                    Err(message) => DatabaseStatus::Failed(message),
+                };
+                this.database_views_status.insert(name, status);
                 cx.notify();
             })
             .log_err();
@@ -3736,6 +3904,58 @@ fn display_field(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("-")
 }
 
+fn next_connection_name(base: &str, existing: &[DatabaseEntry]) -> String {
+    let mut name = base.to_string();
+    let mut index = 0usize;
+    while existing.iter().any(|entry| entry.name == name) {
+        index += 1;
+        name = format!("{base} ({index})");
+    }
+    name
+}
+
+fn driver_badge_short(driver: &str) -> &'static str {
+    match driver {
+        "postgres" => "pg",
+        "mysql" => "my",
+        "mariadb" => "mar",
+        "sqlite" => "docs",
+        "sqlserver" => "msr",
+        "oracle" => "orc",
+        "mongodb" => "mdb",
+        "redis" => "sh",
+        _ => "?",
+    }
+}
+
+fn driver_badge_color(driver: &str) -> Color {
+    match driver {
+        "postgres" => Color::Info,
+        "mysql" => Color::Warning,
+        "mariadb" => Color::Warning,
+        "sqlite" => Color::Created,
+        "sqlserver" => Color::Accent,
+        "oracle" => Color::Error,
+        "mongodb" => Color::Success,
+        "redis" => Color::Error,
+        _ => Color::Muted,
+    }
+}
+
+fn driver_display_name(driver: &str) -> String {
+    match driver {
+        "postgres" => "PostgreSQL".to_string(),
+        "mysql" => "MySQL".to_string(),
+        "mariadb" => "MariaDB".to_string(),
+        "sqlite" => "SQLite".to_string(),
+        "sqlserver" => "SQL Server".to_string(),
+        "oracle" => "Oracle".to_string(),
+        "mongodb" => "MongoDB".to_string(),
+        "redis" => "Redis".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn parse_remote_entries(
     stdout: &str,
     base_path: &str,
@@ -3769,15 +3989,7 @@ fn parse_remote_entries(
         .collect())
 }
 
-fn parse_database_schema(stdout: &str) -> Result<Vec<DatabaseTable>, String> {
-    let value: Value = serde_json::from_str(stdout).map_err(|_| {
-        first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid schema JSON".to_string())
-    })?;
-    let tables = value
-        .get("tables")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "schema JSON had no tables".to_string())?;
-
+fn parse_table_list(tables: &[Value]) -> Vec<DatabaseTable> {
     let mut parsed = Vec::new();
     for table in tables {
         let Some(name) = string_field(table, "name") else {
@@ -3805,8 +4017,45 @@ fn parse_database_schema(stdout: &str) -> Result<Vec<DatabaseTable>, String> {
             .unwrap_or_default();
         parsed.push(DatabaseTable { name, columns });
     }
+    parsed
+}
 
-    Ok(parsed)
+fn parse_database_schema(stdout: &str) -> Result<Vec<DatabaseTable>, String> {
+    let value: Value = serde_json::from_str(stdout).map_err(|_| {
+        first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid schema JSON".to_string())
+    })?;
+    let tables = value
+        .get("tables")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "schema JSON had no tables".to_string())?;
+    Ok(parse_table_list(tables))
+}
+
+fn parse_database_views(stdout: &str) -> Result<Vec<DatabaseTable>, String> {
+    let value: Value = serde_json::from_str(stdout).map_err(|_| {
+        first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid views JSON".to_string())
+    })?;
+    let views = value
+        .get("views")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "views JSON had no views".to_string())?;
+    Ok(parse_table_list(views))
+}
+
+fn parse_database_names(stdout: &str) -> Result<Vec<String>, String> {
+    let value: Value = serde_json::from_str(stdout).map_err(|_| {
+        first_non_empty_line(stdout.lines())
+            .unwrap_or_else(|| "invalid databases JSON".to_string())
+    })?;
+    let databases = value
+        .get("databases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "databases JSON had no databases".to_string())?;
+    Ok(databases
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect())
 }
 
 fn parse_table_rows(stdout: &str) -> Result<Vec<serde_json::Map<String, Value>>, String> {
@@ -4575,119 +4824,374 @@ impl Render for PhpPanel {
             .to_lowercase();
             let connection_matches = query.is_empty() || haystack.contains(&query);
 
+            let expanded = self.db_expanded_conns.contains(&database.name);
+
             let mut schema_rows = Vec::new();
             let mut schema_matches = false;
-            if let Some(DatabaseStatus::Loaded(tables)) =
-                self.database_status.get(&database.name)
-            {
-                for (table_index, table) in tables.iter().enumerate() {
-                    let table_key = (database.name.clone(), table.name.clone());
-                    let preview_status = self.table_status.get(&table_key);
-                    let preview_matches = matches!(
-                        preview_status,
-                        Some(TableStatus::Loaded(rows))
-                            if !query.is_empty()
-                                && rows.iter().any(|row| row.values().any(|value| {
-                                    display_value(value).to_lowercase().contains(&query)
-                                }))
-                    );
-                    let table_matches = query.is_empty()
-                        || table.name.to_lowercase().contains(&query)
-                        || preview_matches;
-                    let mut matching_columns = Vec::new();
-                    for (column_index, column) in table.columns.iter().enumerate() {
-                        let column_matches = query.is_empty()
-                            || table_matches
-                            || column.name.to_lowercase().contains(&query)
-                            || column.column_type.to_lowercase().contains(&query);
-                        if column_matches {
-                            matching_columns.push((column_index, column));
+            if expanded {
+                match self.database_status.get(&database.name) {
+                    Some(DatabaseStatus::Loaded(tables)) => {
+                        if tables.is_empty() {
+                            schema_rows.push(
+                                ListItem::new(format!("database-empty-{index}"))
+                                    .indent_level(1)
+                                    .child(
+                                        Label::new("no tables")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .into_any_element(),
+                            );
                         }
-                    }
-                    if !table_matches && matching_columns.is_empty() {
-                        continue;
-                    }
-                    schema_matches = true;
+                        for (table_index, table) in tables.iter().enumerate() {
+                            let table_key = (database.name.clone(), table.name.clone());
+                            let preview_status = self.table_status.get(&table_key);
+                            let preview_matches = matches!(
+                                preview_status,
+                                Some(TableStatus::Loaded(rows))
+                                    if !query.is_empty()
+                                        && rows.iter().any(|row| row.values().any(|value| {
+                                            display_value(value).to_lowercase().contains(&query)
+                                        }))
+                            );
+                            let table_matches = query.is_empty()
+                                || table.name.to_lowercase().contains(&query)
+                                || preview_matches;
+                            let mut matching_columns = Vec::new();
+                            for (column_index, column) in table.columns.iter().enumerate() {
+                                let column_matches = query.is_empty()
+                                    || table_matches
+                                    || column.name.to_lowercase().contains(&query)
+                                    || column.column_type.to_lowercase().contains(&query);
+                                if column_matches {
+                                    matching_columns.push((column_index, column));
+                                }
+                            }
+                            if !table_matches && matching_columns.is_empty() {
+                                continue;
+                            }
+                            schema_matches = true;
 
-                    let expanded = self.expanded_tables.contains(&table_key);
-                    let connection_name = database.name.clone();
-                    let table_name = table.name.clone();
-                    let table_root = database.root.clone();
+                            let table_expanded = self.expanded_tables.contains(&table_key);
+                            let connection_name = database.name.clone();
+                            let table_name = table.name.clone();
+                            let table_root = database.root.clone();
 
-                    let mut table_item =
-                        ListItem::new(format!("database-table-{index}-{table_index}"))
-                            .indent_level(1)
-                            .toggle(expanded)
-                            .child(
-                                Label::new(format!(
-                                    "{} ({} columns)",
-                                    table.name,
-                                    table.columns.len()
-                                ))
-                                .truncate(),
-                            )
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                this.toggle_table_preview(
-                                    connection_name.clone(),
-                                    table_name.clone(),
-                                    table_root.clone(),
-                                    cx,
-                                );
-                            }));
-                    if let Some(status) = preview_status {
-                        let (status_text, color) = match status {
-                            TableStatus::Loading => ("loading…".to_string(), Color::Muted),
-                            TableStatus::Loaded(rows) => (
-                                format!(
-                                    "{} {}",
-                                    rows.len(),
-                                    if rows.len() == 1 { "row" } else { "rows" }
-                                ),
-                                Color::Default,
-                            ),
-                            TableStatus::Failed(message) => (message.clone(), Color::Error),
-                        };
-                        table_item = table_item.end_slot(
-                            Label::new(status_text)
-                                .size(LabelSize::XSmall)
-                                .color(color)
-                                .truncate(),
-                        );
-                    }
-                    schema_rows.push(table_item.into_any_element());
-
-                    if expanded {
-                        if let Some(TableStatus::Loaded(rows)) = preview_status {
-                            database_grids.push(render_table_grid(
-                                &format!("database-grid-{index}-{table_index}"),
-                                &table.name,
-                                &table.columns,
-                                rows,
-                                cx,
-                            ));
-                        }
-                    }
-
-                    for (column_index, column) in matching_columns {
-                        let text = format!(
-                            "{} · {}{}",
-                            column.name,
-                            column.column_type,
-                            if column.primary_key { " [pk]" } else { "" },
-                        );
-                        schema_rows.push(
-                            ListItem::new(format!(
-                                "database-column-{index}-{table_index}-{column_index}"
-                            ))
-                                .indent_level(2)
-                                .child(
-                                    Label::new(text)
+                            let mut table_item =
+                                ListItem::new(format!("database-table-{index}-{table_index}"))
+                                    .indent_level(1)
+                                    .toggle(table_expanded)
+                                    .child(
+                                        Label::new(format!(
+                                            "{} ({} columns)",
+                                            table.name,
+                                            table.columns.len()
+                                        ))
+                                        .truncate(),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _window, cx| {
+                                            this.toggle_table_preview(
+                                                connection_name.clone(),
+                                                table_name.clone(),
+                                                table_root.clone(),
+                                                cx,
+                                            );
+                                        },
+                                    ));
+                            if let Some(status) = preview_status {
+                                let (status_text, color) = match status {
+                                    TableStatus::Loading => {
+                                        ("loading…".to_string(), Color::Muted)
+                                    }
+                                    TableStatus::Loaded(rows) => (
+                                        format!(
+                                            "{} {}",
+                                            rows.len(),
+                                            if rows.len() == 1 { "row" } else { "rows" }
+                                        ),
+                                        Color::Default,
+                                    ),
+                                    TableStatus::Failed(message) => {
+                                        (message.clone(), Color::Error)
+                                    }
+                                };
+                                table_item = table_item.end_slot(
+                                    Label::new(status_text)
                                         .size(LabelSize::XSmall)
-                                        .color(Color::Muted)
+                                        .color(color)
+                                        .truncate(),
+                                );
+                            }
+                            schema_rows.push(table_item.into_any_element());
+
+                            if table_expanded {
+                                if let Some(TableStatus::Loaded(rows)) = preview_status {
+                                    database_grids.push(render_table_grid(
+                                        &format!("database-grid-{index}-{table_index}"),
+                                        &table.name,
+                                        &table.columns,
+                                        rows,
+                                        cx,
+                                    ));
+                                }
+                            }
+
+                            for (column_index, column) in matching_columns {
+                                let text = format!(
+                                    "{} · {}{}",
+                                    column.name,
+                                    column.column_type,
+                                    if column.primary_key { " [pk]" } else { "" },
+                                );
+                                schema_rows.push(
+                                    ListItem::new(format!(
+                                        "database-column-{index}-{table_index}-{column_index}"
+                                    ))
+                                    .indent_level(2)
+                                    .child(
+                                        Label::new(text)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                    .into_any_element(),
+                                );
+                            }
+                        }
+                    }
+                    Some(DatabaseStatus::Loading) => {
+                        schema_rows.push(
+                            ListItem::new(format!("database-loading-{index}"))
+                                .indent_level(1)
+                                .child(
+                                    Label::new("loading schema…")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    Some(DatabaseStatus::Failed(message)) => {
+                        schema_rows.push(
+                            ListItem::new(format!("database-schema-error-{index}"))
+                                .indent_level(1)
+                                .child(
+                                    Label::new(message.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Error)
                                         .truncate(),
                                 )
                                 .into_any_element(),
                         );
+                    }
+                    None => {}
+                }
+
+                if database.driver.as_deref() == Some("sqlite")
+                    && let Some(DatabaseStatus::Loaded(views)) =
+                        self.database_views_status.get(&database.name)
+                    && !views.is_empty()
+                {
+                    let views_open = self.db_expanded_views.contains(&database.name);
+                    let views_connection = database.name.clone();
+                    schema_rows.push(
+                        ListItem::new(format!("database-views-{index}"))
+                            .indent_level(1)
+                            .toggle(views_open)
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Label::new("Views")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Default),
+                                    )
+                                    .child(
+                                        Label::new(format!("({})", views.len()))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _: &ClickEvent, _window, cx| {
+                                    if this.db_expanded_views.remove(&views_connection) {
+                                        cx.notify();
+                                    } else {
+                                        this.db_expanded_views
+                                            .insert(views_connection.clone());
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                            .into_any_element(),
+                    );
+                    if views_open {
+                        for (view_index, view) in views.iter().enumerate() {
+                            let view_key = (database.name.clone(), view.name.clone());
+                            let view_connection = database.name.clone();
+                            let view_name = view.name.clone();
+                            let view_root = database.root.clone();
+                            let view_open = self.expanded_tables.contains(&view_key);
+                            let mut view_item =
+                                ListItem::new(format!("database-view-{index}-{view_index}"))
+                                    .indent_level(2)
+                                    .toggle(view_open)
+                                    .child(Label::new(view.name.clone()).truncate())
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _window, cx| {
+                                            this.toggle_table_preview(
+                                                view_connection.clone(),
+                                                view_name.clone(),
+                                                view_root.clone(),
+                                                cx,
+                                            );
+                                        },
+                                    ));
+                            if let Some(status) = self.table_status.get(&view_key) {
+                                let (status_text, color) = match status {
+                                    TableStatus::Loading => {
+                                        ("loading…".to_string(), Color::Muted)
+                                    }
+                                    TableStatus::Loaded(rows) => (
+                                        format!(
+                                            "{} {}",
+                                            rows.len(),
+                                            if rows.len() == 1 { "row" } else { "rows" }
+                                        ),
+                                        Color::Default,
+                                    ),
+                                    TableStatus::Failed(message) => {
+                                        (message.clone(), Color::Error)
+                                    }
+                                };
+                                view_item = view_item.end_slot(
+                                    Label::new(status_text)
+                                        .size(LabelSize::XSmall)
+                                        .color(color)
+                                        .truncate(),
+                                );
+                            }
+                            schema_rows.push(view_item.into_any_element());
+
+                            if view_open {
+                                if let Some(TableStatus::Loaded(rows)) =
+                                    self.table_status.get(&view_key)
+                                {
+                                    database_grids.push(render_table_grid(
+                                        &format!("database-view-grid-{index}-{view_index}"),
+                                        &view.name,
+                                        &view.columns,
+                                        rows,
+                                        cx,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if database.driver.as_deref() != Some("sqlite") {
+                    let names_open = self.db_expanded_names.contains(&database.name);
+                    let names_count = match self.db_names_status.get(&database.name) {
+                        Some(DbListStatus::Loaded(names)) => format!(" ({})", names.len()),
+                        _ => String::new(),
+                    };
+                    let names_connection = database.name.clone();
+                    let names_root = database.root.clone();
+                    schema_rows.push(
+                        ListItem::new(format!("database-names-{index}"))
+                            .indent_level(1)
+                            .toggle(names_open)
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Label::new("Databases")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Default),
+                                    )
+                                    .child(
+                                        Label::new(names_count)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _: &ClickEvent, _window, cx| {
+                                    this.toggle_database_names(
+                                        names_connection.clone(),
+                                        names_root.clone(),
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .into_any_element(),
+                    );
+                    if names_open {
+                        match self.db_names_status.get(&database.name) {
+                            Some(DbListStatus::Loading) | None => {
+                                schema_rows.push(
+                                    ListItem::new(format!("database-names-loading-{index}"))
+                                        .indent_level(2)
+                                        .child(
+                                            Label::new("connecting…")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .into_any_element(),
+                                );
+                            }
+                            Some(DbListStatus::Loaded(names)) if names.is_empty() => {
+                                schema_rows.push(
+                                    ListItem::new(format!("database-names-empty-{index}"))
+                                        .indent_level(2)
+                                        .child(
+                                            Label::new("no databases")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .into_any_element(),
+                                );
+                            }
+                            Some(DbListStatus::Loaded(names)) => {
+                                for (name_index, db_name) in names.iter().enumerate() {
+                                    schema_rows.push(
+                                        ListItem::new(format!(
+                                            "database-name-{index}-{name_index}"
+                                        ))
+                                        .indent_level(2)
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(
+                                                    Icon::new(IconName::DatabaseZap)
+                                                        .size(IconSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new(db_name.clone())
+                                                        .size(LabelSize::Small),
+                                                ),
+                                        )
+                                        .into_any_element(),
+                                    );
+                                }
+                            }
+                            Some(DbListStatus::Failed(message)) => {
+                                schema_rows.push(
+                                    ListItem::new(format!("database-names-error-{index}"))
+                                        .indent_level(2)
+                                        .child(
+                                            Label::new(message.clone())
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Error)
+                                                .truncate(),
+                                        )
+                                        .into_any_element(),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -4696,14 +5200,15 @@ impl Render for PhpPanel {
                 continue;
             }
 
-            let text = format!(
-                "{} · {} · {}",
-                database.name,
-                display_field(&database.driver),
-                display_field(&database.target),
-            );
+            let driver = database.driver.as_deref().unwrap_or("server");
+            let paren = match (&database.user, &database.host) {
+                (Some(user), Some(host)) => format!("{user}@{host}"),
+                (None, Some(host)) => host.clone(),
+                _ => display_field(&database.target).to_string(),
+            };
             let name = database.name.clone();
             let root = database.root.clone();
+            let is_sqlite = driver == "sqlite";
             let status = self
                 .database_check_status
                 .get(&database.name)
@@ -4729,49 +5234,57 @@ impl Render for PhpPanel {
                         })
                 });
 
-            let mut item = ListItem::new(("database", index))
-                .child(Label::new(text).truncate())
-                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    this.toggle_database_schema(name.clone(), root.clone(), cx);
-                }));
-            if let Some((status_text, color)) = status {
-                item = item.end_slot(
-                    Label::new(status_text)
-                        .size(LabelSize::XSmall)
-                        .color(color)
-                        .truncate(),
-                );
-            }
-            database_rows.push(item.into_any_element());
-
-            let sql_connection = database.name.clone();
-            let mut sql_item = ListItem::new(("database-sql", index))
-                .indent_level(1)
-                .child(Label::new("SQL").truncate())
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.open_sql_form(sql_connection.clone(), window, cx);
-                }));
-            if let Some(status) = self.query_status.get(&database.name) {
-                let (status_text, color) = match status {
-                    TableStatus::Loading => ("running…".to_string(), Color::Muted),
-                    TableStatus::Loaded(rows) => (
-                        format!(
-                            "{} {}",
-                            rows.len(),
-                            if rows.len() == 1 { "row" } else { "rows" }
-                        ),
-                        Color::Default,
+            let mut connection_row = h_flex()
+                .id(("database-connection", index))
+                .w_full()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .gap_1()
+                .cursor_pointer()
+                .hover(|this| this.bg(cx.theme().colors().element_hover))
+                .child(
+                    div().flex_none().child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
                     ),
-                    TableStatus::Failed(message) => (message.clone(), Color::Error),
-                };
-                sql_item = sql_item.end_slot(
+                )
+                .child(driver_badge(driver, driver_badge_color(driver), cx))
+                .child(
+                    Label::new(database.name.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Default)
+                        .flex_none(),
+                )
+                .child(
+                    Label::new(format!("({})", paren))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .child(div().flex_1().min_w_0());
+            if let Some((status_text, color)) = status {
+                connection_row = connection_row.child(
                     Label::new(status_text)
                         .size(LabelSize::XSmall)
                         .color(color)
-                        .truncate(),
+                        .truncate()
+                        .flex_none(),
                 );
             }
-            database_rows.push(sql_item.into_any_element());
+            connection_row = connection_row.on_click(cx.listener(
+                move |this, _: &ClickEvent, _window, cx| {
+                    this.toggle_connection_expand(name.clone(), is_sqlite, root.clone(), cx);
+                },
+            ));
+            database_rows.push(connection_row.into_any_element());
+
+            database_rows.extend(schema_rows);
 
             if let Some(TableStatus::Loaded(rows)) = self.query_status.get(&database.name) {
                 database_grids.push(render_table_grid(
@@ -4782,8 +5295,6 @@ impl Render for PhpPanel {
                     cx,
                 ));
             }
-
-            database_rows.extend(schema_rows);
         }
 
         let mut collection_rows = Vec::new();
@@ -5124,19 +5635,139 @@ impl Render for PhpPanel {
                 .color(Color::Muted),
             );
 
-        let add_database_row = h_flex()
-            .id("add-database")
-            .px_3()
+        let sql_target = self.databases.first().map(|first| first.name.clone());
+
+        let database_toolbar = h_flex()
+            .id("database-toolbar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_2()
             .py_1()
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                this.open_form(FormKind::Database, window, cx);
-            }))
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
             .child(
-                Label::new("+ add database")
-                    .size(LabelSize::Small)
-                    .color(Color::Accent),
+                IconButton::new("db-add", IconName::Plus)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Add data source"))
+                    .aria_label("Add data source")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_db_menu(cx);
+                    })),
             )
-            .into_any_element();
+            .child(
+                IconButton::new("database-refresh", IconName::RotateCw)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Refresh"))
+                    .aria_label("Refresh databases")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.refresh_databases(cx);
+                    })),
+            )
+            .child(
+                IconButton::new("database-sql", IconName::Terminal)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("SQL console"))
+                    .aria_label("Open SQL console")
+                    .disabled(sql_target.is_none())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        if let Some(connection) = sql_target.clone() {
+                            this.open_sql_form(connection, window, cx);
+                        }
+                    })),
+            );
+
+        let database_driver_menu = if self.db_menu_open {
+            let mut menu_rows = Vec::new();
+            menu_rows.push(
+                h_flex()
+                    .id("db-menu-datasource")
+                    .w_full()
+                    .flex_none()
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Label::new("Data Source")
+                            .size(LabelSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_form(FormKind::Database, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+            menu_rows.push(
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .px_2()
+                    .py_0p5()
+                    .child(
+                        Label::new("Full Support")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+            for (menu_index, driver) in DATABASE_DRIVERS.iter().enumerate() {
+                let driver_name = driver.to_string();
+                menu_rows.push(
+                    h_flex()
+                        .id(("db-menu-driver", menu_index))
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_0p5()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .child(driver_badge(
+                            driver_badge_short(driver),
+                            driver_badge_color(driver),
+                            cx,
+                        ))
+                        .child(
+                            Label::new(driver_display_name(driver))
+                                .size(LabelSize::Small)
+                                .color(Color::Default)
+                                .truncate(),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.open_database_form(Some(driver_name.as_str()), window, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
+            Some(
+                v_flex()
+                    .id("db-driver-menu")
+                    .w_full()
+                    .flex_none()
+                    .gap_0p5()
+                    .px_1()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().elevated_surface_background)
+                    .shadow_sm()
+                    .max_h(px(220.))
+                    .overflow_y_scroll()
+                    .children(menu_rows),
+            )
+        } else {
+            None
+        };
 
         let section_header = |title: &'static str, cx: &Context<Self>| {
             h_flex()
@@ -5174,43 +5805,6 @@ impl Render for PhpPanel {
                         .color(Color::Success),
                 )
             });
-
-        let database_toolbar = h_flex()
-            .id("database-toolbar")
-            .w_full()
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                Label::new(format!("{} connections", self.databases.len()))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .truncate()
-                    .flex_1(),
-            )
-            .child(
-                Button::new("database-refresh", "Refresh")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
-                    .style(ButtonStyle::Subtle)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.refresh_databases(cx);
-                    })),
-            )
-            .child(
-                Button::new("database-add", "+")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
-                    .style(ButtonStyle::Subtle)
-                    .tooltip(Tooltip::text("Add database"))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.open_form(FormKind::Database, window, cx);
-                    })),
-            );
 
         let tab_bar = render_tab_bar(self.active_tab, cx);
 
@@ -5253,9 +5847,12 @@ impl Render for PhpPanel {
                 )
                 .into_any_element(),
             PanelTab::Databases => v_flex()
+                .id("database-content")
+                .relative()
                 .flex_1()
                 .min_h_0()
                 .child(database_toolbar)
+                .children(database_driver_menu)
                 .when_some(
                     self.form
                         .as_ref()
@@ -5269,11 +5866,10 @@ impl Render for PhpPanel {
                         .min_h_0()
                         .overflow_y_scroll()
                         .children(if database_rows.is_empty() {
-                            vec![empty_row("not configured")]
+                            vec![empty_row("no databases configured")]
                         } else {
                             database_rows
-                        })
-                        .child(add_database_row),
+                        }),
                 )
                 .children(database_grids)
                 .into_any_element(),
@@ -5525,6 +6121,20 @@ fn remote_root_badge(server: &Option<RemoteServer>) -> String {
         .and_then(|s| s.protocol.clone())
         .filter(|protocol| !protocol.is_empty())
         .unwrap_or_else(|| "server".to_string())
+}
+
+fn driver_badge(chip: &str, color: Color, cx: &App) -> gpui::AnyElement {
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(cx.theme().colors().element_hover)
+        .child(
+            Label::new(format!("{} ", chip))
+                .size(LabelSize::XSmall)
+                .color(color),
+        )
+        .into_any_element()
 }
 
 fn empty_row(message: &'static str) -> gpui::AnyElement {
@@ -6211,5 +6821,71 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "subdir/nested.php");
         assert_eq!(entries[0].size, Some(23));
+    }
+
+    fn connection_entry(name: &str) -> DatabaseEntry {
+        DatabaseEntry {
+            name: name.to_string(),
+            driver: None,
+            target: None,
+            user: None,
+            host: None,
+            root: PathBuf::from("/tmp"),
+        }
+    }
+
+    #[test]
+    fn driver_badge_mapping_covers_all_drivers() {
+        assert_eq!(driver_badge_short("postgres"), "pg");
+        assert_eq!(driver_badge_short("mysql"), "my");
+        assert_eq!(driver_badge_short("mariadb"), "mar");
+        assert_eq!(driver_badge_short("sqlite"), "docs");
+        assert_eq!(driver_badge_short("sqlserver"), "msr");
+        assert_eq!(driver_badge_short("oracle"), "orc");
+        assert_eq!(driver_badge_short("mongodb"), "mdb");
+        assert_eq!(driver_badge_short("redis"), "sh");
+        assert_eq!(driver_badge_short("unknown"), "?");
+        for driver in DATABASE_DRIVERS {
+            assert_ne!(driver_badge_short(driver), "?");
+            assert!(!driver_display_name(driver).is_empty());
+        }
+        assert_eq!(driver_display_name("sqlserver"), "SQL Server");
+        assert_eq!(driver_display_name("custom"), "custom");
+    }
+
+    #[test]
+    fn next_connection_name_prefills_unique_names() {
+        assert_eq!(next_connection_name("sqlite", &[]), "sqlite");
+        let taken = vec![connection_entry("sqlite")];
+        assert_eq!(next_connection_name("sqlite", &taken), "sqlite (1)");
+        let taken = vec![
+            connection_entry("sqlite"),
+            connection_entry("sqlite (1)"),
+        ];
+        assert_eq!(next_connection_name("sqlite", &taken), "sqlite (2)");
+    }
+
+    #[test]
+    fn parse_database_names_reads_list_json() {
+        let names = parse_database_names(
+            r#"{"connection":"pg","driver":"postgres","databases":["app","postgres"]}"#,
+        )
+        .expect("parse names");
+        assert_eq!(names, vec!["app", "postgres"]);
+        assert!(parse_database_names("{}").is_err());
+        assert!(parse_database_names("not json").is_err());
+    }
+
+    #[test]
+    fn parse_database_views_reads_table_shaped_json() {
+        let views = parse_database_views(
+            r#"{"connection":"app","driver":"sqlite","views":[{"name":"active_orders","columns":[{"name":"id","type":"INTEGER","primary_key":true}]}]}"#,
+        )
+        .expect("parse views");
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].name, "active_orders");
+        assert_eq!(views[0].columns.len(), 1);
+        assert!(views[0].columns[0].primary_key);
+        assert!(parse_database_views(r#"{"views":[]}"#).is_ok());
     }
 }
