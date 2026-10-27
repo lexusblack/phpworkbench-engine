@@ -28,15 +28,17 @@ enum PanelTab {
     Files,
     Remote,
     Databases,
+    Tests,
     Http,
     Collections,
 }
 
 impl PanelTab {
-    const ALL: [PanelTab; 5] = [
+    const ALL: [PanelTab; 6] = [
         PanelTab::Files,
         PanelTab::Remote,
         PanelTab::Databases,
+        PanelTab::Tests,
         PanelTab::Http,
         PanelTab::Collections,
     ];
@@ -46,6 +48,7 @@ impl PanelTab {
             PanelTab::Files => "Files",
             PanelTab::Remote => "Remote",
             PanelTab::Databases => "Databases",
+            PanelTab::Tests => "Tests",
             PanelTab::Http => "HTTP",
             PanelTab::Collections => "Collections",
         }
@@ -405,6 +408,94 @@ enum HttpStatus {
     Failed(String),
 }
 
+enum TestListStatus {
+    Unloaded,
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestStatus {
+    Pass,
+    Fail,
+    Error,
+    Skip,
+}
+
+impl TestStatus {
+    fn parse(value: &str) -> TestStatus {
+        match value {
+            "pass" | "passed" => TestStatus::Pass,
+            "error" => TestStatus::Error,
+            "skip" | "skipped" => TestStatus::Skip,
+            _ => TestStatus::Fail,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TestStatus::Pass => "✓",
+            TestStatus::Fail => "✗",
+            TestStatus::Error => "!",
+            TestStatus::Skip => "–",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            TestStatus::Pass => Color::Success,
+            TestStatus::Fail | TestStatus::Error => Color::Error,
+            TestStatus::Skip => Color::Muted,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TestCase {
+    class: String,
+    name: String,
+    file: String,
+    status: TestStatus,
+    message: String,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TestSummary {
+    total: usize,
+    passed: usize,
+    failed: usize,
+    errors: usize,
+    skipped: usize,
+}
+
+impl TestSummary {
+    fn text(self) -> String {
+        let mut parts = vec![
+            format!("{} passed", self.passed),
+            format!("{} failed", self.failed),
+        ];
+        if self.errors > 0 {
+            parts.push(format!("{} errors", self.errors));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped", self.skipped));
+        }
+        parts.join(" · ")
+    }
+}
+
+struct TestRunResult {
+    tests: Vec<TestCase>,
+    summary: TestSummary,
+}
+
+enum TestRunState {
+    Running,
+    Finished(TestRunResult),
+    Failed(String),
+}
+
 fn parse_request_line(line: &str) -> Option<(String, String)> {
     let mut parts = line.split_whitespace();
     let first = parts.next()?;
@@ -612,6 +703,77 @@ fn collection_response_status(response: &Value) -> Option<u16> {
         .map(|status| status as u16)
 }
 
+fn parse_test_files(stdout: &str) -> std::result::Result<Vec<String>, String> {
+    let value: Value = serde_json::from_str(stdout).map_err(|_| {
+        first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid JSON from php-test".to_string())
+    })?;
+    let files = value
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "test list had no files".to_string())?;
+    Ok(files
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect())
+}
+
+fn parse_test_run(stdout: &str) -> std::result::Result<TestRunResult, String> {
+    let value: Value = serde_json::from_str(stdout).map_err(|_| {
+        first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid JSON from php-test".to_string())
+    })?;
+    let tests = value
+        .get("tests")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "test run had no tests".to_string())?;
+
+    let mut cases = Vec::with_capacity(tests.len());
+    for test in tests {
+        let status = test.get("status").and_then(Value::as_str).unwrap_or("fail");
+        cases.push(TestCase {
+            class: test
+                .get("class")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: test
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            file: test
+                .get("file")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            status: TestStatus::parse(status),
+            message: test
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+
+    let summary_value = value.get("summary");
+    let summary_number = |key: &str| {
+        summary_value
+            .and_then(|summary| summary.get(key))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+    };
+    let count = |status: TestStatus| cases.iter().filter(|case| case.status == status).count();
+    let summary = TestSummary {
+        total: summary_number("total").unwrap_or(cases.len()),
+        passed: summary_number("passed").unwrap_or_else(|| count(TestStatus::Pass)),
+        failed: summary_number("failed").unwrap_or_else(|| count(TestStatus::Fail)),
+        errors: summary_number("errors").unwrap_or_else(|| count(TestStatus::Error)),
+        skipped: summary_number("skipped").unwrap_or_else(|| count(TestStatus::Skip)),
+    };
+
+    Ok(TestRunResult { tests: cases, summary })
+}
+
 fn first_non_empty_line<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
     lines
         .map(str::trim)
@@ -648,6 +810,10 @@ pub struct PhpPanel {
     query_status: HashMap<String, TableStatus>,
     expanded_tables: HashSet<(String, String)>,
     http_status: HashMap<String, HttpStatus>,
+    test_list_status: TestListStatus,
+    test_files: Vec<String>,
+    test_run: Option<TestRunState>,
+    test_active_file: Option<String>,
     form: Option<FormState>,
     saved_message: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -713,6 +879,10 @@ impl PhpPanel {
                     query_status: HashMap::new(),
                     expanded_tables: HashSet::new(),
                     http_status: HashMap::new(),
+                    test_list_status: TestListStatus::Unloaded,
+                    test_files: Vec::new(),
+                    test_run: None,
+                    test_active_file: None,
                     form: None,
                     saved_message: None,
                     _subscriptions: vec![subscription],
@@ -956,6 +1126,9 @@ impl PhpPanel {
             if tab == PanelTab::Remote {
                 self.ensure_remote_selected(cx);
             }
+            if tab == PanelTab::Tests {
+                self.ensure_tests_loaded(cx);
+            }
             cx.notify();
             return;
         }
@@ -964,6 +1137,9 @@ impl PhpPanel {
         self.saved_message = None;
         if tab == PanelTab::Remote {
             self.ensure_remote_selected(cx);
+        }
+        if tab == PanelTab::Tests {
+            self.ensure_tests_loaded(cx);
         }
         cx.notify();
     }
@@ -1427,6 +1603,121 @@ impl PhpPanel {
                     Err(message) => HttpStatus::Failed(message),
                 };
                 this.http_status.insert(key, status);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn ensure_tests_loaded(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.test_list_status,
+            TestListStatus::Unloaded | TestListStatus::Failed(_)
+        ) {
+            self.refresh_tests(cx);
+        }
+    }
+
+    fn refresh_tests(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.worktree_root(cx) else {
+            self.test_list_status = TestListStatus::Failed("no worktree".to_string());
+            cx.notify();
+            return;
+        };
+        if matches!(self.test_list_status, TestListStatus::Loading) {
+            return;
+        }
+        self.test_list_status = TestListStatus::Loading;
+        cx.notify();
+
+        let task = cx.background_spawn(async move {
+            let output = std::process::Command::new("php-test")
+                .arg("list")
+                .arg("--dir")
+                .arg(&root)
+                .arg("--json")
+                .current_dir(&root)
+                .output();
+
+            match output {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    parse_test_files(&stdout)
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "php-test list failed".to_string()))
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(files) => {
+                        this.test_files = files;
+                        this.test_list_status = TestListStatus::Loaded;
+                    }
+                    Err(message) => {
+                        this.test_files.clear();
+                        this.test_list_status = TestListStatus::Failed(message);
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn run_tests(&mut self, file: Option<String>, cx: &mut Context<Self>) {
+        if matches!(self.test_run, Some(TestRunState::Running)) {
+            return;
+        }
+        let Some(root) = self.worktree_root(cx) else {
+            self.test_run = Some(TestRunState::Failed("no worktree".to_string()));
+            cx.notify();
+            return;
+        };
+        self.test_active_file = file.clone();
+        self.test_run = Some(TestRunState::Running);
+        cx.notify();
+
+        let task = cx.background_spawn(async move {
+            let mut command = std::process::Command::new("php-test");
+            command.arg("run").arg("--dir").arg(&root);
+            if let Some(file) = &file {
+                command.arg("--file").arg(file);
+            }
+            let output = command.arg("--json").current_dir(&root).output();
+
+            match output {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Ok(result) = parse_test_run(&stdout) {
+                        Ok(result)
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                            .unwrap_or_else(|| "php-test run failed".to_string()))
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.test_run = Some(match result {
+                    Ok(result) => TestRunState::Finished(result),
+                    Err(message) => TestRunState::Failed(message),
+                });
                 cx.notify();
             })
             .log_err();
@@ -3001,6 +3292,210 @@ impl Render for PhpPanel {
             })
             .collect::<Vec<_>>();
 
+        let tests_running = matches!(self.test_run, Some(TestRunState::Running));
+        let (tests_summary_text, tests_summary_color) = match &self.test_run {
+            Some(TestRunState::Running) => ("running…".to_string(), Color::Muted),
+            Some(TestRunState::Finished(result)) => (result.summary.text(), Color::Default),
+            Some(TestRunState::Failed(message)) => (message.clone(), Color::Error),
+            None => match &self.test_list_status {
+                TestListStatus::Loading => ("loading…".to_string(), Color::Muted),
+                TestListStatus::Failed(message) => (message.clone(), Color::Error),
+                _ => ("idle".to_string(), Color::Muted),
+            },
+        };
+
+        let tests_toolbar = h_flex()
+            .id("tests-toolbar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Button::new("tests-run-all", "Run all")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::XSmall)
+                    .style(ButtonStyle::Subtle)
+                    .disabled(tests_running)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.run_tests(None, cx);
+                    })),
+            )
+            .child(
+                Button::new("tests-refresh", "Refresh")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::XSmall)
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.refresh_tests(cx);
+                    })),
+            )
+            .child(
+                Label::new(tests_summary_text)
+                    .size(LabelSize::XSmall)
+                    .color(tests_summary_color)
+                    .truncate()
+                    .flex_1(),
+            );
+
+        let mut test_rows = Vec::new();
+        for (index, file) in self.test_files.iter().enumerate() {
+            let file_for_click = file.clone();
+            let mut item = ListItem::new(("test-file", index))
+                .child(Label::new(file.clone()).truncate())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.run_tests(Some(file_for_click.clone()), cx);
+                }));
+            let status = match &self.test_run {
+                Some(TestRunState::Running)
+                    if self.test_active_file.as_deref() == Some(file.as_str()) =>
+                {
+                    Some(("running…".to_string(), Color::Muted))
+                }
+                Some(TestRunState::Finished(result)) => {
+                    let cases = result
+                        .tests
+                        .iter()
+                        .filter(|case| case.file == *file)
+                        .collect::<Vec<_>>();
+                    if cases.is_empty() {
+                        None
+                    } else {
+                        let passed = cases
+                            .iter()
+                            .filter(|case| case.status == TestStatus::Pass)
+                            .count();
+                        let failed = cases
+                            .iter()
+                            .filter(|case| {
+                                matches!(case.status, TestStatus::Fail | TestStatus::Error)
+                            })
+                            .count();
+                        let color = if failed > 0 {
+                            Color::Error
+                        } else if passed > 0 {
+                            Color::Success
+                        } else {
+                            Color::Muted
+                        };
+                        Some((format!("{passed}/{} pass", cases.len()), color))
+                    }
+                }
+                _ => None,
+            };
+            if let Some((status_text, color)) = status {
+                item = item.end_slot(
+                    Label::new(status_text)
+                        .size(LabelSize::XSmall)
+                        .color(color)
+                        .truncate(),
+                );
+            }
+            test_rows.push(item.into_any_element());
+        }
+
+        if test_rows.is_empty() {
+            let (message, color) = match &self.test_list_status {
+                TestListStatus::Loading => ("loading…".to_string(), Color::Muted),
+                TestListStatus::Failed(message) => (message.clone(), Color::Error),
+                _ => ("no test files".to_string(), Color::Muted),
+            };
+            test_rows.push(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .child(Label::new(message).size(LabelSize::Small).color(color))
+                    .into_any_element(),
+            );
+        }
+
+        let test_result_rows = match &self.test_run {
+            Some(TestRunState::Running) => vec![
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .child(
+                        Label::new("running…")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            ],
+            Some(TestRunState::Failed(message)) => vec![
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .child(
+                        Label::new(message.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error)
+                            .truncate(),
+                    )
+                    .into_any_element(),
+            ],
+            Some(TestRunState::Finished(result)) => result
+                .tests
+                .iter()
+                .map(|case| {
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            Label::new(case.status.label())
+                                .size(LabelSize::XSmall)
+                                .color(case.status.color())
+                                .flex_none(),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    Label::new(format!("{}::{}", case.class, case.name))
+                                        .size(LabelSize::XSmall)
+                                        .color(case.status.color())
+                                        .truncate(),
+                                )
+                                .when(!case.message.is_empty(), |this| {
+                                    this.child(
+                                        Label::new(case.message.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                }),
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+
+        let tests_results_header = h_flex()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Label::new(match &self.test_run {
+                    Some(TestRunState::Finished(result)) => format!(
+                        "Results · {} tests · {}",
+                        result.summary.total,
+                        result.summary.text()
+                    ),
+                    Some(TestRunState::Running) => "Results · running…".to_string(),
+                    Some(TestRunState::Failed(_)) => "Results · failed".to_string(),
+                    None => "Results".to_string(),
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            );
+
         let add_server_row = h_flex()
             .id("add-server")
             .px_3()
@@ -3171,6 +3666,28 @@ impl Render for PhpPanel {
                         .child(add_database_row),
                 )
                 .children(database_grids)
+                .into_any_element(),
+            PanelTab::Tests => v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(tests_toolbar)
+                .child(
+                    div()
+                        .id("php-tests-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(test_rows),
+                )
+                .child(tests_results_header)
+                .child(
+                    div()
+                        .id("php-test-results")
+                        .flex_shrink_0()
+                        .max_h(relative(0.5))
+                        .overflow_y_scroll()
+                        .children(test_result_rows),
+                )
                 .into_any_element(),
             PanelTab::Collections => div()
                 .id("php-collections-scroll")
@@ -3651,6 +4168,34 @@ mod tests {
         assert_eq!(connections[1]["password_env"], json!("PGPASSWORD"));
 
         std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn parse_test_list_reads_files() {
+        let files = parse_test_files(
+            r#"{"files":["tests/CalculatorTest.php","tests/FailingTest.php"],"tool":"phpunit"}"#,
+        )
+        .expect("parse test list");
+        assert_eq!(
+            files,
+            vec!["tests/CalculatorTest.php", "tests/FailingTest.php"]
+        );
+    }
+
+    #[test]
+    fn parse_test_run_reads_statuses_and_summary() {
+        let output = r#"{"tool":"phpunit","tests":[{"name":"testAddsNumbers","class":"App\\Tests\\CalculatorTest","file":"tests/CalculatorTest.php","status":"pass","message":""},{"name":"testFailsOnPurpose","class":"App\\Tests\\FailingTest","file":"tests/FailingTest.php","status":"fail","message":"Failed asserting that 5 is identical to 4."},{"name":"testIsSkipped","class":"App\\Tests\\FailingTest","file":"tests/FailingTest.php","status":"skip","message":""}],"summary":{"total":3,"passed":1,"failed":1,"errors":0,"skipped":1}}"#;
+        let result = parse_test_run(output).expect("parse test run");
+        assert_eq!(result.tests.len(), 3);
+        assert_eq!(result.tests[0].status, TestStatus::Pass);
+        assert_eq!(result.tests[1].status, TestStatus::Fail);
+        assert_eq!(result.tests[1].message, "Failed asserting that 5 is identical to 4.");
+        assert_eq!(result.tests[2].status, TestStatus::Skip);
+        assert_eq!(result.summary.total, 3);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.failed, 1);
+        assert_eq!(result.summary.skipped, 1);
+        assert_eq!(result.summary.text(), "1 passed · 1 failed · 1 skipped");
     }
 
     #[test]
