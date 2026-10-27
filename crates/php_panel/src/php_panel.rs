@@ -89,6 +89,7 @@ struct DatabaseEntry {
 enum FormKind {
     Server,
     Database,
+    Sql,
 }
 
 #[derive(Clone)]
@@ -97,6 +98,7 @@ struct FormState {
     fields: Vec<String>,
     active: usize,
     message: Option<String>,
+    connection: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,12 +127,24 @@ impl FormState {
                 String::new(),
                 String::new(),
             ],
+            FormKind::Sql => vec![String::new()],
         };
         Self {
             kind,
             fields,
             active: 0,
             message: None,
+            connection: None,
+        }
+    }
+
+    fn sql(connection: String) -> Self {
+        Self {
+            kind: FormKind::Sql,
+            fields: vec![String::new()],
+            active: 0,
+            message: None,
+            connection: Some(connection),
         }
     }
 
@@ -146,6 +160,14 @@ impl FormState {
                 "local_root",
             ],
             FormKind::Database => &["name", "driver", "target", "user", "database"],
+            FormKind::Sql => &["sql"],
+        }
+    }
+
+    fn placeholder(&self, index: usize) -> Option<&'static str> {
+        match (self.kind, index) {
+            (FormKind::Sql, 0) => Some("select * from users limit 20"),
+            _ => None,
         }
     }
 
@@ -623,6 +645,7 @@ pub struct PhpPanel {
     database_status: HashMap<String, DatabaseStatus>,
     database_check_status: HashMap<String, SyncStatus>,
     table_status: HashMap<(String, String), TableStatus>,
+    query_status: HashMap<String, TableStatus>,
     expanded_tables: HashSet<(String, String)>,
     http_status: HashMap<String, HttpStatus>,
     form: Option<FormState>,
@@ -687,6 +710,7 @@ impl PhpPanel {
                     database_status: HashMap::new(),
                     database_check_status: HashMap::new(),
                     table_status: HashMap::new(),
+                    query_status: HashMap::new(),
                     expanded_tables: HashSet::new(),
                     http_status: HashMap::new(),
                     form: None,
@@ -1426,6 +1450,19 @@ impl PhpPanel {
         cx.notify();
     }
 
+    fn open_sql_form(
+        &mut self,
+        connection: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.form = Some(FormState::sql(connection));
+        self.query.clear();
+        self.saved_message = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
     fn handle_form_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let outcome = self.form.as_mut().map(|form| {
             form.handle_key(
@@ -1450,6 +1487,7 @@ impl PhpPanel {
         };
         let kind = form.kind;
         let fields = form.fields.clone();
+        let connection = form.connection.clone();
         let Some(root) = self.worktree_root(cx) else {
             if let Some(form) = self.form.as_mut() {
                 form.message = Some("no open worktree".to_string());
@@ -1458,9 +1496,32 @@ impl PhpPanel {
             return;
         };
 
+        if kind == FormKind::Sql {
+            let sql = form_field(&fields, 0);
+            if sql.is_empty() {
+                if let Some(form) = self.form.as_mut() {
+                    form.message = Some("sql is empty".to_string());
+                }
+                cx.notify();
+                return;
+            }
+            let Some(connection) = connection else {
+                if let Some(form) = self.form.as_mut() {
+                    form.message = Some("no connection".to_string());
+                }
+                cx.notify();
+                return;
+            };
+            self.form = None;
+            self.run_sql_query(connection, sql, root, cx);
+            cx.notify();
+            return;
+        }
+
         let saved = match kind {
             FormKind::Server => save_server_config(&root, &fields),
             FormKind::Database => save_database_config(&root, &fields),
+            FormKind::Sql => return,
         };
 
         match saved {
@@ -1476,6 +1537,7 @@ impl PhpPanel {
                         self.run_server_check(name, root, cx);
                     }
                     FormKind::Database => self.run_database_check(name, root, cx),
+                    FormKind::Sql => {}
                 }
                 cx.notify();
             }
@@ -1672,6 +1734,57 @@ impl PhpPanel {
                     Err(message) => TableStatus::Failed(message),
                 };
                 this.table_status.insert(key, status);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn run_sql_query(
+        &mut self,
+        connection: String,
+        sql: String,
+        root: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.query_status
+            .insert(connection.clone(), TableStatus::Loading);
+        cx.notify();
+
+        let task_connection = connection.clone();
+        let task = cx.background_spawn(async move {
+            let output = std::process::Command::new("php-db")
+                .arg("query")
+                .arg(&task_connection)
+                .arg(&sql)
+                .arg("--json")
+                .current_dir(&root)
+                .output();
+
+            match output {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    parse_table_rows(&stdout)
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "query command failed".to_string()))
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                let status = match result {
+                    Ok(rows) => TableStatus::Loaded(rows),
+                    Err(message) => TableStatus::Failed(message),
+                };
+                this.query_status.insert(connection, status);
                 cx.notify();
             })
             .log_err();
@@ -1982,6 +2095,23 @@ fn parse_table_rows(stdout: &str) -> Result<Vec<serde_json::Map<String, Value>>,
         .as_array()
         .ok_or_else(|| "query JSON was not an array".to_string())?;
     Ok(rows.iter().filter_map(Value::as_object).cloned().collect())
+}
+
+fn query_columns(rows: &[serde_json::Map<String, Value>]) -> Vec<DatabaseColumn> {
+    let mut seen = HashSet::new();
+    let mut columns = Vec::new();
+    for row in rows {
+        for name in row.keys() {
+            if seen.insert(name.clone()) {
+                columns.push(DatabaseColumn {
+                    name: name.clone(),
+                    column_type: String::new(),
+                    primary_key: false,
+                });
+            }
+        }
+    }
+    columns
 }
 
 fn display_value(value: &Value) -> String {
@@ -2694,6 +2824,46 @@ impl Render for PhpPanel {
                 );
             }
             database_rows.push(item.into_any_element());
+
+            let sql_connection = database.name.clone();
+            let mut sql_item = ListItem::new(("database-sql", index))
+                .indent_level(1)
+                .child(Label::new("SQL").truncate())
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.open_sql_form(sql_connection.clone(), window, cx);
+                }));
+            if let Some(status) = self.query_status.get(&database.name) {
+                let (status_text, color) = match status {
+                    TableStatus::Loading => ("running…".to_string(), Color::Muted),
+                    TableStatus::Loaded(rows) => (
+                        format!(
+                            "{} {}",
+                            rows.len(),
+                            if rows.len() == 1 { "row" } else { "rows" }
+                        ),
+                        Color::Default,
+                    ),
+                    TableStatus::Failed(message) => (message.clone(), Color::Error),
+                };
+                sql_item = sql_item.end_slot(
+                    Label::new(status_text)
+                        .size(LabelSize::XSmall)
+                        .color(color)
+                        .truncate(),
+                );
+            }
+            database_rows.push(sql_item.into_any_element());
+
+            if let Some(TableStatus::Loaded(rows)) = self.query_status.get(&database.name) {
+                database_grids.push(render_table_grid(
+                    &format!("database-query-grid-{index}"),
+                    "query",
+                    &query_columns(rows),
+                    rows,
+                    cx,
+                ));
+            }
+
             database_rows.extend(schema_rows);
         }
 
@@ -2984,7 +3154,7 @@ impl Render for PhpPanel {
                 .when_some(
                     self.form
                         .as_ref()
-                        .filter(|form| form.kind == FormKind::Database),
+                        .filter(|form| matches!(form.kind, FormKind::Database | FormKind::Sql)),
                     |this, form| this.child(render_form(form)),
                 )
                 .child(
@@ -3120,6 +3290,7 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
     let title = match form.kind {
         FormKind::Server => "new server",
         FormKind::Database => "new database",
+        FormKind::Sql => "sql console",
     };
     rows.push(
         h_flex()
@@ -3137,15 +3308,23 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
         let active = index == form.active;
         let value = form.fields.get(index).cloned().unwrap_or_default();
         let empty = value.is_empty();
-        let display = if active {
+        let placeholder = form.placeholder(index);
+        let display = if empty {
+            match placeholder {
+                Some(placeholder) if active => format!("{placeholder}|"),
+                Some(placeholder) => placeholder.to_string(),
+                None if active => "|".to_string(),
+                None => "—".to_string(),
+            }
+        } else if active {
             format!("{value}|")
-        } else if empty {
-            "—".to_string()
         } else {
             value
         };
         let value_label = Label::new(display).size(LabelSize::Small).truncate();
-        let value_label = if active {
+        let value_label = if empty && placeholder.is_some() {
+            value_label.color(Color::Placeholder)
+        } else if active {
             value_label.color(Color::Accent).underline()
         } else if empty {
             value_label.color(Color::Placeholder)
@@ -3168,12 +3347,16 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
         );
     }
 
+    let footer = match form.kind {
+        FormKind::Sql => "Enter run · Esc cancel",
+        FormKind::Server | FormKind::Database => "Tab next · Enter save · Esc cancel",
+    };
     rows.push(
         h_flex()
             .px_3()
             .py_1()
             .child(
-                Label::new("Tab next · Enter save · Esc cancel")
+                Label::new(footer)
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
@@ -3229,7 +3412,7 @@ mod tests {
 
     #[test]
     fn form_defaults_match_field_labels() {
-        for kind in [FormKind::Server, FormKind::Database] {
+        for kind in [FormKind::Server, FormKind::Database, FormKind::Sql] {
             let form = FormState::new(kind);
             assert_eq!(form.fields.len(), form.labels().len());
             assert_eq!(form.active, 0);
@@ -3239,6 +3422,28 @@ mod tests {
         assert_eq!(server.fields[6], ".");
         let database = FormState::new(FormKind::Database);
         assert_eq!(database.fields[1], "sqlite");
+        let sql = FormState::sql("app".to_string());
+        assert_eq!(sql.labels(), &["sql"]);
+        assert_eq!(sql.placeholder(0), Some("select * from users limit 20"));
+        assert_eq!(sql.connection.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn query_columns_unions_keys_in_row_order() {
+        let rows = vec![
+            json!({"id": 1, "email": "a@example.test"}),
+            json!({"email": "b@example.test", "name": "B"}),
+        ];
+        let rows = rows
+            .into_iter()
+            .filter_map(|row| row.as_object().cloned())
+            .collect::<Vec<_>>();
+        let columns = query_columns(&rows);
+        let names = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["id", "email", "name"]);
     }
 
     #[test]
