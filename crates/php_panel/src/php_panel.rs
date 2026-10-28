@@ -30,7 +30,19 @@ use util::ResultExt as _;
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{OpenOptions, Panel, StatusItemView, Workspace};
 
-actions!(php_panel, [ToggleFocus, OpenDeploymentDialog, BrowseRemoteHost]);
+actions!(
+    php_panel,
+    [ToggleFocus, OpenDeploymentDialog, BrowseRemoteHost, SelectNextTab, SelectPrevTab]
+);
+
+fn next_tab(active: PanelTab, offset: isize) -> PanelTab {
+    let len = PanelTab::ALL.len() as isize;
+    let index = PanelTab::ALL
+        .iter()
+        .position(|tab| *tab == active)
+        .unwrap_or(0) as isize;
+    PanelTab::ALL[((index + offset).rem_euclid(len)) as usize]
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PanelTab {
@@ -1880,6 +1892,12 @@ impl PhpPanel {
                     workspace.toggle_panel_focus::<PhpPanel>(window, cx);
                 },
             );
+            workspace.register_action(|_, _: &SelectNextTab, window, cx| {
+                select_tab_cyclically(window, cx, |active| next_tab(active, 1));
+            });
+            workspace.register_action(|_, _: &SelectPrevTab, window, cx| {
+                select_tab_cyclically(window, cx, |active| next_tab(active, -1));
+            });
         })
         .detach();
     }
@@ -5930,6 +5948,20 @@ impl Render for PhpPanel {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let modifiers = &event.keystroke.modifiers;
+                if this.form.is_none()
+                    && modifiers.control
+                    && modifiers.alt
+                    && !modifiers.shift
+                    && !modifiers.platform
+                    && !modifiers.function
+                {
+                    if let Ok(index) = event.keystroke.key.parse::<usize>() {
+                        if (1..=6).contains(&index) {
+                            this.select_tab(PanelTab::ALL[index - 1], cx);
+                            return;
+                        }
+                    }
+                }
                 if modifiers.platform || modifiers.control || modifiers.alt {
                     return;
                 }
@@ -5968,7 +6000,26 @@ impl Render for PhpPanel {
             }))
             .child(tab_bar)
             .child(content)
-    }
+    }}
+
+fn select_tab_cyclically(
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    next: fn(PanelTab) -> PanelTab,
+) {
+    let Some(panel) = cx
+        .global::<DeployShared>()
+        .panel
+        .clone()
+        .and_then(|panel| panel.upgrade())
+    else {
+        return;
+    };
+    panel.update(cx, |panel, cx| {
+        panel.select_tab(next(panel.active_tab), cx);
+    });
+    let focus_handle = panel.read(cx).focus_handle.clone();
+    window.focus(&focus_handle, cx);
 }
 
 fn render_tab_bar(active: PanelTab, cx: &Context<PhpPanel>) -> gpui::AnyElement {
@@ -6887,5 +6938,16 @@ mod tests {
         assert_eq!(views[0].columns.len(), 1);
         assert!(views[0].columns[0].primary_key);
         assert!(parse_database_views(r#"{"views":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn next_tab_advances_cyclically() {
+        assert_eq!(next_tab(PanelTab::Files, 1), PanelTab::Remote);
+        assert_eq!(next_tab(PanelTab::Collections, 1), PanelTab::Files);
+        assert_eq!(next_tab(PanelTab::Files, -1), PanelTab::Collections);
+        assert_eq!(next_tab(PanelTab::Collections, -1), PanelTab::Http);
+        for tab in PanelTab::ALL {
+            assert_eq!(next_tab(tab, 6), tab);
+        }
     }
 }
