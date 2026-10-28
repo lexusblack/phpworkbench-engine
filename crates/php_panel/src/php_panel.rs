@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Result;
 use gpui::{
-    Anchor, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId, Entity,
+    Action, Anchor, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId, Entity,
     EventEmitter, TextStyle, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, StatefulInteractiveElement, Styled, Subscription,
     UniformListScrollHandle, WeakEntity, Window, AnyWindowHandle, SharedString, TitlebarOptions,
@@ -17,6 +17,8 @@ use gpui::{
 use editor::{Editor, EditorElement, EditorStyle, actions as editor_actions};
 use project::{Project, ProjectPath};
 use regex::Regex;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::Value;
 use file_icons::FileIcons;
 use ui::{
@@ -31,8 +33,18 @@ use workspace::{OpenOptions, Panel, StatusItemView, Workspace};
 
 actions!(
     php_panel,
-    [ToggleFocus, OpenDeploymentDialog, OpenDataSourcesDialog, BrowseRemoteHost, SelectNextTab, SelectPrevTab]
+    [ToggleFocus, OpenDeploymentDialog, OpenDataSourcesDialog, OpenSshConfigsDialog, BrowseRemoteHost, SelectNextTab, SelectPrevTab]
 );
+
+/// Adds a SQLite file picked in the project tree as a data source.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct AddAsDataSource {
+    /// Absolute path of the SQLite file to add.
+    #[serde(default)]
+    pub abs_path: Option<String>,
+}
 
 fn next_tab(active: PanelTab, offset: isize) -> PanelTab {
     let len = PanelTab::ALL.len() as isize;
@@ -82,12 +94,211 @@ struct RemoteServer {
     host: Option<String>,
     port: Option<String>,
     user: Option<String>,
+    password: Option<String>,
+    password_session: bool,
+    ssh_config: Option<String>,
     remote_root: Option<String>,
     local_root: Option<String>,
     web_url: Option<String>,
     excluded: Vec<String>,
     upload_on_save: bool,
+    use_rsync: bool,
+    visible: bool,
+    passive_mode: bool,
+    show_hidden: bool,
+    list_compat: bool,
+    use_mlsd: bool,
+    max_connections: u32,
+    keep_alive_enabled: bool,
+    keep_alive_seconds: u32,
+    encoding: String,
     root: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SavePassword {
+    Forever,
+    Session,
+}
+
+impl SavePassword {
+    fn label(self) -> &'static str {
+        match self {
+            SavePassword::Forever => "Forever",
+            SavePassword::Session => "Session",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            SavePassword::Forever => SavePassword::Session,
+            SavePassword::Session => SavePassword::Forever,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            SavePassword::Forever => "Password saved permanently",
+            SavePassword::Session => "Password saved for the current session",
+        }
+    }
+}
+
+const ADVANCED_DEFAULT_ENCODING: &str = "UTF-8";
+const ADVANCED_DEFAULT_MAX_CONNECTIONS: u32 = 5;
+const ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS: u32 = 300;
+
+fn deploy_type_has_advanced(protocol: &str) -> bool {
+    matches!(
+        deploy_type_canonical(protocol),
+        Some("ftp") | Some("ftps") | Some("webdav") | Some("webdavs")
+    )
+}
+
+fn picker_query_matches(query: &str, name: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    name.to_lowercase().contains(&needle)
+}
+
+fn parse_local_dir_entries(items: Vec<(String, bool)>) -> Vec<RemoteEntry> {
+    let mut entries: Vec<RemoteEntry> = items
+        .into_iter()
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, is_directory)| RemoteEntry {
+            path: name.clone(),
+            name,
+            is_directory,
+            size: None,
+        })
+        .collect();
+    entries.sort_by(|a, b| match (a.is_directory, b.is_directory) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    entries
+}
+
+const DEPLOY_TYPES: [&str; 7] = ["local", "in-place", "sftp", "ftp", "ftps", "webdav", "webdavs"];
+
+fn deploy_type_canonical(protocol: &str) -> Option<&'static str> {
+    match protocol.trim().to_ascii_lowercase().as_str() {
+        "local" => Some("local"),
+        "in-place" | "inplace" | "in_place" | "in place" => Some("in-place"),
+        "sftp" | "ssh" => Some("sftp"),
+        "ftp" => Some("ftp"),
+        "ftps" | "ftp-ssl" | "ftpes" => Some("ftps"),
+        "webdav" | "dav" => Some("webdav"),
+        "webdavs" | "davs" | "dav+" => Some("webdavs"),
+        _ => None,
+    }
+}
+
+fn next_deploy_type(current: &str) -> &'static str {
+    let canonical = deploy_type_canonical(current).unwrap_or("local");
+    let position = DEPLOY_TYPES
+        .iter()
+        .position(|known| *known == canonical)
+        .unwrap_or(0);
+    DEPLOY_TYPES[(position + 1) % DEPLOY_TYPES.len()]
+}
+
+fn deploy_type_badge_short(protocol: &str) -> &'static str {
+    match deploy_type_canonical(protocol) {
+        Some("local") => "local",
+        Some("in-place") => "dl",
+        Some("sftp") => "ssh",
+        Some("ftp") | Some("ftps") => "ftp",
+        Some("webdav") => "dav",
+        Some("webdavs") => "dav+",
+        _ => "?",
+    }
+}
+
+fn deploy_type_badge_color(protocol: &str) -> Color {
+    match deploy_type_canonical(protocol) {
+        Some("local") => Color::Success,
+        Some("in-place") => Color::Accent,
+        Some("sftp") => Color::Info,
+        Some("ftp") | Some("ftps") => Color::Warning,
+        Some("webdav") | Some("webdavs") => Color::Created,
+        _ => Color::Muted,
+    }
+}
+
+fn deploy_type_display_name(protocol: &str) -> String {
+    match deploy_type_canonical(protocol) {
+        Some("local") => "Local or mounted folder".to_string(),
+        Some("in-place") => "In place".to_string(),
+        Some("sftp") => "SFTP".to_string(),
+        Some("ftp") => "FTP".to_string(),
+        Some("ftps") => "FTPS".to_string(),
+        Some("webdav") => "WebDAV".to_string(),
+        Some("webdavs") => "WebDAV (HTTPS)".to_string(),
+        _ => protocol.to_string(),
+    }
+}
+
+fn deploy_default_port(protocol: &str) -> Option<&'static str> {
+    match deploy_type_canonical(protocol) {
+        Some("ftp") => Some("21"),
+        Some("ftps") => Some("990"),
+        Some("webdav") => Some("80"),
+        Some("webdavs") => Some("443"),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeployField {
+    SshConfig,
+    Host,
+    Port,
+    User,
+    AnonToggle,
+    Password,
+    Folder,
+    RootPath,
+    WebUrl,
+    TestConnection,
+    RsyncToggle,
+}
+
+fn deploy_connection_fields(protocol: &str) -> &'static [DeployField] {
+    match deploy_type_canonical(protocol) {
+        Some("sftp") => &[
+            DeployField::SshConfig,
+            DeployField::RsyncToggle,
+            DeployField::RootPath,
+            DeployField::WebUrl,
+            DeployField::TestConnection,
+        ],
+        Some("ftp") | Some("ftps") | Some("webdav") | Some("webdavs") => &[
+            DeployField::Host,
+            DeployField::Port,
+            DeployField::User,
+            DeployField::AnonToggle,
+            DeployField::Password,
+            DeployField::RootPath,
+            DeployField::WebUrl,
+            DeployField::TestConnection,
+        ],
+        Some("local") => &[
+            DeployField::Folder,
+            DeployField::RootPath,
+            DeployField::WebUrl,
+            DeployField::TestConnection,
+        ],
+        Some("in-place") => &[DeployField::WebUrl, DeployField::TestConnection],
+        _ => &[
+            DeployField::RootPath,
+            DeployField::WebUrl,
+            DeployField::TestConnection,
+        ],
+    }
 }
 
 #[derive(Clone)]
@@ -240,10 +451,15 @@ struct DialogBuffer {
     host: String,
     port: String,
     user: String,
+    password: String,
+    password_session: bool,
     remote_root: String,
     local_root: String,
     web_url: String,
     excluded: String,
+    max_connections: String,
+    keep_alive_seconds: String,
+    encoding: String,
 }
 
 impl DialogBuffer {
@@ -254,12 +470,23 @@ impl DialogBuffer {
                 host: server.host.clone().unwrap_or_default(),
                 port: server.port.clone().unwrap_or_default(),
                 user: server.user.clone().unwrap_or_default(),
+                password: server.password.clone().unwrap_or_default(),
+                password_session: server.password_session,
                 remote_root: server.remote_root.clone().unwrap_or_default(),
                 local_root: server.local_root.clone().unwrap_or_default(),
                 web_url: server.web_url.clone().unwrap_or_default(),
                 excluded: excluded_text(Some(server.excluded.as_slice())),
+                max_connections: server.max_connections.to_string(),
+                keep_alive_seconds: server.keep_alive_seconds.to_string(),
+                encoding: server.encoding.clone(),
             },
-            None => Self::default(),
+            None => Self {
+                password_session: false,
+                max_connections: ADVANCED_DEFAULT_MAX_CONNECTIONS.to_string(),
+                keep_alive_seconds: ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS.to_string(),
+                encoding: ADVANCED_DEFAULT_ENCODING.to_string(),
+                ..Self::default()
+            },
         }
     }
 
@@ -286,6 +513,29 @@ impl DialogBuffer {
         apply_connection_fields(server, &self.connection_fields(protocol));
         apply_mapping_fields(server, &self.mapping_fields());
         apply_excluded_field(server, &[self.excluded.clone()]);
+        let password = self.password.trim().to_string();
+        server.password = if password.is_empty() {
+            None
+        } else {
+            Some(password)
+        };
+        server.password_session = self.password_session;
+        server.max_connections = self
+            .max_connections
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(ADVANCED_DEFAULT_MAX_CONNECTIONS);
+        server.keep_alive_seconds = self
+            .keep_alive_seconds
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS);
+        let encoding = self.encoding.trim().to_string();
+        server.encoding = if encoding.is_empty() {
+            ADVANCED_DEFAULT_ENCODING.to_string()
+        } else {
+            encoding
+        };
     }
 }
 
@@ -310,14 +560,27 @@ pub struct DeploymentDialog {
     next_number: usize,
     message: Option<(String, Color)>,
     panel: Option<WeakEntity<PhpPanel>>,
+    ssh_config_name: String,
+    ssh_menu_open: bool,
+    ssh_configs: Vec<SshEntry>,
+    advanced_open: bool,
+    save_password: SavePassword,
     name_editor: Entity<Editor>,
     host_editor: Entity<Editor>,
     port_editor: Entity<Editor>,
     user_editor: Entity<Editor>,
+    password_editor: Entity<Editor>,
     remote_root_editor: Entity<Editor>,
     local_root_editor: Entity<Editor>,
     web_url_editor: Entity<Editor>,
     excluded_editor: Entity<Editor>,
+    max_connections_editor: Entity<Editor>,
+    keep_alive_seconds_editor: Entity<Editor>,
+    encoding_editor: Entity<Editor>,
+    validate_warnings: Vec<(String, Vec<String>)>,
+    validate_seq: u64,
+    autodetect_status: Option<(String, Color)>,
+    autodetect_seq: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -338,14 +601,27 @@ impl DeploymentDialog {
             next_number: 1,
             message: None,
             panel: None,
+            ssh_config_name: String::new(),
+            ssh_menu_open: false,
+            ssh_configs: Vec::new(),
+            advanced_open: false,
+            save_password: SavePassword::Forever,
             name_editor: cx.new(|cx| Editor::single_line(window, cx)),
             host_editor: cx.new(|cx| Editor::single_line(window, cx)),
             port_editor: cx.new(|cx| Editor::single_line(window, cx)),
             user_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            password_editor: cx.new(|cx| Editor::single_line(window, cx)),
             remote_root_editor: cx.new(|cx| Editor::single_line(window, cx)),
             local_root_editor: cx.new(|cx| Editor::single_line(window, cx)),
             web_url_editor: cx.new(|cx| Editor::single_line(window, cx)),
             excluded_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            max_connections_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            keep_alive_seconds_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            encoding_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            validate_warnings: Vec::new(),
+            validate_seq: 0,
+            autodetect_status: None,
+            autodetect_seq: 0,
             _subscriptions: Vec::new(),
         };
         dialog.seed_from_disk(window, cx);
@@ -354,6 +630,7 @@ impl DeploymentDialog {
 
     fn seed_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.servers = load_deploy_servers(&self.root);
+        self.ssh_configs = load_ssh_configs(&self.root);
         let names = self
             .servers
             .iter()
@@ -378,6 +655,7 @@ impl DeploymentDialog {
         }
         self.update_next_number();
         self.load_editors(window, cx);
+        self.schedule_validate(cx);
         cx.notify();
     }
 
@@ -405,12 +683,34 @@ impl DeploymentDialog {
         };
         set(&self.name_editor, buffer.name.clone());
         set(&self.host_editor, buffer.host.clone());
-        set(&self.port_editor, buffer.port.clone());
-        set(&self.user_editor, buffer.user.clone());
+        let port = if buffer.port.is_empty() {
+            deploy_default_port(&self.protocol).unwrap_or_default().to_string()
+        } else {
+            buffer.port.clone()
+        };
+        set(&self.port_editor, port);        set(&self.user_editor, buffer.user.clone());
+        set(&self.password_editor, buffer.password.clone());
+        self.save_password = if buffer.password_session {
+            SavePassword::Session
+        } else {
+            SavePassword::Forever
+        };
+        self.ssh_config_name = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .and_then(|server| server.ssh_config.clone())
+            .unwrap_or_default();
+        self.ssh_menu_open = false;
         set(&self.remote_root_editor, buffer.remote_root.clone());
         set(&self.local_root_editor, buffer.local_root.clone());
         set(&self.web_url_editor, buffer.web_url.clone());
         set(&self.excluded_editor, buffer.excluded.clone());
+        set(&self.max_connections_editor, buffer.max_connections.clone());
+        set(
+            &self.keep_alive_seconds_editor,
+            buffer.keep_alive_seconds.clone(),
+        );
+        set(&self.encoding_editor, buffer.encoding.clone());
     }
 
     fn buffer(&self, cx: &App) -> DialogBuffer {
@@ -420,10 +720,15 @@ impl DeploymentDialog {
             host: text(&self.host_editor),
             port: text(&self.port_editor),
             user: text(&self.user_editor),
+            password: text(&self.password_editor),
+            password_session: self.save_password == SavePassword::Session,
             remote_root: text(&self.remote_root_editor),
             local_root: text(&self.local_root_editor),
             web_url: text(&self.web_url_editor),
             excluded: text(&self.excluded_editor),
+            max_connections: text(&self.max_connections_editor),
+            keep_alive_seconds: text(&self.keep_alive_seconds_editor),
+            encoding: text(&self.encoding_editor),
         }
     }
 
@@ -447,7 +752,9 @@ impl DeploymentDialog {
         self.selected = Some(index);
         self.tab = DeployTab::Connection;
         self.message = None;
+        self.autodetect_status = None;
         self.load_editors(window, cx);
+        self.schedule_validate(cx);
         cx.notify();
     }
 
@@ -459,6 +766,7 @@ impl DeploymentDialog {
         self.tab = tab;
         self.message = None;
         self.load_editors(window, cx);
+        self.schedule_validate(cx);
         cx.notify();
     }
 
@@ -468,7 +776,9 @@ impl DeploymentDialog {
         self.selected = Some(self.servers.len() - 1);
         self.tab = DeployTab::Connection;
         self.message = None;
+        self.autodetect_status = None;
         self.load_editors(window, cx);
+        self.schedule_validate(cx);
         cx.notify();
     }
 
@@ -486,17 +796,513 @@ impl DeploymentDialog {
         };
         self.tab = DeployTab::Connection;
         self.message = None;
+        self.autodetect_status = None;
         self.load_editors(window, cx);
+        self.schedule_validate(cx);
         cx.notify();
     }
 
-    fn toggle_protocol(&mut self, cx: &mut Context<Self>) {
-        self.protocol = if self.protocol == "local" {
-            "sftp".to_string()
-        } else {
-            "local".to_string()
-        };
+    fn cycle_deploy_type(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        self.protocol = next_deploy_type(&self.protocol).to_string();
+        if let Some(index) = self.selected {
+            if let Some(server) = self.servers.get_mut(index) {
+                server.protocol = Some(self.protocol.clone());
+            }
+        }
+        self.message = None;
+        self.autodetect_status = None;
+        self.load_editors(window, cx);
+        self.schedule_validate(cx);
         cx.notify();
+    }
+
+    fn toggle_visible(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        if let Some(server) = self.servers.get_mut(index) {
+            server.visible = !server.visible;
+        }
+        self.schedule_validate(cx);
+        cx.notify();
+    }
+
+    fn toggle_rsync(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        if let Some(server) = self.servers.get_mut(index) {
+            server.use_rsync = !server.use_rsync;
+        }
+        cx.notify();
+    }
+
+    fn toggle_advanced(&mut self, cx: &mut Context<Self>) {
+        self.advanced_open = !self.advanced_open;
+        cx.notify();
+    }
+
+    fn toggle_advanced_flag(
+        &mut self,
+        pick: impl Fn(&mut RemoteServer) -> &mut bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        if let Some(server) = self.servers.get_mut(index) {
+            let flag = pick(server);
+            *flag = !*flag;
+        }
+        cx.notify();
+    }
+
+    fn cycle_save_password(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let next = self.save_password.next();
+        self.save_password = next;
+        let Some(index) = self.selected else {
+            return;
+        };
+        if let Some(server) = self.servers.get_mut(index) {
+            server.password_session = next == SavePassword::Session;
+        }
+        cx.notify();
+    }
+
+    fn reset_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_password = SavePassword::Forever;
+        self.password_editor.update(cx, |editor, cx| {
+            editor.set_text(String::new(), window, cx);
+        });
+        let Some(index) = self.selected else {
+            cx.notify();
+            return;
+        };
+        if let Some(server) = self.servers.get_mut(index) {
+            server.password = None;
+            server.password_session = false;
+        }
+        cx.notify();
+    }
+
+    fn open_root_picker(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(selected) = self.selected else {
+            return;
+        };
+        let Some(server) = self.servers.get(selected).cloned() else {
+            return;
+        };
+        let configs = load_ssh_configs(&self.root);
+        let entries: Vec<Value> = self
+            .servers
+            .iter()
+            .map(deploy_server_entry)
+            .map(|mut entry| {
+                let _ = resolve_ssh_into(&mut entry, &configs);
+                entry
+            })
+            .collect();
+        let content = deploy_temp_config_content(&entries, &server.name);
+        let picker_path = self.root.join(".zed/deploy.picker.json");
+        if let Err(error) = std::fs::create_dir_all(picker_path.parent().expect("picker config parent"))
+            .and_then(|_| {
+                std::fs::write(
+                    &picker_path,
+                    serde_json::to_string(&content).expect("serialize picker config"),
+                )
+            })
+        {
+            self.message = Some((format!("cannot write picker config: {error}"), Color::Error));
+            cx.notify();
+            return;
+        }
+        let local_base = match deploy_type_canonical(&server.protocol.clone().unwrap_or_default())
+        {
+            Some("local") => Some(match server.local_root.as_deref() {
+                Some(local) if !local.trim().is_empty() => self.root.join(local.trim()),
+                _ => self.root.clone(),
+            }),
+            _ => None,
+        };
+        let host_display = server.host.clone().unwrap_or_else(|| {
+            local_base_display(&local_base, &self.root)
+        });
+        let title = format!("Choose Root Path on {} ({})", server.name, host_display);
+        open_root_picker_window(
+            self.root.clone(),
+            server.name.clone(),
+            title,
+            host_display,
+            local_base,
+            cx,
+        );
+    }
+
+    fn apply_picked_root(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_none() {
+            return;
+        }
+        self.remote_root_editor.update(cx, |editor, cx| {
+            editor.set_text(path.clone(), window, cx);
+        });
+        if let Some(index) = self.selected {
+            if let Some(server) = self.servers.get_mut(index) {
+                server.remote_root = Some(path);
+            }
+        }
+        self.schedule_validate(cx);
+        cx.notify();
+    }
+
+    fn render_advanced_rows(
+        &self,
+        selected: Option<&RemoteServer>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let passive = selected.is_some_and(|server| server.passive_mode);
+        let show_hidden = selected.is_some_and(|server| server.show_hidden);
+        let list_compat = selected.is_some_and(|server| server.list_compat);
+        let use_mlsd = selected.is_some_and(|server| server.use_mlsd);
+        let keep_alive_enabled = selected.is_some_and(|server| server.keep_alive_enabled);
+        let mut rows: Vec<AnyElement> = Vec::new();
+        rows.push(
+            dialog_toggle_row(
+                "deploy-advanced-passive",
+                passive,
+                "Passive mode",
+                cx,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_advanced_flag(|server| &mut server.passive_mode, cx);
+            }))
+            .into_any_element(),
+        );
+        rows.push(
+            dialog_toggle_row(
+                "deploy-advanced-hidden",
+                show_hidden,
+                "Show and process hidden files",
+                cx,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_advanced_flag(|server| &mut server.show_hidden, cx);
+            }))
+            .into_any_element(),
+        );
+        rows.push(
+            dialog_row(
+                "Use LIST command:",
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        dialog_toggle_with(
+                            "deploy-advanced-list-compat",
+                            list_compat,
+                            "Compatible with old version...",
+                            None,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_advanced_flag(|server| &mut server.list_compat, cx);
+                        }))
+                        .into_any_element(),
+                    )
+                    .child(
+                        dialog_toggle_with(
+                            "deploy-advanced-mlsd",
+                            use_mlsd,
+                            "Instead of MLSD",
+                            None,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_advanced_flag(|server| &mut server.use_mlsd, cx);
+                        }))
+                        .into_any_element(),
+                    ),
+            ),
+        );
+        rows.push(dialog_row(
+            "Number of connections:",
+            dialog_editor(
+                "deploy-advanced-connections-editor",
+                &self.max_connections_editor,
+                Some(px(60.)),
+                window,
+                cx,
+            ),
+        ));
+        rows.push(
+            dialog_toggle_row_with(
+                "deploy-advanced-keep-alive",
+                keep_alive_enabled,
+                "Send keep-alive messages each",
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(dialog_editor(
+                        "deploy-advanced-keep-alive-editor",
+                        &self.keep_alive_seconds_editor,
+                        Some(px(55.)),
+                        window,
+                        cx,
+                    ))
+                    .child(
+                        Label::new("seconds")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                cx,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_advanced_flag(|server| &mut server.keep_alive_enabled, cx);
+            }))
+            .into_any_element(),
+        );
+        rows.push(dialog_row(
+            "Encoding for client-server communication:",
+            dialog_editor(
+                "deploy-advanced-encoding-editor",
+                &self.encoding_editor,
+                Some(px(120.)),
+                window,
+                cx,
+            ),
+        ));
+        rows
+    }
+
+    fn toggle_anonymous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        let anonymous = self
+            .servers
+            .get(index)
+            .is_some_and(|server| server.user.as_deref() == Some("anonymous"));
+        if let Some(server) = self.servers.get_mut(index) {
+            if anonymous {
+                server.user = None;
+            } else {
+                server.user = Some("anonymous".to_string());
+                server.password = None;
+            }
+        }
+        self.load_editors(window, cx);
+        self.schedule_validate(cx);
+        cx.notify();
+    }
+
+    fn reload_ssh_configs(&mut self, cx: &mut Context<Self>) {
+        self.ssh_configs = load_ssh_configs(&self.root);
+        cx.notify();
+    }
+
+    fn toggle_ssh_menu(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        self.reload_ssh_configs(cx);
+        self.ssh_menu_open = !self.ssh_menu_open;
+        cx.notify();
+    }
+
+    fn close_ssh_menu(&mut self, cx: &mut Context<Self>) {
+        self.ssh_menu_open = false;
+        cx.notify();
+    }
+
+    fn select_ssh_config(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        self.ssh_menu_open = false;
+        let Some(config) = self.ssh_configs.get(index).cloned() else {
+            return;
+        };
+        let Some(selected) = self.selected else {
+            return;
+        };
+        let Some(server) = self.servers.get_mut(selected) else {
+            return;
+        };
+        server.ssh_config = Some(config.name.clone());
+        server.user = if config.user.trim().is_empty() {
+            None
+        } else {
+            Some(config.user.trim().to_string())
+        };
+        server.host = if config.host.trim().is_empty() {
+            None
+        } else {
+            Some(config.host.trim().to_string())
+        };
+        server.port = Some(ssh_entry_port(&config).to_string());
+        self.ssh_config_name = config.name.clone();
+        self.load_editors(window, cx);
+        self.schedule_validate(cx);
+        cx.notify();
+    }
+
+    fn open_ssh_configs(&mut self, cx: &mut Context<Self>) {
+        self.close_ssh_menu(cx);
+        open_ssh_configs_window(self.root.clone(), cx);
+    }
+
+    fn run_autodetect(&mut self, window: &mut Window, cx: &mut Context<Self>) {        let Some(selected) = self.selected else {
+            return;
+        };
+        self.apply_editors(cx);
+        let Some(server) = self.servers.get(selected).cloned() else {
+            return;
+        };
+        self.autodetect_seq += 1;
+        let seq = self.autodetect_seq;
+        self.autodetect_status = Some(("detecting...".to_string(), Color::Muted));
+        cx.notify();
+
+        let root = self.root.clone();
+        let name = server.name.clone();
+        let mut entry = deploy_server_entry(&server);
+        let configs = load_ssh_configs(&self.root);
+        let _ = resolve_ssh_into(&mut entry, &configs);
+        let content = deploy_temp_config_content(&[entry], &name);
+        let autodetect_path = root.join(".zed/deploy.autodetect.json");
+        if std::fs::write(&autodetect_path, serde_json::to_string(&content).expect("serialize autodetect config")).is_err() {
+            self.autodetect_status = Some(("cannot write autodetect config".to_string(), Color::Error));
+            cx.notify();
+            return;
+        }
+        let weak = cx.weak_entity();
+        let task = cx.background_spawn(async move {
+            let mut command = util::command::new_command("php-deploy");
+            command
+                .arg("autodetect")
+                .arg("--config")
+                .arg(autodetect_path)
+                .arg("--name")
+                .arg(&name)
+                .arg("--json")
+                .current_dir(&root);
+            command.output().await
+        });
+
+        cx.spawn_in(window, async move |weak, cx| {
+            let output = task.await;
+            weak.update_in(cx, |dialog, window, cx| {
+                if dialog.autodetect_seq != seq {
+                    return;
+                }
+                let found = output
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .and_then(|value| parse_autodetect_root(&value));
+                dialog.autodetect_status = Some(match found {
+                    Some(found) => {
+                        dialog.remote_root_editor.update(cx, |editor, cx| {
+                            editor.set_text(found.clone(), window, cx);
+                        });
+                        if let Some(index) = dialog.selected {
+                            if let Some(server) = dialog.servers.get_mut(index) {
+                                server.remote_root = Some(found.clone());
+                            }
+                        }
+                        (format!("root found: {found}"), Color::Success)
+                    }
+                    None => ("no root found".to_string(), Color::Warning),
+                });
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn schedule_validate(&mut self, cx: &mut Context<Self>) {
+        self.validate_seq += 1;
+        let seq = self.validate_seq;
+        let Some(selected) = self.selected else {
+            self.validate_warnings = Vec::new();
+            return;
+        };
+        let Some(active) = self.servers.get(selected).cloned() else {
+            self.validate_warnings = Vec::new();
+            return;
+        };
+        let configs = load_ssh_configs(&self.root);
+        let mut ssh_warnings = Vec::new();
+        let entries = self
+            .servers
+            .iter()
+            .map(deploy_server_entry)
+            .map(|mut entry| {
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Err(message) = resolve_ssh_into(&mut entry, &configs) {
+                    ssh_warnings.push((name, vec![message]));
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        let content = deploy_temp_config_content(&entries, &active.name);
+        let validate_path = self.root.join(".zed/deploy.validate.json");
+        let written = std::fs::create_dir_all(validate_path.parent().expect("validate config parent"))
+            .and_then(|_| {
+                std::fs::write(
+                    &validate_path,
+                    serde_json::to_string(&content).expect("serialize validate config"),
+                )
+            });
+        self.validate_warnings = Vec::new();
+        if written.is_err() {
+            return;
+        }
+        cx.notify();
+
+        let root = self.root.clone();
+        let weak = cx.weak_entity();
+        let task = cx.background_spawn(async move {
+            let mut command = util::command::new_command("php-deploy");
+            command
+                .arg("validate")
+                .arg("--config")
+                .arg(&validate_path)
+                .arg("--json")
+                .current_dir(&root);
+            command.output().await
+        });
+
+        cx.spawn(async move |_, cx| {
+            let output = task.await;
+            weak.update(cx, |dialog, cx| {
+                if dialog.validate_seq != seq {
+                    return;
+                }
+                dialog.validate_warnings = output
+                    .ok()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .map(|value| parse_validate_output(&value))
+                    .unwrap_or_default();
+                dialog.validate_warnings.extend(ssh_warnings);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     fn test_connection(&mut self, cx: &mut Context<Self>) {
@@ -509,10 +1315,14 @@ impl DeploymentDialog {
         let Some(server) = self.servers.get(selected).cloned() else {
             return;
         };
-        let content = serde_json::json!({
-            "servers": [deploy_server_entry(&server)],
-            "active": server.name,
-        });
+        let mut entry = deploy_server_entry(&server);
+        let configs = load_ssh_configs(&self.root);
+        if let Err(message) = resolve_ssh_into(&mut entry, &configs) {
+            self.message = Some((message, Color::Error));
+            cx.notify();
+            return;
+        }
+        let content = deploy_temp_config_content(&[entry], &server.name);
         let test_path = self.root.join(".zed/deploy.test.json");
         if let Err(error) = std::fs::create_dir_all(test_path.parent().expect("test config parent"))
             .and_then(|_| {
@@ -665,60 +1475,200 @@ fn dialog_editor_element(editor: &Entity<Editor>, cx: &App) -> AnyElement {
     EditorElement::new(editor, style).into_any_element()
 }
 
-fn dialog_editor_box(
-    id: &'static str,
-    editor: &Entity<Editor>,
-    width: Option<Pixels>,
-    cx: &App,
-) -> AnyElement {
-    let colors = cx.theme().colors();
-    let mut box_div = div()
-        .id(id)
-        .flex_1()
-        .min_w_0()
-        .bg(colors.editor_background)
-        .border_1()
-        .border_color(colors.border_variant)
-        .rounded_sm()
-        .px_1()
-        .py_0p5()
-        .cursor_text()
-        .child(dialog_editor_element(editor, cx));
-    if let Some(width) = width {
-        box_div = box_div.flex_none().w(width);
-    }
-    box_div.into_any_element()
+const DIALOG_LABEL_WIDTH: Pixels = px(110.);
+const DIALOG_ROW_HEIGHT: Pixels = px(27.);
+const DIALOG_CONTROL_HEIGHT: Pixels = px(24.);
+const DIALOG_CONTROL_INDENT: Pixels = px(126.);
+
+fn dialog_label(label: impl Into<SharedString>) -> Label {
+    Label::new(label).size(LabelSize::Small).color(Color::Muted)
 }
 
-fn dialog_field(
-    id: &'static str,
-    label: &'static str,
-    editor: &Entity<Editor>,
-    width: Option<Pixels>,
-    cx: &App,
-) -> AnyElement {
+fn dialog_row(label: &'static str, control: impl IntoElement) -> AnyElement {
     h_flex()
         .w_full()
         .flex_none()
         .items_center()
         .gap_2()
-        .py_1()
+        .min_h(DIALOG_ROW_HEIGHT)
         .child(
             div()
                 .flex_none()
-                .w(px(90.))
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
+                .w(DIALOG_LABEL_WIDTH)
+                .child(dialog_label(label)),
         )
-        .child(dialog_editor_box(id, editor, width, cx))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(DIALOG_CONTROL_HEIGHT)
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(control),
+        )
+        .into_any_element()
+}
+
+fn dialog_editor(
+    id: impl Into<ElementId>,
+    editor: &Entity<Editor>,
+    width: Option<Pixels>,
+    window: &Window,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let focused = editor.read(cx).focus_handle(cx).is_focused(window);
+    let mut box_div = div()
+        .id(id)
+        .h(DIALOG_CONTROL_HEIGHT)
+        .flex()
+        .items_center()
+        .bg(colors.editor_background)
+        .border_1()
+        .border_color(if focused {
+            colors.border_focused
+        } else {
+            colors.border_variant
+        })
+        .rounded_xs()
+        .px_2()
+        .cursor_text()
+        .child(dialog_editor_element(editor, cx));
+    if let Some(width) = width {
+        box_div = box_div.flex_none().w(width);
+    } else {
+        box_div = box_div.flex_1().min_w_0();
+    }
+    box_div.into_any_element()
+}
+
+fn dialog_static(text: impl Into<SharedString>, color: Color) -> AnyElement {
+    h_flex()
+        .flex_none()
+        .px_1()
+        .py_0p5()
+        .child(
+            Label::new(text)
+                .size(LabelSize::XSmall)
+                .color(color)
+                .truncate(),
+        )
+        .into_any_element()
+}
+
+fn dialog_section_header(text: &'static str) -> AnyElement {
+    h_flex()
+        .w_full()
+        .flex_none()
+        .px_1()
+        .py_2()
+        .child(
+            Label::new(text)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
+fn dialog_toggle_row(
+    id: impl Into<ElementId>,
+    checked: bool,
+    label: impl Into<SharedString>,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    dialog_toggle_with(id, checked, label, None, cx).w_full()
+}
+
+fn dialog_toggle_row_with(
+    id: impl Into<ElementId>,
+    checked: bool,
+    label: impl Into<SharedString>,
+    trailing: impl IntoElement,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    dialog_toggle_with(id, checked, label, Some(trailing.into_any_element()), cx).w_full()
+}
+
+fn dialog_toggle_with(
+    id: impl Into<ElementId>,
+    checked: bool,
+    label: impl Into<SharedString>,
+    trailing: Option<AnyElement>,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    h_flex()
+        .id(id)
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .h(DIALOG_CONTROL_HEIGHT)
+        .px_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().colors().element_hover))
+        .child(
+            Label::new(if checked { "[x]" } else { "[ ]" })
+                .size(LabelSize::Small)
+                .color(if checked { Color::Accent } else { Color::Muted }),
+        )
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(if checked { Color::Default } else { Color::Muted }),
+        )
+        .when_some(trailing, |this, trailing| this.child(trailing))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DialogButtonVariant {
+    Primary,
+    Secondary,
+    Link,
+}
+
+fn dialog_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    variant: DialogButtonVariant,
+) -> Button {
+    let mut button = Button::new(id, label);
+    match variant {
+        DialogButtonVariant::Primary => {
+            button = button.style(ButtonStyle::Filled);
+        }
+        DialogButtonVariant::Secondary => {
+            button = button.style(ButtonStyle::Subtle);
+        }
+        DialogButtonVariant::Link => {
+            button = button
+                .style(ButtonStyle::Subtle)
+                .color(Color::Muted);
+        }
+    }
+    button
+        .label_size(LabelSize::Small)
+        .size(ButtonSize::Default)
+        .truncate(true)
+}
+
+fn dialog_badge(chip: impl Into<SharedString>, color: Color, cx: &App) -> gpui::AnyElement {
+    let chip: SharedString = chip.into();
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(cx.theme().colors().element_hover)
+        .child(
+            Label::new(format!("{} ", chip))
+                .size(LabelSize::XSmall)
+                .color(color),
+        )
         .into_any_element()
 }
 
 impl Render for DeploymentDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let protocol = self.protocol.clone();
         let message = self.message.clone();
@@ -726,10 +1676,22 @@ impl Render for DeploymentDialog {
         let mut server_rows = Vec::new();
         for (index, server) in self.servers.iter().enumerate() {
             let is_selected = self.selected == Some(index);
-            let badge = server
-                .protocol
-                .clone()
-                .unwrap_or_else(|| "server".to_string());
+            let badge = deploy_type_badge_short(
+                server.protocol.as_deref().unwrap_or("server"),
+            );
+            let name_element: AnyElement = if is_selected {
+                dialog_editor("deploy-name-editor", &self.name_editor, None, window, cx)
+            } else {
+                Label::new(server.name.clone())
+                    .size(LabelSize::XSmall)
+                    .color(if !server.visible {
+                        Color::Muted
+                    } else {
+                        Color::Default
+                    })
+                    .truncate()
+                    .into_any_element()
+            };
             server_rows.push(
                 h_flex()
                     .id(("deploy-server-row", index))
@@ -742,23 +1704,9 @@ impl Render for DeploymentDialog {
                     .rounded_sm()
                     .cursor_pointer()
                     .when(is_selected, |this| this.bg(colors.element_selected))
-                    .hover(|style| style.bg(colors.element_hover))
-                    .child(
-                        Label::new(badge)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .flex_none(),
-                    )
-                    .child(
-                        Label::new(server.name.clone())
-                            .size(LabelSize::XSmall)
-                            .color(if is_selected {
-                                Color::Accent
-                            } else {
-                                Color::Default
-                            })
-                            .truncate(),
-                    )
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(driver_badge(badge, deploy_type_badge_color(server.protocol.as_deref().unwrap_or("server")), cx))
+                    .child(name_element)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.select_server(index, window, cx);
                     }))
@@ -766,17 +1714,7 @@ impl Render for DeploymentDialog {
             );
         }
         if server_rows.is_empty() {
-            server_rows.push(
-                h_flex()
-                    .px_1()
-                    .py_0p5()
-                    .child(
-                        Label::new("no servers")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element(),
-            );
+            server_rows.push(dialog_static("no servers", Color::Muted));
         }
 
         let mut tab_rows = Vec::new();
@@ -808,154 +1746,456 @@ impl Render for DeploymentDialog {
             );
         }
 
-        let type_button = Button::new("deploy-type", self.protocol.clone())
-            .size(ButtonSize::Compact)
-            .label_size(LabelSize::XSmall)
-            .style(ButtonStyle::Subtle)
-            .end_icon(
-                Icon::new(IconName::ChevronDown)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
+        let type_button = h_flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .child(dialog_badge(
+                deploy_type_badge_short(&protocol),
+                deploy_type_badge_color(&protocol),
+                cx,
+            ))
+            .child(
+                dialog_button(
+                    "deploy-type",
+                    deploy_type_display_name(&protocol),
+                    DialogButtonVariant::Secondary,
+                )
+                .end_icon(
+                    Icon::new(IconName::ChevronDown)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.cycle_deploy_type(window, cx);
+                })),
             )
-            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                this.toggle_protocol(cx);
-            }))
             .into_any_element();
 
-        let test_button = Button::new("deploy-test", "Test Connection")
-            .size(ButtonSize::Compact)
-            .label_size(LabelSize::XSmall)
-            .style(ButtonStyle::Subtle)
-            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                this.test_connection(cx);
-            }));
+        let visible_state = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.visible)
+            .unwrap_or(true);
+        let visible_button = dialog_button(
+            "deploy-visible",
+            if visible_state {
+                "visible only for this project"
+            } else {
+                "global"
+            },
+            DialogButtonVariant::Secondary,
+        )
+        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+            this.toggle_visible(cx);
+        }));
 
-        let test_row = match message.as_ref().filter(|_| self.tab == DeployTab::Connection) {
-            Some((text, color)) => h_flex()
-                .flex_none()
-                .items_center()
-                .gap_2()
-                .px_1()
-                .py_1()
-                .child(test_button)
-                .child(
-                    Label::new(text.clone())
-                        .size(LabelSize::XSmall)
-                        .color(*color)
-                        .flex_1()
-                        .truncate(),
+        let rsync_state = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.use_rsync)
+            .unwrap_or(false);
+        let anonymous_state = self
+            .user_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .eq("anonymous");
+
+        let local_folder_empty = deploy_type_canonical(&protocol) == Some("local")
+            && self
+                .local_root_editor
+                .read(cx)
+                .text(cx)
+                .trim()
+                .is_empty();
+
+        let mut connection_rows: Vec<AnyElement> = Vec::new();
+        for field in deploy_connection_fields(&protocol) {
+            connection_rows.push(match field {
+                DeployField::SshConfig => {
+                    let mut rows: Vec<AnyElement> = Vec::new();
+                    rows.push(
+                        dialog_row(
+                            "SSH configuration:",
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    dialog_button(
+                                        "dp-ssh-config",
+                                        if self.ssh_config_name.is_empty() {
+                                            "<select configuration>"
+                                        } else {
+                                            self.ssh_config_name.as_str()
+                                        },
+                                        if self.ssh_config_name.is_empty() {
+                                            DialogButtonVariant::Link
+                                        } else {
+                                            DialogButtonVariant::Primary
+                                        },
+                                    )
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                        this.toggle_ssh_menu(cx);
+                                    })),
+                                )
+                                .child(
+                                    IconButton::new("dp-ssh-edit", IconName::Ellipsis)
+                                        .shape(IconButtonShape::Square)
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Edit SSH configurations"))
+                                        .on_click(cx.listener(
+                                            |this, _: &ClickEvent, _window, cx| {
+                                                this.open_ssh_configs(cx);
+                                            },
+                                        )),
+                                ),
+                        ),
+                    );
+                    if self.ssh_menu_open {
+                        let selected = self.ssh_config_name.clone();
+                        for (index, config) in self.ssh_configs.iter().enumerate() {
+                            let is_active = selected == config.name;
+                            rows.push(
+                                h_flex()
+                                    .id(("dp-ssh-config-row", index))
+                                    .w_full()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .when(is_active, |this| this.bg(colors.element_selected))
+                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                    .child(
+                                        Label::new(config.name.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(if is_active {
+                                                Color::Accent
+                                            } else {
+                                                Color::Default
+                                            })
+                                            .truncate(),
+                                    )
+                                    .child(
+                                        Label::new(ssh_user_host_text(config))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.select_ssh_config(index, window, cx);
+                                        },
+                                    ))
+                                    .into_any_element(),
+                            );
+                        }
+                        rows.push(
+                            h_flex()
+                                .id("dp-ssh-config-add")
+                                .w_full()
+                                .flex_none()
+                                .items_center()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .child(
+                                    Label::new("Add new configuration...")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.open_ssh_configs(cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .flex_col()
+                        .gap_0p5()
+                        .children(rows)
+                        .into_any_element()
+                }
+                DeployField::Host => dialog_row(
+                    "Host:",
+                    dialog_editor("deploy-host-editor", &self.host_editor, None, window, cx),
+                ),
+                DeployField::Port => dialog_row(
+                    "Port:",
+                    dialog_editor("deploy-port-editor", &self.port_editor, Some(px(60.)), window, cx),
+                ),
+                DeployField::User => dialog_row(
+                    "Username:",
+                    dialog_editor("deploy-user-editor", &self.user_editor, None, window, cx),
+                ),
+                DeployField::AnonToggle => dialog_toggle_row(
+                    "deploy-anon",
+                    anonymous_state,
+                    "Login as anonymous",
+                    cx,
                 )
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.toggle_anonymous(window, cx);
+                }))
                 .into_any_element(),
-            None => h_flex()
-                .flex_none()
-                .items_center()
-                .px_1()
-                .py_1()
-                .child(test_button)
+                DeployField::Password => h_flex()
+                    .w_full()
+                    .flex_none()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(dialog_row(
+                        "Password:",
+                        dialog_editor(
+                            "deploy-password-editor",
+                            &self.password_editor,
+                            None,
+                            window,
+                            cx,
+                        ),
+                    ))
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .pl(DIALOG_CONTROL_INDENT)
+                            .child(
+                                dialog_button(
+                                    "deploy-save-password",
+                                    format!("Save: {}", self.save_password.label()),
+                                    DialogButtonVariant::Secondary,
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.cycle_save_password(cx);
+                                })),
+                            )
+                            .child(dialog_static(self.save_password.hint(), Color::Muted))
+                            .child(
+                                dialog_button(
+                                    "deploy-reset-password",
+                                    "Reset",
+                                    DialogButtonVariant::Secondary,
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.reset_password(window, cx);
+                                })),
+                            ),
+                    )
+                    .into_any_element(),
+                DeployField::Folder => dialog_row(
+                    "Folder:",
+                    dialog_editor(
+                        "deploy-local-root-editor",
+                        &self.local_root_editor,
+                        None,
+                        window,
+                        cx,
+                    ),
+                ),
+                DeployField::RootPath => h_flex()
+                    .w_full()
+                    .flex_none()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(dialog_row(
+                        "Root path:",
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(dialog_editor(
+                                "deploy-root-editor",
+                                &self.remote_root_editor,
+                                None,
+                                window,
+                                cx,
+                            ))
+                            .child(
+                                IconButton::new("dp-root-browse", IconName::Folder)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Choose root path"))
+                                    .on_click(cx.listener(
+                                        |this, _: &ClickEvent, _window, cx| {
+                                            this.open_root_picker(cx);
+                                        },
+                                    )),
+                            )
+                            .child(
+                                dialog_button(
+                                    "deploy-autodetect",
+                                    "Autodetect",
+                                    DialogButtonVariant::Secondary,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, window, cx| {
+                                        this.run_autodetect(window, cx);
+                                    },
+                                )),
+                            ),
+                    ))
+                    .children(self.autodetect_status.as_ref().map(|(text, color)| {
+                        dialog_static(text.clone(), *color)
+                    }))
+                    .into_any_element(),
+                DeployField::WebUrl => dialog_row(
+                    "Web server URL:",
+                    dialog_editor("deploy-url-editor", &self.web_url_editor, None, window, cx),
+                ),
+                DeployField::TestConnection => {
+                    let test_button = dialog_button(
+                        "deploy-test",
+                        "Test Connection",
+                        DialogButtonVariant::Link,
+                    )
+                    .disabled(local_folder_empty)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.test_connection(cx);
+                    }));
+                    match message.as_ref() {
+                        Some((text, color)) => h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .px_1()
+                            .py_1()
+                            .child(test_button)
+                            .child(
+                                Label::new(text.clone())
+                                    .size(LabelSize::Small)
+                                    .color(*color)
+                                    .flex_1()
+                                    .truncate(),
+                            )
+                            .into_any_element(),
+                        None => h_flex()
+                            .flex_none()
+                            .items_center()
+                            .px_1()
+                            .py_1()
+                            .child(test_button)
+                            .into_any_element(),
+                    }
+                }
+                DeployField::RsyncToggle => dialog_toggle_row(
+                    "deploy-rsync",
+                    rsync_state,
+                    "Use rsync for download/upload/sync",
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.toggle_rsync(cx);
+                }))
                 .into_any_element(),
-        };
+            });
+        }
 
         let tab_content: AnyElement = match self.tab {
             DeployTab::Connection => v_flex()
                 .id("deploy-tab-connection")
                 .w_full()
-                .children(vec![
-                    dialog_field(
-                        "deploy-name-editor",
-                        "Name:",
-                        &self.name_editor,
-                        None,
-                        cx,
-                    ),
-                    h_flex()
-                        .w_full()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .child(
-                            div().flex_none().w(px(90.)).child(
-                                Label::new("Type:")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                        .child(type_button)
-                        .into_any_element(),
-                    dialog_field(
-                        "deploy-host-editor",
-                        "Host:",
-                        &self.host_editor,
-                        None,
-                        cx,
-                    ),
-                    dialog_field(
-                        "deploy-port-editor",
-                        "Port:",
-                        &self.port_editor,
-                        Some(px(60.)),
-                        cx,
-                    ),
-                    dialog_field(
-                        "deploy-user-editor",
-                        "Username:",
-                        &self.user_editor,
-                        None,
-                        cx,
-                    ),
-                    h_flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .px_1()
-                        .child(
-                            Label::new("password saved permanently")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .into_any_element(),
-                    test_row,
-                    dialog_field(
-                        "deploy-root-editor",
-                        "Root path:",
-                        &self.remote_root_editor,
-                        None,
-                        cx,
-                    ),
-                    dialog_field(
-                        "deploy-url-editor",
-                        "Web server URL:",
-                        &self.web_url_editor,
-                        None,
-                        cx,
-                    ),
-                ])
+                .children({
+                    let mut rows: Vec<AnyElement> = Vec::new();
+                    rows.push(dialog_row(
+                        "Type:",
+                        type_button,
+                    ));
+                    rows.push(dialog_row(
+                        "Visibility:",
+                        visible_button,
+                    ));
+                    rows.extend(connection_rows);
+                    rows.push(
+                        h_flex()
+                            .id("deploy-advanced-toggle")
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .py_0p5()
+                            .min_h(px(24.))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                            .child(
+                                Label::new(if self.advanced_open {
+                                    "▾ Advanced"
+                                } else {
+                                    "▸ Advanced"
+                                })
+                                .size(LabelSize::Small)
+                                .color(Color::Default),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.toggle_advanced(cx);
+                            }))
+                            .into_any_element(),
+                    );
+                    if self.advanced_open {
+                        if deploy_type_has_advanced(&self.protocol) {
+                            let selected = self
+                                .selected
+                                .and_then(|index| self.servers.get(index))
+                                .cloned();
+                            rows.extend(self.render_advanced_rows(selected.as_ref(), window, cx));
+                        } else {
+                            rows.push(dialog_static("advanced: none", Color::Muted));
+                        }
+                    }
+                    rows
+                })
                 .into_any_element(),
             DeployTab::Mappings => v_flex()
                 .id("deploy-tab-mappings")
                 .w_full()
                 .children(vec![
-                    dialog_field(
-                        "deploy-local-root-editor",
+                    dialog_row(
                         "Local path:",
-                        &self.local_root_editor,
-                        None,
-                        cx,
+                        dialog_editor(
+                            "deploy-local-root-editor",
+                            &self.local_root_editor,
+                            None,
+                            window,
+                            cx,
+                        ),
                     ),
-                    dialog_field(
-                        "deploy-deploy-path-editor",
+                    dialog_row(
                         "Deployment path:",
-                        &self.remote_root_editor,
-                        None,
-                        cx,
+                        dialog_editor(
+                            "deploy-deploy-path-editor",
+                            &self.remote_root_editor,
+                            None,
+                            window,
+                            cx,
+                        ),
                     ),
-                    dialog_field(
-                        "deploy-web-path-editor",
+                    dialog_row(
                         "Web path:",
-                        &self.web_url_editor,
-                        None,
-                        cx,
+                        dialog_editor(
+                            "deploy-web-path-editor",
+                            &self.web_url_editor,
+                            None,
+                            window,
+                            cx,
+                        ),
                     ),
                 ])
                 .into_any_element(),
@@ -963,15 +2203,15 @@ impl Render for DeploymentDialog {
                 .id("deploy-tab-excluded")
                 .w_full()
                 .gap_1()
-                .child(
-                    Label::new("excluded paths, comma separated")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(dialog_editor_box(
+                .child(dialog_static(
+                    "excluded paths, comma separated",
+                    Color::Muted,
+                ))
+                .child(dialog_editor(
                     "deploy-excluded-editor",
                     &self.excluded_editor,
                     None,
+                    window,
                     cx,
                 ))
                 .into_any_element(),
@@ -988,8 +2228,32 @@ impl Render for DeploymentDialog {
                         .color(*color)
                         .truncate(),
                 )
-                .into_any_element()
+                    .into_any_element()
         });
+
+        let selected_name = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.name.clone());
+        let warning_lines = self
+            .validate_warnings
+            .iter()
+            .filter(|(name, _)| name.is_empty() || Some(name) == selected_name.as_ref())
+            .flat_map(|(_, warnings)| warnings.iter())
+            .map(|warning| {
+                h_flex()
+                    .flex_none()
+                    .px_3()
+                    .py_0p5()
+                    .child(
+                        Label::new(warning.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning)
+                            .truncate(),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
 
         v_flex()
             .id("deploy-dialog")
@@ -1098,6 +2362,7 @@ impl Render for DeploymentDialog {
                     ),
             )
             .children(message_line)
+            .children(warning_lines)
             .child(
                 h_flex()
                     .flex_none()
@@ -1107,22 +2372,21 @@ impl Render for DeploymentDialog {
                     .px_3()
                     .py_2()
                     .child(
-                        Button::new("deploy-cancel", "Cancel")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.cancel(window, cx);
-                            })),
+                        dialog_button(
+                            "deploy-cancel",
+                            "Cancel",
+                            DialogButtonVariant::Secondary,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.cancel(window, cx);
+                        })),
                     )
                     .child(
-                        Button::new("deploy-ok", "OK")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        dialog_button("deploy-ok", "OK", DialogButtonVariant::Primary).on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.confirm(window, cx);
-                            })),
+                            }),
+                        ),
                     ),
             )
     }
@@ -1273,6 +2537,7 @@ struct DataSource {
     url: String,
     read_only: bool,
     ssh_enabled: bool,
+    ssh_name: String,
     ssh_user: String,
     ssh_host: String,
     ssh_port: String,
@@ -1296,6 +2561,7 @@ impl DataSource {
             url: String::new(),
             read_only: false,
             ssh_enabled: false,
+            ssh_name: String::new(),
             ssh_user: String::new(),
             ssh_host: String::new(),
             ssh_port: String::new(),
@@ -1348,6 +2614,7 @@ fn parse_data_source(value: &Value, root: &Path) -> Option<DataSource> {
     source.read_only = value.get("read_only").and_then(Value::as_bool).unwrap_or(false);
     if let Some(tunnel) = value.get("ssh_tunnel") {
         source.ssh_enabled = tunnel.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        source.ssh_name = string_field(tunnel, "name").unwrap_or_default();
         source.ssh_host = string_field(tunnel, "host").unwrap_or_default();
         source.ssh_user = string_field(tunnel, "user").unwrap_or_default();
         source.ssh_port = match tunnel.get("port") {
@@ -1428,27 +2695,8 @@ fn data_source_entry(source: &DataSource) -> Value {
     if source.ssh_enabled {
         let mut tunnel = serde_json::Map::new();
         tunnel.insert("enabled".to_string(), Value::Bool(true));
-        if !source.ssh_host.trim().is_empty() {
-            tunnel.insert(
-                "host".to_string(),
-                Value::String(source.ssh_host.trim().to_string()),
-            );
-        }
-        let ssh_port = source.ssh_port.trim().to_string();
-        if !ssh_port.is_empty() {
-            match ssh_port.parse::<u16>() {
-                Ok(number) => tunnel.insert("port".to_string(), Value::from(number)),
-                Err(_) => tunnel.insert("port".to_string(), Value::String(ssh_port)),
-            };
-        }
-        if !source.ssh_user.trim().is_empty() {
-            tunnel.insert(
-                "user".to_string(),
-                Value::String(source.ssh_user.trim().to_string()),
-            );
-        }
-        let local_port = source.ssh_local_port.trim().to_string();
-        if !local_port.is_empty() {
+        if !source.ssh_local_port.trim().is_empty() {
+            let local_port = source.ssh_local_port.trim().to_string();
             match local_port.parse::<u16>() {
                 Ok(number) => tunnel.insert("local_port".to_string(), Value::from(number)),
                 Err(_) => tunnel.insert("local_port".to_string(), Value::String(local_port)),
@@ -1483,6 +2731,15 @@ fn data_source_test_config(source: &DataSource) -> Value {
         _ => serde_json::Map::new(),
     };
     entry.insert("name".to_string(), Value::String("_test".to_string()));
+    // inject the staged config NAME so resolve_ssh_tunnel_into can find it
+    if source.ssh_enabled && !source.ssh_name.trim().is_empty() {
+        if let Some(tunnel) = entry.get_mut("ssh_tunnel").and_then(Value::as_object_mut) {
+            tunnel.insert(
+                "name".to_string(),
+                Value::String(source.ssh_name.trim().to_string()),
+            );
+        }
+    }
     serde_json::json!({ "connections": [Value::Object(entry)] })
 }
 
@@ -1506,6 +2763,7 @@ fn save_data_sources(root: &Path, sources: &[DataSource]) -> std::result::Result
         Some(_) => return Err("connections in databases.json is not an array".to_string()),
         None => Vec::new(),
     };
+    let ssh_configs = load_ssh_configs(root);
     let mut connections = Vec::new();
     for source in sources {
         let staged = match data_source_entry(source) {
@@ -1526,6 +2784,19 @@ fn save_data_sources(root: &Path, sources: &[DataSource]) -> std::result::Result
                 merged.remove(key);
             }
         }
+        let mut merged = Value::Object(merged);
+        if source.ssh_enabled && !source.ssh_name.trim().is_empty() {
+            if let Some(tunnel) = merged.get_mut("ssh_tunnel").and_then(Value::as_object_mut) {
+                tunnel.insert(
+                    "name".to_string(),
+                    Value::String(source.ssh_name.trim().to_string()),
+                );
+            }
+        }
+        if let Err(message) = resolve_ssh_tunnel_into(&mut merged, &ssh_configs) {
+            return Err(format!("{}: {}", source.name.trim(), message));
+        }
+        let merged = match merged { Value::Object(map) => map, _ => serde_json::Map::new() };
         connections.push(Value::Object(merged));
     }
     config.insert("connections".to_string(), Value::Array(connections));
@@ -1566,36 +2837,339 @@ fn driver_support_hint(driver: &str) -> &'static str {
     }
 }
 
-fn parse_ssh_config(text: &str) -> (String, String, String) {
-    let (user, rest) = match text.trim().split_once('@') {
-        Some((user, rest)) => (user.trim().to_string(), rest.trim().to_string()),
-        None => (String::new(), text.trim().to_string()),
-    };
-    match rest.rsplit_once(':') {
-        Some((host, port)) => {
-            let port = port.trim();
-            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
-                (user, host.trim().to_string(), port.to_string())
-            } else {
-                (user, rest, String::new())
-            }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshAuthMode {
+    Password,
+    Key,
+    Agent,
+}
+
+impl SshAuthMode {
+    fn label(self) -> &'static str {
+        match self {
+            SshAuthMode::Password => "Password",
+            SshAuthMode::Key => "Key pair",
+            SshAuthMode::Agent => "OpenSSH config and authentication agent",
         }
-        _ => (user, rest, String::new()),
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            SshAuthMode::Password => "password",
+            SshAuthMode::Key => "key",
+            SshAuthMode::Agent => "agent",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "key" | "key pair" => SshAuthMode::Key,
+            "agent" | "openssh" => SshAuthMode::Agent,
+            _ => SshAuthMode::Password,
+        }
     }
 }
 
-fn format_ssh_config(user: &str, host: &str, port: &str) -> String {
+fn next_ssh_auth(current: SshAuthMode) -> SshAuthMode {
+    match current {
+        SshAuthMode::Password => SshAuthMode::Key,
+        SshAuthMode::Key => SshAuthMode::Agent,
+        SshAuthMode::Agent => SshAuthMode::Password,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SshEntry {
+    name: String,
+    user: String,
+    host: String,
+    port: String,
+    auth: SshAuthMode,
+    password: String,
+    password_session: bool,
+    key_path: String,
+    keep_alive: u16,
+    strict_host_key: bool,
+}
+
+impl SshEntry {
+    fn blank() -> Self {
+        Self {
+            name: String::new(),
+            user: String::new(),
+            host: String::new(),
+            port: "22".to_string(),
+            auth: SshAuthMode::Password,
+            password: String::new(),
+            password_session: false,
+            key_path: String::new(),
+            keep_alive: 15,
+            strict_host_key: false,
+        }
+    }
+}
+
+fn ssh_entry_port(config: &SshEntry) -> u16 {
+    config.port.trim().parse::<u16>().unwrap_or(22)
+}
+
+fn ssh_user_host_text(config: &SshEntry) -> String {
     let mut text = String::new();
-    if !user.is_empty() {
-        text.push_str(user.trim());
+    if !config.user.trim().is_empty() {
+        text.push_str(config.user.trim());
         text.push('@');
     }
-    text.push_str(host.trim());
-    if !port.is_empty() {
-        text.push(':');
-        text.push_str(port.trim());
+    text.push_str(config.host.trim());
+    if !config.port.trim().is_empty() {
+        text.push_str(":");
+        text.push_str(config.port.trim());
     }
     text
+}
+
+fn parse_ssh_entry(value: &Value) -> SshEntry {
+    let mut entry = SshEntry::blank();
+    entry.name = string_field(value, "name").unwrap_or_default();
+    entry.user = string_field(value, "user").unwrap_or_default();
+    entry.host = string_field(value, "host").unwrap_or_default();
+    entry.port = match value.get("port") {
+        Some(Value::Number(port)) => port.to_string(),
+        Some(Value::String(port)) => port.clone(),
+        _ => String::new(),
+    };
+    entry.auth = value
+        .get("auth")
+        .and_then(Value::as_str)
+        .map(SshAuthMode::parse)
+        .unwrap_or(SshAuthMode::Password);
+    entry.password = string_field(value, "password").unwrap_or_default();
+    entry.key_path = string_field(value, "key_path").unwrap_or_default();
+    entry.keep_alive = match value.get("keep_alive") {
+        Some(Value::Number(seconds)) => seconds
+            .as_u64()
+            .map(|seconds| seconds.min(u16::MAX as u64) as u16)
+            .unwrap_or(15),
+        _ => 15,
+    };
+    entry.strict_host_key = value
+        .get("strict_host_key")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    entry
+}
+
+fn ssh_store_entry(config: &SshEntry) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "name".to_string(),
+        Value::String(config.name.trim().to_string()),
+    );
+    entry.insert(
+        "user".to_string(),
+        Value::String(config.user.trim().to_string()),
+    );
+    entry.insert(
+        "host".to_string(),
+        Value::String(config.host.trim().to_string()),
+    );
+    entry.insert("port".to_string(), Value::from(ssh_entry_port(config)));
+    entry.insert("auth".to_string(), Value::String(config.auth.key().to_string()));
+    if !config.password.is_empty() && !config.password_session {
+        entry.insert(
+            "password".to_string(),
+            Value::String(config.password.clone()),
+        );
+    }
+    if !config.key_path.trim().is_empty() {
+        entry.insert(
+            "key_path".to_string(),
+            Value::String(config.key_path.trim().to_string()),
+        );
+    }
+    entry.insert("keep_alive".to_string(), Value::from(config.keep_alive));
+    entry.insert(
+        "strict_host_key".to_string(),
+        Value::Bool(config.strict_host_key),
+    );
+    Value::Object(entry)
+}
+
+fn load_ssh_configs(root: &Path) -> Vec<SshEntry> {
+    read_json(&root.join(".zed/ssh.json"))
+        .and_then(|config| config.get("configs").and_then(Value::as_array).cloned())
+        .map(|configs| {
+            configs
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|name| !name.trim().is_empty())
+                        .unwrap_or(false)
+                })
+                .map(parse_ssh_entry)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_ssh_configs(root: &Path, configs: &[SshEntry]) -> std::result::Result<(), String> {
+    for config in configs {
+        if config.name.trim().is_empty() {
+            return Err("configuration name is required".to_string());
+        }
+        if !config
+            .port
+            .trim()
+            .chars()
+            .all(|character| character.is_ascii_digit())
+            || config.port.trim().parse::<u16>().is_err()
+        {
+            return Err(format!("{}: wrong port number", config.name.trim()));
+        }
+        if matches!(config.auth, SshAuthMode::Key) && config.key_path.trim().is_empty() {
+            return Err(format!("{}: key path is required", config.name.trim()));
+        }
+    }
+    let mut seen = HashSet::new();
+    for config in configs {
+        let name = config.name.trim().to_string();
+        if !seen.insert(name.clone()) {
+            return Err(format!("duplicate configuration name: {name}"));
+        }
+    }
+    write_config_object(
+        &root.join(".zed/ssh.json"),
+        &serde_json::json!({
+            "configs": configs
+                .iter()
+                .map(ssh_store_entry)
+                .collect::<Vec<_>>()
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+    )
+}
+
+fn unique_ssh_config_name(base: &str, configs: &[SshEntry]) -> String {
+    let mut name = base.to_string();
+    let mut index = 0usize;
+    while configs
+        .iter()
+        .any(|config| config.name.trim() == name)
+    {
+        index += 1;
+        name = format!("{base} ({index})");
+    }
+    name
+}
+
+fn ssh_apply_auth_to_tunnel(
+    tunnel: &mut serde_json::Map<String, Value>,
+    config: &SshEntry,
+) {
+    tunnel.insert("auth".to_string(), Value::String(config.auth.key().to_string()));
+    if !config.password.is_empty() {
+        tunnel.insert(
+            "password".to_string(),
+            Value::String(config.password.clone()),
+        );
+    }
+    if !config.key_path.trim().is_empty() {
+        tunnel.insert(
+            "key_path".to_string(),
+            Value::String(config.key_path.trim().to_string()),
+        );
+    }
+    tunnel.insert(
+        "strict_host_key".to_string(),
+        Value::Bool(config.strict_host_key),
+    );
+    tunnel.insert("keep_alive".to_string(), Value::from(config.keep_alive));
+}
+
+fn ssh_apply_auth_to_server(
+    server: &mut serde_json::Map<String, Value>,
+    config: &SshEntry,
+) {
+    server.insert(
+        "ssh_auth".to_string(),
+        Value::String(config.auth.key().to_string()),
+    );
+    if !config.password.is_empty() {
+        server.insert(
+            "ssh_password".to_string(),
+            Value::String(config.password.clone()),
+        );
+    }
+    if !config.key_path.trim().is_empty() {
+        server.insert(
+            "ssh_key_path".to_string(),
+            Value::String(config.key_path.trim().to_string()),
+        );
+    }
+    server.insert(
+        "ssh_strict_host_key".to_string(),
+        Value::Bool(config.strict_host_key),
+    );
+    server.insert(
+        "ssh_keep_alive".to_string(),
+        Value::from(config.keep_alive),
+    );
+}
+
+fn resolve_ssh_into(
+    server: &mut Value,
+    configs: &[SshEntry],
+) -> std::result::Result<(), String> {
+    let Some(name) = string_field(server, "ssh_config").filter(|name| !name.is_empty()) else {
+        return Ok(());
+    };
+    let Some(config) = configs.iter().find(|config| config.name == name) else {
+        return Err(format!("ssh configuration '{name}' not found"));
+    };
+    let Some(map) = server.as_object_mut() else {
+        return Ok(());
+    };
+    map.insert("host".to_string(), Value::String(config.host.trim().to_string()));
+    map.insert("user".to_string(), Value::String(config.user.trim().to_string()));
+    map.insert("port".to_string(), Value::from(ssh_entry_port(config)));
+    ssh_apply_auth_to_server(map, config);
+    Ok(())
+}
+
+fn resolve_ssh_tunnel_into(
+    connection: &mut Value,
+    configs: &[SshEntry],
+) -> std::result::Result<(), String> {
+    let Some(Value::Object(tunnel)) = connection.get_mut("ssh_tunnel") else {
+        return Ok(());
+    };
+    let enabled = tunnel.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    if !enabled {
+        return Ok(());
+    }
+    let Some(name) = tunnel
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    let Some(config) = configs.iter().find(|config| config.name == name) else {
+        return Err(format!("ssh configuration '{name}' not found"));
+    };
+    // the marker is transient: php-db denies unknown fields, so strip it now
+    // that the resolved host/user/port/auth keys carry the connection data
+    tunnel.remove("name");
+    tunnel.insert("host".to_string(), Value::String(config.host.trim().to_string()));
+    tunnel.insert("user".to_string(), Value::String(config.user.trim().to_string()));
+    tunnel.insert("port".to_string(), Value::from(ssh_entry_port(config)));
+    ssh_apply_auth_to_tunnel(tunnel, config);
+    Ok(())
 }
 
 fn options_to_rows(options: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
@@ -1671,6 +3245,20 @@ fn data_source_problems(source: &DataSource) -> Vec<String> {
     problems
 }
 
+fn ssh_config_problem(source: &DataSource, configs: &[SshEntry]) -> Option<String> {
+    if !source.ssh_enabled {
+        return None;
+    }
+    let name = source.ssh_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if configs.iter().any(|config| config.name == name) {
+        return None;
+    }
+    Some(format!("ssh configuration '{name}' not found"))
+}
+
 fn next_data_source_name(base: &str, sources: &[DataSource]) -> String {
     let mut name = base.to_string();
     let mut index = 0usize;
@@ -1679,6 +3267,68 @@ fn next_data_source_name(base: &str, sources: &[DataSource]) -> String {
         name = format!("{base} ({index})");
     }
     name
+}
+
+pub fn is_sqlite_file_name(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("sqlite" | "db" | "sqlite3")
+    )
+}
+
+fn sqlite_data_source_from_file(name: &str, rel_path: &str, root: &Path) -> DataSource {
+    let mut source = DataSource::blank(root.to_path_buf());
+    source.name = name.to_string();
+    source.driver = "sqlite".to_string();
+    source.path = rel_path.to_string();
+    source
+}
+
+fn upsert_sqlite_data_source(root: &Path, rel_path: &str) -> std::result::Result<String, String> {
+    let rel_path = rel_path.trim().replace('\\', "/");
+    if rel_path.is_empty() {
+        return Err("sqlite file path is empty".to_string());
+    }
+    let file_name = Path::new(&rel_path)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .ok_or_else(|| "sqlite file name could not be derived".to_string())?
+        .to_string();
+    let mut sources = load_data_sources(root);
+    let name = next_data_source_name(&file_name, &sources);
+    sources.push(sqlite_data_source_from_file(&name, &rel_path, root));
+    save_data_sources(root, &sources)?;
+    Ok(name)
+}
+
+fn add_data_source_from_sqlite_file(
+    workspace: &Workspace,
+    abs_path: &str,
+    cx: &App,
+) -> std::result::Result<String, String> {
+    let project = workspace.project().read(cx);
+    let mut target = None;
+    for worktree in project.visible_worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let worktree_root = worktree.abs_path();
+        let Ok(relative) = Path::new(abs_path).strip_prefix(&*worktree_root) else {
+            continue;
+        };
+        if !relative.as_os_str().is_empty() {
+            target = Some((worktree_root.to_path_buf(), relative.to_path_buf()));
+            break;
+        }
+    }
+    let Some((root, relative)) = target else {
+        return Err(format!(
+            "'{abs_path}' is not in any project folder — data source not added"
+        ));
+    };
+    upsert_sqlite_data_source(&root, &relative.to_string_lossy())
 }
 
 enum SchemaListState {
@@ -1702,15 +3352,16 @@ pub struct DataSourcesDialog {
     schemas_state: SchemaListState,
     panel: Option<WeakEntity<PhpPanel>>,
     name_editor: Entity<Editor>,
-    file_editor: Entity<Editor>,
     host_editor: Entity<Editor>,
     port_editor: Entity<Editor>,
     user_editor: Entity<Editor>,
     password_editor: Entity<Editor>,
     database_editor: Entity<Editor>,
     url_editor: Entity<Editor>,
-    ssh_config_editor: Entity<Editor>,
     ssh_local_port_editor: Entity<Editor>,
+    ssh_menu_open: bool,
+    driver_menu_open: bool,
+    ssh_configs: Vec<SshEntry>,
     advanced_rows: Vec<(Entity<Editor>, Entity<Editor>)>,
 }
 
@@ -1732,15 +3383,16 @@ impl DataSourcesDialog {
             schemas_state: SchemaListState::Idle,
             panel: None,
             name_editor: cx.new(|cx| Editor::single_line(window, cx)),
-            file_editor: cx.new(|cx| Editor::single_line(window, cx)),
             host_editor: cx.new(|cx| Editor::single_line(window, cx)),
             port_editor: cx.new(|cx| Editor::single_line(window, cx)),
             user_editor: cx.new(|cx| Editor::single_line(window, cx)),
             password_editor: cx.new(|cx| Editor::single_line(window, cx)),
             database_editor: cx.new(|cx| Editor::single_line(window, cx)),
             url_editor: cx.new(|cx| Editor::single_line(window, cx)),
-            ssh_config_editor: cx.new(|cx| Editor::single_line(window, cx)),
             ssh_local_port_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            ssh_menu_open: false,
+            driver_menu_open: false,
+            ssh_configs: Vec::new(),
             advanced_rows: Vec::new(),
         };
         dialog.seed_from_disk(window, cx);
@@ -1749,6 +3401,9 @@ impl DataSourcesDialog {
 
     fn seed_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sources = load_data_sources(&self.root);
+        self.ssh_configs = load_ssh_configs(&self.root);
+        self.restore_ssh_config_names();
+        self.ssh_menu_open = false;
         self.selected = if self.sources.is_empty() {
             None
         } else {
@@ -1780,19 +3435,19 @@ impl DataSourcesDialog {
             editor.update(cx, |editor, cx| editor.set_text(value, window, cx));
         };
         set(&self.name_editor, source.name.clone());
-        set(&self.file_editor, source.path.clone());
         set(&self.host_editor, source.host.clone());
         set(&self.port_editor, source.port.clone());
         set(&self.user_editor, source.user.clone());
         set(&self.password_editor, String::new());
         set(&self.database_editor, source.database.clone());
         set(&self.url_editor, source.url.clone());
-        set(
-            &self.ssh_config_editor,
-            format_ssh_config(&source.ssh_user, &source.ssh_host, &source.ssh_port),
-        );
+        self.ssh_menu_open = false;
+        self.driver_menu_open = false;
+        self.ssh_configs = load_ssh_configs(&self.root.clone());
         set(&self.ssh_local_port_editor, source.ssh_local_port.clone());
-        self.advanced_rows = source
+        self.ssh_local_port_editor.update(cx, |editor, cx| {
+            editor.set_placeholder_text("<Dynamic>", window, cx);
+        });        self.advanced_rows = source
             .options
             .iter()
             .map(|(key, value)| {
@@ -1820,7 +3475,6 @@ impl DataSourcesDialog {
         }
         if let Some(source) = self.sources.get_mut(index) {
             source.name = text(&self.name_editor);
-            source.path = text(&self.file_editor);
             source.host = text(&self.host_editor);
             source.port = text(&self.port_editor);
             source.user = text(&self.user_editor);
@@ -1830,10 +3484,6 @@ impl DataSourcesDialog {
             }
             source.database = text(&self.database_editor);
             source.url = text(&self.url_editor);
-            let (ssh_user, ssh_host, ssh_port) = parse_ssh_config(&text(&self.ssh_config_editor));
-            source.ssh_user = ssh_user;
-            source.ssh_host = ssh_host;
-            source.ssh_port = ssh_port;
             source.ssh_local_port = text(&self.ssh_local_port_editor);
             source.options = rows_to_options(&advanced)
                 .into_iter()
@@ -1846,6 +3496,36 @@ impl DataSourcesDialog {
                 })
                 .collect();
         }
+    }
+
+    fn toggle_driver_menu(&mut self, cx: &mut Context<Self>) {
+        if self.selected.is_none() {
+            return;
+        }
+        self.driver_menu_open = !self.driver_menu_open;
+        cx.notify();
+    }
+
+    fn switch_driver(&mut self, driver: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.driver_menu_open = false;
+        let Some(index) = self.selected else {
+            return;
+        };
+        self.apply_editors(cx);
+        if let Some(source) = self.sources.get_mut(index) {
+            if source.driver != driver {
+                source.driver = driver;
+                if source.port.trim().is_empty() {
+                    if let Some(default_port) = driver_default_port(&source.driver) {
+                        source.port = default_port.to_string();
+                    }
+                }
+            }
+        }
+        self.message = None;
+        self.test_message = None;
+        self.load_fields(window, cx);
+        cx.notify();
     }
 
     fn select_source(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1955,6 +3635,65 @@ impl DataSourcesDialog {
         cx.notify();
     }
 
+    fn toggle_ssh_menu(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        self.ssh_configs = load_ssh_configs(&self.root);
+        self.ssh_menu_open = !self.ssh_menu_open;
+        cx.notify();
+    }
+
+    fn select_ssh_config(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.ssh_menu_open = false;
+        let Some(config) = self.ssh_configs.get(index).cloned() else {
+            return;
+        };
+        let Some(source) = self.selected.and_then(|index| self.sources.get_mut(index)) else {
+            return;
+        };
+        source.ssh_name = config.name.clone();
+        source.ssh_user = config.user.trim().to_string();
+        source.ssh_host = config.host.trim().to_string();
+        source.ssh_port = ssh_entry_port(&config).to_string();
+        cx.notify();
+    }
+
+    // databases.json cannot carry the config NAME (php-db denies unknown
+    // tunnel fields), so reconstruct the selection by matching the resolved
+    // host/port/user against the ssh store on load.
+    fn restore_ssh_config_names(&mut self) {
+        let configs = self.ssh_configs.clone();
+        if configs.is_empty() {
+            return;
+        }
+        for source in &mut self.sources {
+            if !source.ssh_enabled || !source.ssh_name.trim().is_empty() {
+                continue;
+            }
+            let host = source.ssh_host.trim();
+            let user = source.ssh_user.trim();
+            let port = source.ssh_port.trim();
+            if host.is_empty() {
+                continue;
+            }
+            for config in &configs {
+                let config_port = ssh_entry_port(config).to_string();
+                let matches_port = port.is_empty() || port == config_port;
+                let matches_user =
+                    user.is_empty() || user == config.user.trim() || config.user.trim().is_empty();
+                if host == config.host.trim() && matches_port && matches_user {
+                    source.ssh_name = config.name.clone();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn open_ssh_configs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        self.ssh_menu_open = false;
+        open_ssh_configs_window(self.root.clone(), cx);
+    }
+
     fn toggle_all_schemas(&mut self, cx: &mut Context<Self>) {
         let Some(source) = self.selected.and_then(|index| self.sources.get_mut(index)) else {
             return;
@@ -2046,7 +3785,17 @@ impl DataSourcesDialog {
         let Some(source) = self.sources.get(selected).cloned() else {
             return;
         };
-        let content = data_source_test_config(&source);
+        let mut content = data_source_test_config(&source);
+        let configs = load_ssh_configs(&self.root);
+        if let Some(connections) = content.get_mut("connections").and_then(Value::as_array_mut) {
+            for connection in connections.iter_mut() {
+                if let Err(message) = resolve_ssh_tunnel_into(connection, &configs) {
+                    self.test_message = Some((message, Color::Error));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         let test_path = self.root.join(".zed/.datasources.test.json");
         if let Err(error) = std::fs::create_dir_all(test_path.parent().expect("test config parent"))
             .and_then(|_| {
@@ -2160,6 +3909,1288 @@ impl DataSourcesDialog {
     }
 }
 
+pub struct SshConfigDialogWindow(pub Option<AnyWindowHandle>);
+
+impl gpui::Global for SshConfigDialogWindow {}
+
+pub struct SshConfigsDialog {
+    root: PathBuf,
+    configs: Vec<SshEntry>,
+    selected: Option<usize>,
+    message: Option<(String, Color)>,
+    test_message: Option<(String, Color)>,
+    panel: Option<WeakEntity<PhpPanel>>,
+    auth: SshAuthMode,
+    save_password: SavePassword,
+    keep_alive_enabled: bool,
+    strict: bool,
+    name_editor: Entity<Editor>,
+    host_editor: Entity<Editor>,
+    port_editor: Entity<Editor>,
+    user_editor: Entity<Editor>,
+    password_editor: Entity<Editor>,
+    key_path_editor: Entity<Editor>,
+    keep_alive_editor: Entity<Editor>,
+}
+
+impl Focusable for SshConfigsDialog {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.name_editor.focus_handle(cx)
+    }
+}
+
+impl SshConfigsDialog {
+    fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let password_editor = cx.new(|cx| Editor::single_line(window, cx));
+        password_editor.update(cx, |editor, cx| editor.set_masked(true, cx));
+        let mut dialog = Self {
+            root,
+            configs: Vec::new(),
+            selected: None,
+            message: None,
+            test_message: None,
+            panel: None,
+            auth: SshAuthMode::Password,
+            save_password: SavePassword::Forever,
+            keep_alive_enabled: true,
+            strict: false,
+            name_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            host_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            port_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            user_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            password_editor,
+            key_path_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            keep_alive_editor: cx.new(|cx| Editor::single_line(window, cx)),
+        };
+        dialog.seed_from_disk(window, cx);
+        dialog
+    }
+
+    fn seed_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.configs = load_ssh_configs(&self.root);
+        self.selected = if self.configs.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        if cx.has_global::<DeployShared>() {
+            self.panel = cx.global::<DeployShared>().panel.clone();
+        }
+        self.message = None;
+        self.test_message = None;
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn resume_with_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.root = root;
+        self.seed_from_disk(window, cx);
+    }
+
+    fn load_editors(&mut self, window: &mut Window, cx: &mut App) {
+        let config = self
+            .selected
+            .and_then(|index| self.configs.get(index))
+            .cloned()
+            .unwrap_or_else(SshEntry::blank);
+        self.auth = config.auth;
+        self.save_password = if config.password_session {
+            SavePassword::Session
+        } else {
+            SavePassword::Forever
+        };
+        self.keep_alive_enabled = config.keep_alive > 0;
+        self.strict = config.strict_host_key;
+        let mut set = |editor: &Entity<Editor>, value: String| {
+            editor.update(cx, |editor, cx| editor.set_text(value, window, cx));
+        };
+        set(&self.name_editor, config.name.clone());
+        set(&self.host_editor, config.host.clone());
+        set(&self.port_editor, config.port.clone());
+        set(&self.user_editor, config.user.clone());
+        set(&self.password_editor, config.password.clone());
+        set(&self.key_path_editor, config.key_path.clone());
+        set(
+            &self.keep_alive_editor,
+            if config.keep_alive > 0 {
+                config.keep_alive.to_string()
+            } else {
+                "15".to_string()
+            },
+        );
+    }
+
+    fn stage_current(&mut self, cx: &mut Context<Self>) {
+        let text = |editor: &Entity<Editor>| editor.read(cx).text(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(config) = self.configs.get_mut(index) else {
+            return;
+        };
+        config.name = text(&self.name_editor);
+        config.host = text(&self.host_editor);
+        config.port = text(&self.port_editor);
+        config.user = text(&self.user_editor);
+        config.password = text(&self.password_editor);
+        config.key_path = text(&self.key_path_editor);
+        config.auth = self.auth;
+        config.password_session = self.save_password == SavePassword::Session;
+        config.strict_host_key = self.strict;
+        config.keep_alive = if self.keep_alive_enabled {
+            text(&self.keep_alive_editor).trim().parse::<u16>().unwrap_or(15)
+        } else {
+            0
+        };
+    }
+
+    fn select_config(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected == Some(index) {
+            return;
+        }
+        self.stage_current(cx);
+        self.selected = Some(index);
+        self.test_message = None;
+        self.message = None;
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn add_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stage_current(cx);
+        let name = unique_ssh_config_name("config", &self.configs);
+        let mut config = SshEntry::blank();
+        config.name = name;
+        self.configs.push(config);
+        self.selected = Some(self.configs.len() - 1);
+        self.test_message = None;
+        self.message = None;
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn remove_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else {
+            self.message = Some(("no configuration selected".to_string(), Color::Error));
+            cx.notify();
+            return;
+        };
+        self.configs.remove(index);
+        self.selected = if self.configs.is_empty() {
+            None
+        } else {
+            Some(index.min(self.configs.len() - 1))
+        };
+        self.test_message = None;
+        self.message = None;
+        self.load_editors(window, cx);
+        cx.notify();
+    }
+
+    fn cycle_auth(&mut self, cx: &mut Context<Self>) {
+        self.stage_current(cx);
+        self.auth = next_ssh_auth(self.auth);
+        cx.notify();
+    }
+
+    fn cycle_save_password(&mut self, cx: &mut Context<Self>) {
+        self.stage_current(cx);
+        self.save_password = self.save_password.next();
+        cx.notify();
+    }
+
+    fn reset_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_password = SavePassword::Forever;
+        self.password_editor.update(cx, |editor, cx| {
+            editor.set_text(String::new(), window, cx);
+        });
+        let Some(index) = self.selected else {
+            cx.notify();
+            return;
+        };
+        if let Some(config) = self.configs.get_mut(index) {
+            config.password = String::new();
+            config.password_session = false;
+        }
+        cx.notify();
+    }
+
+    fn toggle_keep_alive(&mut self, cx: &mut Context<Self>) {
+        self.stage_current(cx);
+        self.keep_alive_enabled = !self.keep_alive_enabled;
+        cx.notify();
+    }
+
+    fn toggle_strict(&mut self, cx: &mut Context<Self>) {
+        self.stage_current(cx);
+        self.strict = !self.strict;
+        cx.notify();
+    }
+
+    fn test_connection(&mut self, cx: &mut Context<Self>) {
+        self.stage_current(cx);
+        let Some(index) = self.selected else {
+            self.test_message = Some(("no configuration selected".to_string(), Color::Error));
+            cx.notify();
+            return;
+        };
+        let Some(config) = self.configs.get(index).cloned() else {
+            return;
+        };
+        let mut command = match ssh_probe_command(&config) {
+            Ok(command) => command,
+            Err(message) => {
+                self.test_message = Some((message, Color::Warning));
+                cx.notify();
+                return;
+            }
+        };
+        self.test_message = Some(("testing...".to_string(), Color::Muted));
+        cx.notify();
+
+        let weak = cx.weak_entity();
+        let task = cx.background_spawn(async move { command.output().await });
+        cx.spawn(async move |_, cx| {
+            let output = task.await;
+            weak.update(cx, |dialog, cx| {
+                dialog.test_message = Some(match output {
+                    Ok(output) if output.status.success() => {
+                        ("connection ok".to_string(), Color::Success)
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let message = first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                            .unwrap_or_else(|| "connection failed".to_string());
+                        (message, Color::Error)
+                    }
+                    Err(error) => (error.to_string(), Color::Error),
+                });
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) -> std::result::Result<(), String> {
+        self.stage_current(cx);
+        save_ssh_configs(&self.root, &self.configs)?;
+        if let Some(panel) = self.panel.clone() {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.saved_message = Some("ssh configurations updated".to_string());
+                })
+                .log_err();
+        }
+        Ok(())
+    }
+
+    fn apply(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.save(cx) {
+            Ok(()) => {
+                self.message = Some(("applied".to_string(), Color::Success));
+            }
+            Err(message) => {
+                self.message = Some((message, Color::Error));
+            }
+        }
+        cx.notify();
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(message) = self.save(cx) {
+            self.message = Some((message, Color::Error));
+            cx.notify();
+            return;
+        }
+        self.close(window, cx);
+    }
+
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close(window, cx);
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cx.has_global::<SshConfigDialogWindow>() {
+            cx.global_mut::<SshConfigDialogWindow>().0 = None;
+        }
+        window.remove_window();
+        cx.notify();
+    }
+}
+
+impl Render for SshConfigsDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let message = self.message.clone();
+        let test_message = self.test_message.clone();
+
+        let mut config_rows = Vec::new();
+        for (index, config) in self.configs.iter().enumerate() {
+            let is_selected = self.selected == Some(index);
+            config_rows.push(
+                h_flex()
+                    .id(("ssh-config-row", index))
+                    .w_full()
+                    .flex_none()
+                    .px_1()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_selected, |this| this.bg(colors.element_selected))
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Label::new(config.name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(if is_selected {
+                                Color::Accent
+                            } else {
+                                Color::Default
+                            })
+                            .truncate(),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select_config(index, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if config_rows.is_empty() {
+            config_rows.push(dialog_static("no configurations", Color::Muted));
+        }
+
+        let auth_button = dialog_button("ssh-auth-type", self.auth.label(), DialogButtonVariant::Secondary)
+            .end_icon(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.cycle_auth(cx);
+            }));
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        rows.push(dialog_row(
+            "Name:",
+            dialog_editor("ssh-name-editor", &self.name_editor, None, window, cx),
+        ));
+        rows.push(dialog_row(
+            "Host:",
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(dialog_editor("ssh-host-editor", &self.host_editor, None, window, cx))
+                .child(
+                    div().flex_none().w(px(35.)).child(
+                        dialog_label("Port:"),
+                    ),
+                )
+                .child(dialog_editor("ssh-port-editor", &self.port_editor, Some(px(60.)), window, cx)),
+        ));
+        rows.push(dialog_row(
+            "Username:",
+            dialog_editor("ssh-user-editor", &self.user_editor, None, window, cx),
+        ));
+        rows.push(dialog_row("Authentication type:", auth_button));
+        match self.auth {
+            SshAuthMode::Password => {
+                rows.push(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(dialog_row(
+                            "Password:",
+                            dialog_editor("ssh-password-editor", &self.password_editor, None, window, cx),
+                        ))
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_2()
+                                .pl(DIALOG_CONTROL_INDENT)
+                                .child(
+                                    dialog_button(
+                                        "ssh-save-password",
+                                        format!("Save: {}", self.save_password.label()),
+                                        DialogButtonVariant::Secondary,
+                                    )
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                        this.cycle_save_password(cx);
+                                    })),
+                                )
+                                .child(dialog_static(self.save_password.hint(), Color::Muted))
+                                .child(
+                                    dialog_button(
+                                        "ssh-reset-password",
+                                        "Reset",
+                                        DialogButtonVariant::Secondary,
+                                    )
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.reset_password(window, cx);
+                                    })),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
+            SshAuthMode::Key => {
+                rows.push(dialog_row(
+                    "Private key file:",
+                    dialog_editor("ssh-key-path-editor", &self.key_path_editor, None, window, cx),
+                ));
+            }
+            SshAuthMode::Agent => {}
+        }
+        rows.push(dialog_section_header("Connection Parameters"));
+        rows.push(
+            dialog_toggle_row_with(
+                "ssh-keep-alive",
+                self.keep_alive_enabled,
+                "Send keep-alives every",
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(dialog_editor(
+                        "ssh-keep-alive-editor",
+                        &self.keep_alive_editor,
+                        Some(px(45.)),
+                        window,
+                        cx,
+                    ))
+                    .child(
+                        Label::new("seconds")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                cx,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_keep_alive(cx);
+            }))
+            .into_any_element(),
+        );
+        rows.push(
+            dialog_toggle_row_with(
+                "ssh-strict",
+                self.strict,
+                "Strict host key check",
+                dialog_static("off = accept-new", Color::Muted),
+                cx,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_strict(cx);
+            }))
+            .into_any_element(),
+        );
+        rows.push(dialog_static("proxy: global settings only", Color::Muted));
+
+        let test_button = dialog_button("ssh-test", "Test Connection", DialogButtonVariant::Link)
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.test_connection(cx);
+            }));
+
+        v_flex()
+            .id("ssh-dialog")
+            .size_full()
+            .bg(colors.background)
+            .text_ui(cx)
+            .on_action(cx.listener(|this, _: &editor_actions::Cancel, window, cx| {
+                this.cancel(window, cx);
+            }))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        v_flex()
+                            .w(px(200.))
+                            .flex_none()
+                            .h_full()
+                            .border_r_1()
+                            .border_color(colors.border)
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap_0p5()
+                                    .px_1()
+                                    .py_1()
+                                    .child(
+                                        IconButton::new("ssh-add", IconName::Plus)
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::XSmall)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.add_config(window, cx);
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        IconButton::new("ssh-remove", IconName::SquareMinus)
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::XSmall)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.remove_config(window, cx);
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("ssh-config-list")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .children(config_rows),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("ssh-tab-content")
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .p_2()
+                            .child(v_flex().w_full().children(rows)),
+                    ),
+            )
+            .children(message.map(|(text, color)| {
+                h_flex()
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .child(
+                        Label::new(text)
+                            .size(LabelSize::XSmall)
+                            .color(color)
+                            .truncate(),
+                    )
+                    .into_any_element()
+            }))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(test_button)
+                            .children(test_message.as_ref().map(|(text, color)| {
+                                Label::new(text.clone())
+                                    .size(LabelSize::Small)
+                                    .color(*color)
+                                    .flex_1()
+                                    .truncate()
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                dialog_button(
+                                    "ssh-cancel",
+                                    "Cancel",
+                                    DialogButtonVariant::Secondary,
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.cancel(window, cx);
+                                })),
+                            )
+                            .child(
+                                dialog_button("ssh-apply", "Apply", DialogButtonVariant::Secondary)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.apply(window, cx);
+                                    })),
+                            )
+                            .child(
+                                dialog_button("ssh-ok", "OK", DialogButtonVariant::Primary)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.confirm(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+}
+
+fn ssh_probe_command(
+    config: &SshEntry,
+) -> std::result::Result<util::command::Command, String> {
+    let port = config.port.trim().to_string();
+    let port = if port.is_empty() { "22".to_string() } else { port };
+    if !port.chars().all(|character| character.is_ascii_digit())
+        || port.parse::<u16>().is_err()
+    {
+        return Err("wrong port number".to_string());
+    }
+    let host = config.host.trim().to_string();
+    if host.is_empty() {
+        return Err("host is required".to_string());
+    }
+    let user = config.user.trim().to_string();
+    if user.is_empty() {
+        return Err("username is required".to_string());
+    }
+    let strict = if config.strict_host_key {
+        "StrictHostKeyChecking=yes"
+    } else {
+        "StrictHostKeyChecking=accept-new"
+    };
+    match config.auth {
+        SshAuthMode::Agent => {
+            let mut command = util::command::new_command("ssh");
+            command
+                .arg(format!("-p{port}"))
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-o")
+                .arg("ConnectTimeout=5")
+                .arg("-o")
+                .arg(strict)
+                .arg(format!("{user}@{host}"))
+                .arg("true");
+            Ok(command)
+        }
+        SshAuthMode::Key => {
+            let key_path = config.key_path.trim().to_string();
+            if key_path.is_empty() {
+                return Err("key path is required".to_string());
+            }
+            let mut command = util::command::new_command("ssh");
+            command
+                .arg(format!("-p{port}"))
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-o")
+                .arg("ConnectTimeout=5")
+                .arg("-o")
+                .arg(strict)
+                .arg("-i")
+                .arg(key_path)
+                .arg(format!("{user}@{host}"))
+                .arg("true");
+            Ok(command)
+        }
+        SshAuthMode::Password => {
+            let password = config.password.clone();
+            if password.is_empty() {
+                return Err("password is required".to_string());
+            }
+            if !sshpass_available() {
+                return Err("sshpass binary not found".to_string());
+            }
+            let mut command = util::command::new_command("sshpass");
+            command
+                .arg("-p")
+                .arg(password)
+                .arg("ssh")
+                .arg(format!("-p{port}"))
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-o")
+                .arg("ConnectTimeout=5")
+                .arg("-o")
+                .arg(strict)
+                .arg(format!("{user}@{host}"))
+                .arg("true");
+            Ok(command)
+        }
+    }
+}
+
+fn sshpass_available() -> bool {
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join("sshpass");
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn open_ssh_configs_window(root: PathBuf, cx: &mut App) {
+    if !cx.has_global::<SshConfigDialogWindow>() {
+        cx.set_global(SshConfigDialogWindow(None));
+    }
+    let existing = cx.global::<SshConfigDialogWindow>().0;
+    if let Some(handle) = existing.and_then(|any| any.downcast::<SshConfigsDialog>()) {
+        let resumed = handle.update(cx, |dialog, window, cx| {
+            dialog.resume_with_root(root.clone(), window, cx);
+            window.activate_window();
+            cx.notify();
+        });
+        if resumed.is_ok() {
+            return;
+        }
+        cx.global_mut::<SshConfigDialogWindow>().0 = None;
+    }
+
+    let window_bounds = WindowBounds::centered(size(px(700.), px(480.)), cx);
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from("SSH Configurations")),
+                    ..Default::default()
+                }),
+                window_bounds: Some(window_bounds),
+                ..Default::default()
+            },
+            |window, cx| {
+                window.set_window_title("SSH Configurations");
+                let view = cx.new(|cx| SshConfigsDialog::new(root.clone(), window, cx));
+                window.activate_window();
+                view.focus_handle(cx).focus(window, cx);
+                view
+            },
+        )
+        .log_err();
+    if let Some(handle) = handle {
+        cx.global_mut::<SshConfigDialogWindow>().0 = Some(handle.into());
+    }
+}
+
+pub struct RootPickerWindow(pub Option<AnyWindowHandle>);
+
+impl gpui::Global for RootPickerWindow {}
+
+pub struct RootPickerRequest {
+    root: PathBuf,
+    server: String,
+    host_display: String,
+    title: String,
+    local_base: Option<PathBuf>,
+}
+
+pub struct RootPickerDialog {
+    request: RootPickerRequest,
+    entries: HashMap<String, std::result::Result<Vec<RemoteEntry>, String>>,
+    expanded: HashSet<String>,
+    selected: Option<String>,
+    query_editor: Entity<Editor>,
+    seq: u64,
+}
+
+impl Focusable for RootPickerDialog {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.query_editor.focus_handle(cx)
+    }
+}
+
+impl RootPickerDialog {
+    fn new(request: RootPickerRequest, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut dialog = Self {
+            request,
+            entries: HashMap::new(),
+            expanded: HashSet::new(),
+            selected: None,
+            query_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            seq: 0,
+        };
+        dialog.expanded.insert(".".to_string());
+        dialog.load_dir(".".to_string(), cx);
+        dialog
+    }
+
+    fn root_label(&self) -> String {
+        format!("{} ({})", self.request.server, self.request.host_display)
+    }
+
+    fn load_dir(&mut self, path: String, cx: &mut Context<Self>) {
+        self.seq += 1;
+        let seq = self.seq;
+        if let Some(local_base) = self.request.local_base.clone() {
+            let task_path = path.clone();
+            let task = cx.background_spawn(async move {
+                let base = if task_path == "." {
+                    local_base
+                } else {
+                    local_base.join(&task_path)
+                };
+                match std::fs::read_dir(&base) {
+                    Ok(reader) => {
+                        let mut items: Vec<(String, bool)> = Vec::new();
+                        for entry in reader.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let is_directory = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            items.push((name, is_directory));
+                        }
+                        Ok(parse_local_dir_entries(items))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    if this.seq != seq {
+                        return;
+                    }
+                    this.entries.insert(path, result);
+                    cx.notify();
+                })
+                .log_err();
+            })
+            .detach();
+            return;
+        }
+        let root = self.request.root.clone();
+        let server = self.request.server.clone();
+        let task_path = path.clone();
+        let task = cx.background_spawn(async move {
+            let output = std::process::Command::new("php-deploy")
+                .arg("ls")
+                .arg("--config")
+                .arg(root.join(".zed/deploy.picker.json"))
+                .arg("--server")
+                .arg(&server)
+                .arg("--path")
+                .arg(&task_path)
+                .arg("--json")
+                .current_dir(&root)
+                .output();
+            match output {
+                Ok(output) if output.status.success() => {
+                    parse_remote_entries(&String::from_utf8_lossy(&output.stdout), &task_path)
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Err(
+                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                            .unwrap_or_else(|| "ls command failed".to_string()),
+                    )
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this.seq != seq {
+                    return;
+                }
+                this.entries.insert(path, result);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn toggle_dir(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.expanded.contains(&path) {
+            self.expanded.remove(&path);
+            cx.notify();
+            return;
+        }
+        self.expanded.insert(path.clone());
+        if !self.entries.contains_key(&path) {
+            self.load_dir(path, cx);
+        }
+        cx.notify();
+    }
+
+    fn select_dir(&mut self, path: String, cx: &mut Context<Self>) {
+        self.selected = Some(path);
+        cx.notify();
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let picked = path;
+        if cx.has_global::<DeployDialogWindow>() {
+            let handle = cx
+                .global::<DeployDialogWindow>()
+                .0
+                .and_then(|any| any.downcast::<DeploymentDialog>());
+            if let Some(handle) = handle {
+                let applied = handle.update(cx, |dialog, window, cx| {
+                    dialog.apply_picked_root(picked, window, cx);
+                });
+                if applied.is_ok() {
+                    self.close(window, cx);
+                    return;
+                }
+            }
+        }
+        self.close(window, cx);
+    }
+
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close(window, cx);
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cx.has_global::<RootPickerWindow>() {
+            cx.global_mut::<RootPickerWindow>().0 = None;
+        }
+        window.remove_window();
+        cx.notify();
+    }
+}
+
+impl Render for RootPickerDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let query = self.query_editor.read(cx).text(cx);
+        let mut rows: Vec<AnyElement> = Vec::new();
+        rows.push(
+            h_flex()
+                .id("rp-root-row")
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .when(self.selected == Some(".".to_string()), |this| {
+                    this.bg(colors.element_selected)
+                })
+                .hover(|style| style.bg(colors.element_hover))
+                .child(
+                    Label::new(if self.expanded.contains(".") { "▾" } else { "▸" })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(self.root_label())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Default)
+                        .truncate(),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.select_dir(".".to_string(), cx);
+                }))
+                .into_any_element(),
+        );
+        let children = self.entries.get(".").cloned();
+        if let Some(result) = children {
+            match result {
+                Ok(entries) => {
+                    let mut line = 0usize;
+                    self.push_picker_rows(".", entries, 1, &mut line, &mut rows, &query, cx);
+                    if rows.len() == 1 && query.is_empty() {
+                        rows.push(
+                            h_flex()
+                                .px_3()
+                                .py_1()
+                                .child(
+                                    Label::new("empty directory")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+                Err(message) => rows.push(
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .child(
+                            Label::new(message)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error)
+                                .truncate(),
+                        )
+                        .into_any_element(),
+                ),
+            }
+        } else {
+            rows.push(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .child(
+                        Label::new("loading…")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .id("root-picker")
+            .size_full()
+            .bg(colors.background)
+            .text_ui(cx)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        Label::new("Search:")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .id("rp-query-box")
+                            .flex_1()
+                            .min_w_0()
+                            .bg(colors.editor_background)
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .rounded_sm()
+                            .px_1()
+                            .py_0p5()
+                            .cursor_text()
+                            .child(dialog_editor_element(&self.query_editor, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("rp-tree")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        Button::new("rp-cancel", "Cancel")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.cancel(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("rp-ok", "OK")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.confirm(window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
+impl RootPickerDialog {
+    fn push_picker_rows(
+        &self,
+        _parent: &str,
+        entries: Vec<RemoteEntry>,
+        depth: usize,
+        line: &mut usize,
+        out: &mut Vec<AnyElement>,
+        query: &str,
+        cx: &Context<Self>,
+    ) {
+        let colors = cx.theme().colors();
+        for entry in entries {
+            let matches = picker_query_matches(query, &entry.name);
+            let children = self.entries.get(&entry.path).cloned();
+            let expanded = self.expanded.contains(&entry.path);
+            let descendant_matches = query.trim().is_empty() || match children.as_ref() {
+                Some(Ok(children)) => {
+                    expanded
+                        && (children
+                            .iter()
+                            .any(|child| picker_query_matches(query, &child.name))
+                            || children.iter().any(|child| {
+                                child.is_directory && self.descendant_matches(query, &child.path)
+                            }))
+                }
+                _ => false,
+            };
+            if !matches && !descendant_matches {
+                continue;
+            }
+            let selected = self.selected == Some(entry.path.clone());
+            let path = entry.path.clone();
+            let toggle_path = path.clone();
+            let is_directory = entry.is_directory;
+            let mut item = h_flex()
+                .id(("rp-entry", *line))
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .when(selected, |this| this.bg(colors.element_selected))
+                .hover(|style| style.bg(colors.element_hover));
+            if is_directory {
+                item = item
+                    .child(
+                        div()
+                            .id(("rp-chevron", *line))
+                            .flex_none()
+                            .w(px(14.))
+                            .child(
+                                Label::new(if expanded { "▾" } else { "▸" })
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .hover(|style| style.bg(colors.element_hover))
+                             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                this.toggle_dir(toggle_path.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::FolderOpen
+                        } else {
+                            IconName::Folder
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Accent),
+                    );
+            } else {
+                item = item
+                    .child(div().flex_none().w(px(14.)))
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    );
+            }
+            item = item.child(
+                Label::new(entry.name.clone())
+                    .size(LabelSize::XSmall)
+                    .color(if selected {
+                        Color::Accent
+                    } else {
+                        Color::Default
+                    })
+                    .truncate(),
+            );
+            *line += 1;
+            out.push(
+                item.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    if is_directory {
+                        this.select_dir(path.clone(), cx);
+                    }
+                }))
+                .into_any_element(),
+            );
+            if is_directory && expanded {
+                if let Some(Ok(children)) = children {
+                    self.push_picker_rows(&entry.path, children, depth + 1, line, out, query, cx);
+                }
+            }
+        }
+    }
+
+    fn descendant_matches(&self, query: &str, path: &str) -> bool {
+        let Some(Ok(children)) = self.entries.get(path) else {
+            return false;
+        };
+        children.iter().any(|child| picker_query_matches(query, &child.name))
+            || children
+                .iter()
+                .any(|child| child.is_directory && self.descendant_matches(query, &child.path))
+    }
+}
+
+pub fn open_root_picker_window(
+    root: PathBuf,
+    server: String,
+    title: String,
+    host_display: String,
+    local_base: Option<PathBuf>,
+    cx: &mut App,
+) {
+    if !cx.has_global::<RootPickerWindow>() {
+        cx.set_global(RootPickerWindow(None));
+    }
+    let existing = cx.global::<RootPickerWindow>().0;
+    if let Some(handle) = existing.and_then(|any| any.downcast::<RootPickerDialog>()) {
+        let resumed = handle.update(cx, |picker, window, cx| {
+            picker.request = RootPickerRequest {
+                root: root.clone(),
+                server: server.clone(),
+                host_display: host_display.clone(),
+                title: title.clone(),
+                local_base: local_base.clone(),
+            };
+            picker.entries.clear();
+            picker.expanded.clear();
+            picker.selected = None;
+            picker.expanded.insert(".".to_string());
+            picker.load_dir(".".to_string(), cx);
+            window.activate_window();
+            cx.notify();
+        });
+        if resumed.is_ok() {
+            return;
+        }
+        cx.global_mut::<RootPickerWindow>().0 = None;
+    }
+    let window_bounds = WindowBounds::centered(size(px(560.), px(520.)), cx);
+    let request = RootPickerRequest {
+        root,
+        server,
+        host_display,
+        title: title.clone(),
+        local_base,
+    };
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from(request.title.clone())),
+                    ..Default::default()
+                }),
+                window_bounds: Some(window_bounds),
+                ..Default::default()
+            },
+            |window, cx| {
+                window.set_window_title(request.title.as_str());
+                let view = cx.new(|cx| RootPickerDialog::new(request, window, cx));
+                window.activate_window();
+                view.focus_handle(cx).focus(window, cx);
+                view
+            },
+        )
+        .log_err();
+    if let Some(handle) = handle {
+        cx.global_mut::<RootPickerWindow>().0 = Some(handle.into());
+    }
+}
+
 pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
     if !cx.has_global::<DataSourcesDialogWindow>() {
         cx.set_global(DataSourcesDialogWindow(None));
@@ -2202,34 +5233,8 @@ pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
     }
 }
 
-fn ds_editor_box(
-    id: impl Into<ElementId>,
-    editor: &Entity<Editor>,
-    flex: bool,
-    cx: &App,
-) -> AnyElement {
-    let colors = cx.theme().colors();
-    let mut box_div = div()
-        .id(id)
-        .min_w_0()
-        .bg(colors.editor_background)
-        .border_1()
-        .border_color(colors.border_variant)
-        .rounded_sm()
-        .px_1()
-        .py_0p5()
-        .cursor_text()
-        .child(dialog_editor_element(editor, cx));
-    if flex {
-        box_div = box_div.flex_1();
-    } else {
-        box_div = box_div.flex_none();
-    }
-    box_div.into_any_element()
-}
-
 impl Render for DataSourcesDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let message = self.message.clone();
         let test_message = self.test_message.clone();
@@ -2237,10 +5242,15 @@ impl Render for DataSourcesDialog {
             .selected
             .and_then(|index| self.sources.get(index))
             .cloned();
-        let problems = selected_source
+        let mut problems: Vec<String> = selected_source
             .as_ref()
             .map(data_source_problems)
             .unwrap_or_default();
+        if let Some(source) = selected_source.as_ref() {
+            if let Some(problem) = ssh_config_problem(source, &self.ssh_configs) {
+                problems.push(problem);
+            }
+        }
 
         let mut source_rows = Vec::new();
         for (index, source) in self.sources.iter().enumerate() {
@@ -2280,17 +5290,7 @@ impl Render for DataSourcesDialog {
             );
         }
         if source_rows.is_empty() {
-            source_rows.push(
-                h_flex()
-                    .px_1()
-                    .py_0p5()
-                    .child(
-                        Label::new("no data sources")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element(),
-            );
+            source_rows.push(dialog_static("no data sources", Color::Muted));
         }
 
         let mut problem_rows = Vec::new();
@@ -2343,169 +5343,215 @@ impl Render for DataSourcesDialog {
 
         let tab_content: AnyElement = match self.tab {
             DataSourceTab::General => {
-                let is_sqlite = selected_source
+                let driver = selected_source
                     .as_ref()
-                    .map(|source| source.is_sqlite())
-                    .unwrap_or(true);
+                    .map(|source| source.driver.clone())
+                    .unwrap_or_default();
+                let fields = data_source_general_fields(&driver);
+                let is_sqlite = driver == "sqlite";
                 let mut rows = Vec::new();
+
                 rows.push(
-                    h_flex()
-                        .w_full()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .child(
-                            div().flex_none().w(px(90.)).child(
-                                Label::new("Driver:")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                        .child(
-                            driver_badge(
-                                driver_badge_short(
-                                    &selected_source
-                                        .as_ref()
-                                        .map(|source| source.driver.clone())
-                                        .unwrap_or_default(),
-                                ),
-                                driver_badge_color(
-                                    &selected_source
-                                        .as_ref()
-                                        .map(|source| source.driver.clone())
-                                        .unwrap_or_default(),
-                                ),
-                                cx,
-                            ),
-                        )
-                        .child(
-                            Label::new(
-                                driver_support_hint(
-                                    &selected_source
-                                        .as_ref()
-                                        .map(|source| source.driver.clone())
-                                        .unwrap_or_default(),
-                                ),
-                            )
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                        )
-                        .into_any_element(),
-                );
-                if is_sqlite {
-                    rows.push(dialog_field(
-                        "ds-file-editor",
-                        "File:",
-                        &self.file_editor,
-                        None,
-                        cx,
-                    ));
-                } else {
-                    rows.push(dialog_field(
-                        "ds-host-editor",
-                        "Host:",
-                        &self.host_editor,
-                        None,
-                        cx,
-                    ));
-                    rows.push(dialog_field(
-                        "ds-port-editor",
-                        "Port:",
-                        &self.port_editor,
-                        Some(px(60.)),
-                        cx,
-                    ));
-                }
-                rows.push(
-                    h_flex()
-                        .w_full()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .child(
-                            div().flex_none().w(px(90.)).child(
-                                Label::new("Authentication:")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                        .child(
-                            Label::new("User & Password")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .into_any_element(),
-                );
-                if !is_sqlite {
-                    rows.push(dialog_field(
-                        "ds-user-editor",
-                        "User:",
-                        &self.user_editor,
-                        None,
-                        cx,
-                    ));
-                    let masked = selected_source
-                        .as_ref()
-                        .map(|source| mask_password(&source.password).to_string())
-                        .unwrap_or_default();
-                    rows.push(
+                    dialog_row(
+                        "Driver:",
                         h_flex()
-                            .w_full()
-                            .flex_none()
+                            .id("ds-driver-picker")
+                            .flex_1()
+                            .min_w_0()
                             .items_center()
                             .gap_2()
-                            .py_1()
-                            .child(
-                                div().flex_none().w(px(90.)).child(
-                                    Label::new("Password:")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
-                            )
-                            .child(ds_editor_box(
-                                "ds-password-editor",
-                                &self.password_editor,
-                                true,
+                            .px_1()
+                            .py_0p5()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(colors.element_hover))
+                            .child(driver_badge(
+                                driver_badge_short(&driver),
+                                driver_badge_color(&driver),
                                 cx,
                             ))
                             .child(
-                                Label::new(masked)
-                                    .size(LabelSize::XSmall)
+                                Label::new(driver_display_name(&driver))
+                                    .size(LabelSize::Small)
+                                    .truncate(),
+                            )
+                            .child(
+                                Label::new(driver_support_hint(&driver))
+                                    .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
+                            .child(div().flex_1().min_w_0())
+                            .child(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.toggle_driver_menu(cx);
+                            })),
+                    ),
+                );
+
+                if self.driver_menu_open && selected_source.is_some() {
+                    let mut menu_rows = Vec::new();
+                    for (menu_index, menu_driver) in DATABASE_DRIVERS.iter().enumerate() {
+                        let is_current = *menu_driver == driver;
+                        menu_rows.push(
+                            h_flex()
+                                .id(("ds-driver-row", menu_index))
+                                .w_full()
+                                .flex_none()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_0p5()
+                                .cursor_pointer()
+                                .when(is_current, |this| this.bg(colors.element_selected))
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .child(driver_badge(
+                                    driver_badge_short(menu_driver),
+                                    driver_badge_color(menu_driver),
+                                    cx,
+                                ))
+                                .child(
+                                    Label::new(driver_display_name(menu_driver))
+                                        .size(LabelSize::Small)
+                                        .color(if is_current {
+                                            Color::Accent
+                                        } else {
+                                            Color::Default
+                                        })
+                                        .truncate(),
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        this.switch_driver(menu_driver.to_string(), window, cx);
+                                    },
+                                ))
+                                .into_any_element(),
+                        );
+                    }
+                    rows.push(
+                        v_flex()
+                            .id("ds-driver-menu")
+                            .w_full()
+                            .flex_none()
+                            .gap_0p5()
+                            .px_1()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.elevated_surface_background)
+                            .shadow_sm()
+                            .max_h(px(220.))
+                            .overflow_y_scroll()
+                            .children(menu_rows)
                             .into_any_element(),
                     );
                 }
-                rows.push(dialog_field(
-                    "ds-database-editor",
-                    "Database:",
-                    &self.database_editor,
-                    None,
-                    cx,
+
+                if is_sqlite && selected_source.is_some() {
+                    let sqlite_path = selected_source
+                        .as_ref()
+                        .map(|source| source.path.trim())
+                        .unwrap_or_default();
+                    rows.push(dialog_row(
+                        "Data source file:",
+                        Label::new(if sqlite_path.is_empty() {
+                            "<not set — add a file from the project tree>"
+                        } else {
+                            sqlite_path
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                    ));
+                }
+
+                let mut front_len = fields.len();
+                for (index, field) in fields.iter().enumerate() {
+                    if !matches!(field, DsGeneralField::Host | DsGeneralField::Port) {
+                        front_len = index;
+                        break;
+                    }
+                }
+                let (front, rest) = fields.split_at(front_len);
+                for field in front {
+                    rows.push(match field {
+                        DsGeneralField::Host => dialog_row(
+                            "Host:",
+                            dialog_editor("ds-host-editor", &self.host_editor, None, window, cx),
+                        ),
+                        DsGeneralField::Port => dialog_row(
+                            "Port:",
+                            dialog_editor("ds-port-editor", &self.port_editor, Some(px(60.)), window, cx),
+                        ),
+                        _ => continue,
+                    });
+                }
+                rows.push(dialog_row(
+                    "Authentication:",
+                    Label::new(if is_sqlite {
+                        "file-based"
+                    } else {
+                        "User & Password"
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
                 ));
-                rows.push(dialog_field(
-                    "ds-url-editor",
-                    "URL:",
-                    &self.url_editor,
-                    None,
-                    cx,
-                ));
-                rows.push(
-                    h_flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .px_1()
-                        .child(
-                            Label::new("Overrides settings above")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .into_any_element(),
-                );
+                for field in rest {
+                    rows.push(match field {
+                        DsGeneralField::User => dialog_row(
+                            "User:",
+                            dialog_editor("ds-user-editor", &self.user_editor, None, window, cx),
+                        ),
+                        DsGeneralField::Password => {
+                            let masked = selected_source
+                                .as_ref()
+                                .map(|source| mask_password(&source.password).to_string())
+                                .unwrap_or_default();
+                            dialog_row(
+                                "Password:",
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(dialog_editor(
+                                        "ds-password-editor",
+                                        &self.password_editor,
+                                        None,
+                                        window,
+                                        cx,
+                                    ))
+                                    .child(
+                                        Label::new(masked)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                        }
+                        DsGeneralField::Database => dialog_row(
+                            "Database:",
+                            dialog_editor(
+                                "ds-database-editor",
+                                &self.database_editor,
+                                None,
+                                window,
+                                cx,
+                            ),
+                        ),
+                        _ => continue,
+                    });
+                }
+                if !is_sqlite {
+                    rows.push(dialog_row(
+                        "URL:",
+                        dialog_editor("ds-url-editor", &self.url_editor, None, window, cx),
+                    ));
+                    rows.push(dialog_static("Overrides settings above", Color::Muted));
+                }
                 v_flex()
                     .id("ds-tab-general")
                     .w_full()
@@ -2522,45 +5568,22 @@ impl Render for DataSourcesDialog {
                     .w_full()
                     .gap_1()
                     .children(vec![
-                        h_flex()
-                            .w_full()
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .py_1()
-                            .child(
-                                div().flex_none().w(px(90.)).child(
-                                    Label::new("Read-only:")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
+                        dialog_row(
+                            "Read-only:",
+                            dialog_button(
+                                "ds-option-readonly",
+                                if read_only {
+                                    "read-only"
+                                } else {
+                                    "read-write"
+                                },
+                                DialogButtonVariant::Secondary,
                             )
-                            .child(
-                                Button::new(
-                                    "ds-option-readonly",
-                                    if read_only {
-                                        "read-only"
-                                    } else {
-                                        "read-write"
-                                    },
-                                )
-                                .size(ButtonSize::Compact)
-                                .label_size(LabelSize::XSmall)
-                                .style(ButtonStyle::Subtle)
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.toggle_read_only(cx);
-                                })),
-                            )
-                            .into_any_element(),
-                        h_flex()
-                            .flex_none()
-                            .px_1()
-                            .child(
-                                Label::new("auto-disconnect: not supported")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .into_any_element(),
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.toggle_read_only(cx);
+                            })),
+                        ),
+                        dialog_static("auto-disconnect: not supported", Color::Muted),
                     ])
                     .into_any_element()
             }
@@ -2571,73 +5594,146 @@ impl Render for DataSourcesDialog {
                     .unwrap_or(false);
                 let mut rows = Vec::new();
                 rows.push(
-                    h_flex()
-                        .w_full()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .child(
-                            div().flex_none().w(px(150.)).child(
-                                Label::new("Use SSH tunnel:")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                        .child(
-                            Button::new(
-                                "ds-option-ssh",
-                                if ssh_enabled { "on" } else { "off" },
-                            )
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::XSmall)
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                this.toggle_ssh(cx);
-                            })),
-                        )
-                        .into_any_element(),
+                    dialog_toggle_row(
+                        "ds-ssh-toggle",
+                        ssh_enabled,
+                        "Use SSH tunnel",
+                        cx,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_ssh(cx);
+                    }))
+                    .into_any_element(),
                 );
                 if ssh_enabled {
-                    rows.push(dialog_field(
-                        "ds-ssh-config-editor",
-                        "SSH configuration:",
-                        &self.ssh_config_editor,
-                        None,
-                        cx,
-                    ));
-                    rows.push(dialog_field(
-                        "ds-ssh-local-port-editor",
-                        "Local port:",
-                        &self.ssh_local_port_editor,
-                        Some(px(60.)),
-                        cx,
-                    ));
+                    let config_name = selected_source
+                        .as_ref()
+                        .map(|source| source.ssh_name.trim().to_string())
+                        .unwrap_or_default();
                     rows.push(
-                        h_flex()
-                            .flex_none()
-                            .px_1()
-                            .py_1()
-                            .child(
-                                Label::new("format user@host:port")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .into_any_element(),
+                        dialog_row(
+                            "SSH configuration:",
+                            h_flex()
+                                .id("ds-ssh-config")
+                                .flex_1()
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    dialog_button(
+                                        "ds-ssh-config-select",
+                                        if config_name.is_empty() {
+                                            "<select configuration>"
+                                        } else {
+                                            config_name.as_str()
+                                        },
+                                        if config_name.is_empty() {
+                                            DialogButtonVariant::Link
+                                        } else {
+                                            DialogButtonVariant::Primary
+                                        },
+                                    )
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _: &ClickEvent, _window, cx| {
+                                            this.toggle_ssh_menu(cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    IconButton::new("ds-ssh-edit", IconName::Ellipsis)
+                                        .shape(IconButtonShape::Square)
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Edit SSH configurations"))
+                                        .on_click(cx.listener(
+                                            |this, _: &ClickEvent, window, cx| {
+                                                this.open_ssh_configs(window, cx);
+                                            },
+                                        )),
+                                ),
+                        ),
                     );
+                    if self.ssh_menu_open {
+                        for (index, config) in self.ssh_configs.iter().enumerate() {
+                            let is_active = config_name == config.name;
+                            rows.push(
+                                h_flex()
+                                    .id(("ds-ssh-config-row", index))
+                                    .w_full()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .when(is_active, |this| this.bg(colors.element_selected))
+                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                    .child(
+                                        Label::new(config.name.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(if is_active {
+                                                Color::Accent
+                                            } else {
+                                                Color::Default
+                                            })
+                                            .truncate(),
+                                    )
+                                    .child(
+                                        Label::new(ssh_user_host_text(config))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _window, cx| {
+                                            this.select_ssh_config(index, cx);
+                                        },
+                                    ))
+                                    .into_any_element(),
+                            );
+                        }
+                        rows.push(
+                            h_flex()
+                                .id("ds-ssh-config-add")
+                                .w_full()
+                                .flex_none()
+                                .items_center()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .child(
+                                    Label::new("Add new configuration...")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, window, cx| {
+                                        this.open_ssh_configs(window, cx);
+                                    },
+                                ))
+                                .into_any_element(),
+                        );
+                    }
+                    rows.push(dialog_row(
+                        "Local port:",
+                        dialog_editor(
+                            "ds-ssh-local-port-editor",
+                            &self.ssh_local_port_editor,
+                            Some(px(80.)),
+                            window,
+                            cx,
+                        ),
+                    ));
                 }
-                rows.push(
-                    h_flex()
-                        .flex_none()
-                        .px_1()
-                        .py_1()
-                        .child(
-                            Label::new("SSL: not supported")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .into_any_element(),
-                );
+                rows.push(dialog_static("SSL: not supported", Color::Muted));
                 v_flex()
                     .id("ds-tab-ssh")
                     .w_full()
@@ -2709,63 +5805,33 @@ impl Render for DataSourcesDialog {
                     ),
                     SchemaListState::Loaded(names) => {
                         rows.push(
-                            h_flex()
-                                .id("ds-schema-row-all")
-                                .w_full()
-                                .flex_none()
-                                .items_center()
-                                .gap_1()
-                                .px_1()
-                                .py_0p5()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(colors.element_hover))
-                                .child(
-                                    Label::new(if excluded.is_empty() { "[x]" } else { "[ ]" })
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .child(
-                                    Label::new("All schemas")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Default),
-                                )
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.toggle_all_schemas(cx);
-                                }))
-                                .into_any_element(),
+                            dialog_toggle_row(
+                                "ds-schema-row-all",
+                                excluded.is_empty(),
+                                "All schemas",
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.toggle_all_schemas(cx);
+                            }))
+                            .into_any_element(),
                         );
                         for (index, name) in names.iter().enumerate() {
                             let checked = schema_checked(&excluded, name);
                             let name = name.clone();
                             rows.push(
-                                h_flex()
-                                    .id(("ds-schema-row", index))
-                                    .w_full()
-                                    .flex_none()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_1()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(colors.element_hover))
-                                    .child(
-                                        Label::new(if checked { "[x]" } else { "[ ]" })
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new(name.clone())
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Default),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, _window, cx| {
-                                            this.toggle_schema(name.clone(), cx);
-                                        },
-                                    ))
-                                    .into_any_element(),
+                                dialog_toggle_row(
+                                    ("ds-schema-row", index),
+                                    checked,
+                                    name.clone(),
+                                    cx,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _window, cx| {
+                                        this.toggle_schema(name.clone(), cx);
+                                    },
+                                ))
+                                .into_any_element(),
                             );
                         }
                     }
@@ -2786,16 +5852,18 @@ impl Render for DataSourcesDialog {
                             .items_center()
                             .gap_1()
                             .py_0p5()
-                            .child(ds_editor_box(
+                            .child(dialog_editor(
                                 ("ds-advanced-name", index),
                                 key_editor,
-                                true,
+                                None,
+                                window,
                                 cx,
                             ))
-                            .child(ds_editor_box(
+                            .child(dialog_editor(
                                 ("ds-advanced-value", index),
                                 value_editor,
-                                true,
+                                None,
+                                window,
                                 cx,
                             ))
                             .into_any_element(),
@@ -2837,46 +5905,10 @@ impl Render for DataSourcesDialog {
             }
         };
 
-        let test_line = match test_message.as_ref() {
-            Some((text, color)) => h_flex()
-                .flex_none()
-                .items_center()
-                .gap_2()
-                .px_1()
-                .py_1()
-                .child(
-                    Button::new("ds-test", "Test Connection")
-                        .size(ButtonSize::Compact)
-                        .label_size(LabelSize::XSmall)
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.test_connection(cx);
-                        })),
-                )
-                .child(
-                    Label::new(text.clone())
-                        .size(LabelSize::XSmall)
-                        .color(*color)
-                        .flex_1()
-                        .truncate(),
-                )
-                .into_any_element(),
-            None => h_flex()
-                .flex_none()
-                .items_center()
-                .px_1()
-                .py_1()
-                .child(
-                    Button::new("ds-test", "Test Connection")
-                        .size(ButtonSize::Compact)
-                        .label_size(LabelSize::XSmall)
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.test_connection(cx);
-                        })),
-                )
-                .into_any_element(),
-        };
+        let test_button = dialog_button("ds-test", "Test Connection", DialogButtonVariant::Link)
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.test_connection(cx);
+            }));
 
         let message_line: Option<AnyElement> = message.as_ref().map(|(text, color)| {
             h_flex()
@@ -2885,7 +5917,7 @@ impl Render for DataSourcesDialog {
                 .py_1()
                 .child(
                     Label::new(text.clone())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Small)
                         .color(*color)
                         .truncate(),
                 )
@@ -3011,13 +6043,14 @@ impl Render for DataSourcesDialog {
                                     .border_color(colors.border)
                                     .child(
                                         Label::new("Name:")
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Small)
                                             .color(Color::Muted),
                                     )
-                                    .child(ds_editor_box(
+                                    .child(dialog_editor(
                                         "ds-name-editor",
                                         &self.name_editor,
-                                        true,
+                                        None,
+                                        window,
                                         cx,
                                     ))
                                     .child(
@@ -3043,8 +6076,7 @@ impl Render for DataSourcesDialog {
                                     .overflow_y_scroll()
                                     .p_2()
                                     .child(tab_content),
-                            )
-                            .child(test_line),
+                            ),
                     ),
             )
             .children(message_line)
@@ -3052,36 +6084,56 @@ impl Render for DataSourcesDialog {
                 h_flex()
                     .flex_none()
                     .items_center()
-                    .justify_end()
+                    .justify_between()
                     .gap_2()
                     .px_3()
                     .py_2()
                     .child(
-                        Button::new("ds-cancel", "Cancel")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.cancel(window, cx);
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(test_button)
+                            .children(test_message.as_ref().map(|(text, color)| {
+                                Label::new(text.clone())
+                                    .size(LabelSize::Small)
+                                    .color(*color)
+                                    .flex_1()
+                                    .truncate()
                             })),
                     )
                     .child(
-                        Button::new("ds-apply", "Apply")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.apply(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("ds-ok", "OK")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.confirm(window, cx);
-                            })),
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                dialog_button(
+                                    "ds-cancel",
+                                    "Cancel",
+                                    DialogButtonVariant::Secondary,
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.cancel(window, cx);
+                                })),
+                            )
+                            .child(
+                                dialog_button(
+                                    "ds-apply",
+                                    "Apply",
+                                    DialogButtonVariant::Secondary,
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.apply(window, cx);
+                                })),
+                            )
+                            .child(
+                                dialog_button("ds-ok", "OK", DialogButtonVariant::Primary)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.confirm(window, cx);
+                                    })),
+                            ),
                     ),
             )
     }
@@ -3754,6 +6806,25 @@ impl PhpPanel {
                 };
                 open_data_sources_window(root, cx);
             });
+            workspace.register_action(|workspace, _: &OpenSshConfigsDialog, _, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+                open_ssh_configs_window(root, cx);
+            });
             workspace.register_action(
                 |workspace, _: &BrowseRemoteHost, window, cx| {
                     if cx.has_global::<DeployShared>() {
@@ -3771,6 +6842,28 @@ impl PhpPanel {
             });
             workspace.register_action(|_, _: &SelectPrevTab, window, cx| {
                 select_tab_cyclically(window, cx, |active| next_tab(active, -1));
+            });
+            workspace.register_action(|workspace, action: &AddAsDataSource, _, cx| {
+                let Some(abs_path) = action.abs_path.as_deref().map(str::trim) else {
+                    return;
+                };
+                if abs_path.is_empty() {
+                    return;
+                }
+                let outcome = match add_data_source_from_sqlite_file(workspace, abs_path, cx) {
+                    Ok(name) => format!("data source added '{name}'"),
+                    Err(message) => format!("failed: {message}"),
+                };
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.refresh(cx);
+                                panel.saved_message = Some(outcome);
+                            })
+                            .log_err();
+                    }
+                }
             });
         })
         .detach();
@@ -3981,9 +7074,12 @@ impl PhpPanel {
         self.remote_servers = remote_servers;
         self.databases = databases;
 
+        // global (visible: false) servers stay in remote_servers (so panel saves keep
+        // them on disk) but are hidden from the panel's server list and active pick
         let names = self
             .remote_servers
             .iter()
+            .filter(|server| server.visible)
             .map(|server| server.name.clone())
             .collect::<Vec<_>>();
         let configured_active = deploy_config
@@ -4083,8 +7179,12 @@ impl PhpPanel {
     fn current_remote_server(&self) -> Option<&RemoteServer> {
         self.active_server
             .as_ref()
-            .and_then(|name| self.remote_servers.iter().find(|server| &server.name == name))
-            .or_else(|| self.remote_servers.first())
+            .and_then(|name| {
+                self.remote_servers
+                    .iter()
+                    .find(|server| &server.name == name && server.visible)
+            })
+            .or_else(|| self.remote_servers.iter().find(|server| server.visible))
     }
 
     fn select_tab(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
@@ -5417,6 +8517,17 @@ fn deploy_server_entry(server: &RemoteServer) -> Value {
     if !user.is_empty() {
         entry.insert("user".to_string(), Value::String(user.to_string()));
     }
+    let password = server.password.as_deref().unwrap_or_default();
+    if !password.is_empty() && !server.password_session {
+        entry.insert("password".to_string(), Value::String(password.to_string()));
+    }
+    let ssh_config = server.ssh_config.as_deref().unwrap_or_default();
+    if !ssh_config.is_empty() {
+        entry.insert(
+            "ssh_config".to_string(),
+            Value::String(ssh_config.to_string()),
+        );
+    }
     if let Some(remote_root) = server.remote_root.as_deref() {
         if !remote_root.is_empty() {
             entry.insert(
@@ -5451,6 +8562,35 @@ fn deploy_server_entry(server: &RemoteServer) -> Value {
     if server.upload_on_save {
         entry.insert("upload_on_save".to_string(), Value::Bool(true));
     }
+    if server.use_rsync {
+        entry.insert("use_rsync".to_string(), Value::Bool(true));
+    }
+    entry.insert("visible".to_string(), Value::Bool(server.visible));
+    if deploy_type_has_advanced(protocol) {
+        entry.insert(
+            "passive_mode".to_string(),
+            Value::Bool(server.passive_mode),
+        );
+        entry.insert("show_hidden".to_string(), Value::Bool(server.show_hidden));
+        entry.insert("list_compat".to_string(), Value::Bool(server.list_compat));
+        entry.insert("use_mlsd".to_string(), Value::Bool(server.use_mlsd));
+        entry.insert(
+            "max_connections".to_string(),
+            Value::from(server.max_connections),
+        );
+        entry.insert(
+            "keep_alive_enabled".to_string(),
+            Value::Bool(server.keep_alive_enabled),
+        );
+        entry.insert(
+            "keep_alive_seconds".to_string(),
+            Value::from(server.keep_alive_seconds),
+        );
+        entry.insert(
+            "encoding".to_string(),
+            Value::String(server.encoding.clone()),
+        );
+    }
     Value::Object(entry)
 }
 
@@ -5476,12 +8616,12 @@ fn save_deploy_config(
 
 fn parse_deploy_server(server: &Value, root: &Path) -> Option<RemoteServer> {
     let name = string_field(server, "name")?;
+    let protocol = string_field(server, "protocol");
     Some(RemoteServer {
         name,
-        protocol: string_field(server, "protocol"),
-        host: string_field(server, "host"),
-        port: port_field(server),
-        user: string_field(server, "user"),
+        password: string_field(server, "password"),
+        password_session: false,
+        ssh_config: string_field(server, "ssh_config"),
         remote_root: string_field(server, "remote_root"),
         local_root: string_field(server, "local_root"),
         web_url: string_field(server, "web_url"),
@@ -5490,6 +8630,51 @@ fn parse_deploy_server(server: &Value, root: &Path) -> Option<RemoteServer> {
             .get("upload_on_save")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        use_rsync: server
+            .get("use_rsync")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        visible: server
+            .get("visible")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        passive_mode: server
+            .get("passive_mode")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        show_hidden: server
+            .get("show_hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        list_compat: server
+            .get("list_compat")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        use_mlsd: server
+            .get("use_mlsd")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        max_connections: server
+            .get("max_connections")
+            .and_then(Value::as_u64)
+            .map(|number| number.min(u32::MAX as u64) as u32)
+            .unwrap_or(ADVANCED_DEFAULT_MAX_CONNECTIONS),
+        keep_alive_enabled: server
+            .get("keep_alive_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        keep_alive_seconds: server
+            .get("keep_alive_seconds")
+            .and_then(Value::as_u64)
+            .map(|number| number.min(u32::MAX as u64) as u32)
+            .unwrap_or(ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS),
+        encoding: string_field(server, "encoding")
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| ADVANCED_DEFAULT_ENCODING.to_string()),
+        protocol,
+        host: string_field(server, "host"),
+        port: port_field(server),
+        user: string_field(server, "user"),
         root: root.to_path_buf(),
     })
 }
@@ -5515,6 +8700,90 @@ fn excluded_paths(server: &Value) -> Vec<String> {
     Vec::new()
 }
 
+fn warning_texts(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(text) => Some(text.clone()),
+                other => other
+                    .get("message")
+                    .or_else(|| other.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+            .filter(|text| !text.is_empty())
+            .collect(),
+        Some(Value::Object(map)) => warning_texts(map.get("warnings")),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_validate_output(value: &Value) -> Vec<(String, Vec<String>)> {
+    let mut result = Vec::new();
+    if let Some(servers) = value.get("servers").and_then(Value::as_array) {
+        for server in servers {
+            let Some(name) = string_field(server, "name") else {
+                continue;
+            };
+            let warnings = warning_texts(server.get("warnings"));
+            if !warnings.is_empty() {
+                result.push((name, warnings));
+            }
+        }
+        if !result.is_empty() {
+            return result;
+        }
+    }
+    for key in ["warnings", "connections"] {
+        if let Some(map) = value.get(key).and_then(Value::as_object) {
+            for (name, list) in map {
+                let warnings = warning_texts(Some(list));
+                if !warnings.is_empty() {
+                    result.push((name.clone(), warnings));
+                }
+            }
+            if !result.is_empty() {
+                return result;
+            }
+        }
+    }
+    let flat = warning_texts(value.get("warnings"));
+    if !flat.is_empty() {
+        result.push((String::new(), flat));
+    }
+    result
+}
+
+fn parse_autodetect_root(value: &Value) -> Option<String> {
+    for key in ["root", "path", "remote_root", "directory", "found", "listing"] {
+        if let Some(text) = string_field(value, key) {
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    value.get("result").and_then(parse_autodetect_root)
+}
+
+fn deploy_temp_config_content(servers: &[Value], active: &str) -> Value {
+    serde_json::json!({
+        "servers": servers,
+        "active": active,
+    })
+}
+
+fn local_base_display(local_base: &Option<PathBuf>, root: &Path) -> String {
+    local_base
+        .as_ref()
+        .map(|path| {
+            path.strip_prefix(root)
+                .map(|relative| relative.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string())
+        })
+        .unwrap_or_default()
+}
+
 fn blank_server(root: PathBuf) -> RemoteServer {
     RemoteServer {
         name: String::new(),
@@ -5522,11 +8791,24 @@ fn blank_server(root: PathBuf) -> RemoteServer {
         host: None,
         port: None,
         user: None,
+        password: None,
+        password_session: false,
+        ssh_config: None,
         remote_root: None,
         local_root: None,
         web_url: None,
         excluded: Vec::new(),
         upload_on_save: false,
+        use_rsync: false,
+        visible: true,
+        passive_mode: true,
+        show_hidden: false,
+        list_compat: false,
+        use_mlsd: false,
+        max_connections: ADVANCED_DEFAULT_MAX_CONNECTIONS,
+        keep_alive_enabled: true,
+        keep_alive_seconds: ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS,
+        encoding: ADVANCED_DEFAULT_ENCODING.to_string(),
         root,
     }
 }
@@ -5621,8 +8903,12 @@ fn validate_staged_servers(servers: &[RemoteServer]) -> Option<String> {
             return Some("server name is required".to_string());
         }
         if let Some(protocol) = server.protocol.as_deref() {
-            if !protocol.is_empty() && !SERVER_PROTOCOLS.contains(&protocol) {
-                return Some(format!("\"{}\" protocol must be local or sftp", server.name));
+            if !protocol.is_empty() && deploy_type_canonical(protocol).is_none() {
+                return Some(format!(
+                    "\"{}\" protocol must be one of: {}",
+                    server.name,
+                    DEPLOY_TYPES.join(", ")
+                ));
             }
         }
         if let Some(port) = server.port.as_deref() {
@@ -5811,12 +9097,54 @@ fn driver_badge_short(driver: &str) -> &'static str {
         "postgres" => "pg",
         "mysql" => "my",
         "mariadb" => "mar",
-        "sqlite" => "docs",
+        "sqlite" => "lite",
         "sqlserver" => "msr",
         "oracle" => "orc",
         "mongodb" => "mdb",
         "redis" => "sh",
         _ => "?",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DsGeneralField {
+    Host,
+    Port,
+    User,
+    Password,
+    Database,
+}
+
+fn data_source_general_fields(driver: &str) -> &'static [DsGeneralField] {
+    match driver {
+        "sqlite" => &[],
+        "redis" => &[DsGeneralField::Host, DsGeneralField::Port, DsGeneralField::Password],
+        "mongodb" => &[
+            DsGeneralField::Host,
+            DsGeneralField::Port,
+            DsGeneralField::User,
+            DsGeneralField::Password,
+            DsGeneralField::Database,
+        ],
+        _ => &[
+            DsGeneralField::Host,
+            DsGeneralField::Port,
+            DsGeneralField::User,
+            DsGeneralField::Password,
+            DsGeneralField::Database,
+        ],
+    }
+}
+
+fn driver_default_port(driver: &str) -> Option<&'static str> {
+    match driver {
+        "postgres" => Some("5432"),
+        "mysql" | "mariadb" => Some("3306"),
+        "sqlserver" => Some("1433"),
+        "oracle" => Some("1521"),
+        "mongodb" => Some("27017"),
+        "redis" => Some("6379"),
+        _ => None,
     }
 }
 
@@ -6274,7 +9602,12 @@ impl Render for PhpPanel {
         let selected_remote = self.current_remote_server().cloned();
         let active_name = self.active_server.clone();
 
-        let picker_servers = self.remote_servers.clone();
+        let picker_servers = self
+            .remote_servers
+            .iter()
+            .filter(|server| server.visible)
+            .cloned()
+            .collect::<Vec<_>>();
         let picker_active = active_name.clone();
         let picker = selected_remote.as_ref().map(|server| {
             (
@@ -8062,17 +11395,7 @@ fn remote_root_badge(server: &Option<RemoteServer>) -> String {
 }
 
 fn driver_badge(chip: &str, color: Color, cx: &App) -> gpui::AnyElement {
-    div()
-        .flex_none()
-        .px_1()
-        .rounded_sm()
-        .bg(cx.theme().colors().element_hover)
-        .child(
-            Label::new(format!("{} ", chip))
-                .size(LabelSize::XSmall)
-                .color(color),
-        )
-        .into_any_element()
+    dialog_badge(chip, color, cx)
 }
 
 fn empty_row(message: &'static str) -> gpui::AnyElement {
@@ -8154,7 +11477,12 @@ impl Render for DeployServerIndicator {
                         if let Some(panel) = clear_panel.clone().and_then(|panel| panel.upgrade()) {
                             panel.update(cx, |panel, cx| {
                                 let root = panel.worktree_root(cx);
-                                let servers = panel.remote_servers.clone();
+                                let servers = panel
+                                    .remote_servers
+                                    .iter()
+                                    .filter(|server| server.visible)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
                                 if let Some(root) = root {
                                     let _ = save_deploy_config(&root, &servers, None);
                                 }
@@ -8376,11 +11704,24 @@ mod tests {
                     host: None,
                     port: None,
                     user: None,
+                    password: None,
+                    password_session: false,
+                    ssh_config: None,
                     remote_root: Some("remote".to_string()),
                     local_root: None,
                     web_url: None,
                     excluded: Vec::new(),
                     upload_on_save: false,
+                    use_rsync: false,
+                    visible: true,
+                    passive_mode: true,
+                    show_hidden: false,
+                    list_compat: false,
+                    use_mlsd: false,
+                    max_connections: ADVANCED_DEFAULT_MAX_CONNECTIONS,
+                    keep_alive_enabled: true,
+                    keep_alive_seconds: ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS,
+                    encoding: ADVANCED_DEFAULT_ENCODING.to_string(),
                     root: root.clone(),
                 },
                 RemoteServer {
@@ -8389,11 +11730,24 @@ mod tests {
                     host: Some("127.0.0.1".to_string()),
                     port: Some("2222".to_string()),
                     user: Some("deploy".to_string()),
+                    password: None,
+                    password_session: false,
+                    ssh_config: None,
                     remote_root: Some("/var/www/app".to_string()),
                     local_root: Some(".".to_string()),
                     web_url: None,
                     excluded: Vec::new(),
                     upload_on_save: false,
+                    use_rsync: false,
+                    visible: true,
+                    passive_mode: true,
+                    show_hidden: false,
+                    list_compat: false,
+                    use_mlsd: false,
+                    max_connections: ADVANCED_DEFAULT_MAX_CONNECTIONS,
+                    keep_alive_enabled: true,
+                    keep_alive_seconds: ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS,
+                    encoding: ADVANCED_DEFAULT_ENCODING.to_string(),
                     root: root.clone(),
                 },
             ],
@@ -8777,7 +12131,7 @@ mod tests {
         assert_eq!(driver_badge_short("postgres"), "pg");
         assert_eq!(driver_badge_short("mysql"), "my");
         assert_eq!(driver_badge_short("mariadb"), "mar");
-        assert_eq!(driver_badge_short("sqlite"), "docs");
+        assert_eq!(driver_badge_short("sqlite"), "lite");
         assert_eq!(driver_badge_short("sqlserver"), "msr");
         assert_eq!(driver_badge_short("oracle"), "orc");
         assert_eq!(driver_badge_short("mongodb"), "mdb");
@@ -8854,24 +12208,280 @@ mod tests {
     }
 
     #[test]
-    fn parse_ssh_config_splits_user_host_port() {
-        let (user, host, port) = parse_ssh_config("deploy@127.0.0.1:2222");
-        assert_eq!(user, "deploy");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, "2222");
-        let (user, host, port) = parse_ssh_config("db.local");
-        assert_eq!(user, "");
-        assert_eq!(host, "db.local");
-        assert_eq!(port, "");
-        let (user, host, port) = parse_ssh_config("  root @ box : 22 ");
-        assert_eq!(user, "root");
-        assert_eq!(host, "box");
-        assert_eq!(port, "22");
+    fn data_source_general_fields_matrix_matches_drivers() {
+        assert_eq!(data_source_general_fields("sqlite"), &[]);
+        for driver in ["postgres", "mysql", "mariadb", "sqlserver", "oracle"] {
+            assert_eq!(
+                data_source_general_fields(driver),
+                &[
+                    DsGeneralField::Host,
+                    DsGeneralField::Port,
+                    DsGeneralField::User,
+                    DsGeneralField::Password,
+                    DsGeneralField::Database,
+                ]
+            );
+        }
         assert_eq!(
-            format_ssh_config("deploy", "127.0.0.1", "2222"),
-            "deploy@127.0.0.1:2222"
+            data_source_general_fields("mongodb"),
+            &[
+                DsGeneralField::Host,
+                DsGeneralField::Port,
+                DsGeneralField::User,
+                DsGeneralField::Password,
+                DsGeneralField::Database,
+            ]
         );
-        assert_eq!(format_ssh_config("", "box", ""), "box");
+        assert_eq!(
+            data_source_general_fields("redis"),
+            &[
+                DsGeneralField::Host,
+                DsGeneralField::Port,
+                DsGeneralField::Password,
+            ]
+        );
+        // unknown drivers keep the server shape (matches the old non-sqlite columns)
+        assert!(
+            data_source_general_fields("custom")
+                .contains(&DsGeneralField::Host)
+        );
+    }
+
+    #[test]
+    fn driver_default_port_matrix_prefills_only_server_drivers() {
+        assert!(driver_default_port("sqlite").is_none());
+        assert!(driver_default_port("unknown").is_none());
+        assert_eq!(driver_default_port("postgres"), Some("5432"));
+        assert_eq!(driver_default_port("mysql"), Some("3306"));
+        assert_eq!(driver_default_port("mariadb"), Some("3306"));
+        assert_eq!(driver_default_port("sqlserver"), Some("1433"));
+        assert_eq!(driver_default_port("oracle"), Some("1521"));
+        assert_eq!(driver_default_port("mongodb"), Some("27017"));
+        assert_eq!(driver_default_port("redis"), Some("6379"));
+    }
+
+    #[test]
+    fn ssh_store_round_trip_tolerates_missing_and_broken_file() {
+        let root = temp_root("ssh_store_round_trip");
+        assert!(load_ssh_configs(&root).is_empty());
+
+        let mut agent = SshEntry::blank();
+        agent.name = "agent".to_string();
+        agent.user = "deploy".to_string();
+        agent.host = "127.0.0.1".to_string();
+        agent.port = "2222".to_string();
+        agent.auth = SshAuthMode::Agent;
+        agent.keep_alive = 10;
+        agent.strict_host_key = true;
+        let mut key = SshEntry::blank();
+        key.name = "key".to_string();
+        key.user = "ci".to_string();
+        key.host = "box.local".to_string();
+        key.auth = SshAuthMode::Key;
+        key.key_path = "/home/ci/id_ed25519".to_string();
+
+        save_ssh_configs(&root, &[agent, key]).expect("save ssh configs");
+        let configs = load_ssh_configs(&root);
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].name, "agent");
+        assert_eq!(configs[0].port, "2222");
+        assert_eq!(configs[0].auth, SshAuthMode::Agent);
+        assert_eq!(configs[0].keep_alive, 10);
+        assert!(configs[0].strict_host_key);
+        assert_eq!(configs[1].auth, SshAuthMode::Key);
+        assert_eq!(configs[1].key_path, "/home/ci/id_ed25519");
+        assert_eq!(configs[1].keep_alive, 15);
+
+        std::fs::write(root.join(".zed/ssh.json"), "not json").expect("break ssh.json");
+        assert!(load_ssh_configs(&root).is_empty());
+        std::fs::write(root.join(".zed/ssh.json"), r#"{"configs":[{"name":"legacy"}]}"#)
+            .expect("legacy ssh.json");
+        let configs = load_ssh_configs(&root);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(ssh_entry_port(&configs[0]), 22);
+        assert_eq!(configs[0].auth, SshAuthMode::Password);
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn save_ssh_configs_rejects_empty_and_duplicate_names() {
+        let root = temp_root("ssh_store_validation");
+        let mut blank = SshEntry::blank();
+        blank.name = "  ".to_string();
+        assert_eq!(
+            save_ssh_configs(&root, &[blank]),
+            Err("configuration name is required".to_string())
+        );
+
+        let mut first = SshEntry::blank();
+        first.name = "same".to_string();
+        let mut second = SshEntry::blank();
+        second.name = "same".to_string();
+        assert_eq!(
+            save_ssh_configs(&root, &[first, second]),
+            Err("duplicate configuration name: same".to_string())
+        );
+
+        let mut key = SshEntry::blank();
+        key.name = "key".to_string();
+        key.auth = SshAuthMode::Key;
+        assert_eq!(
+            save_ssh_configs(&root, &[key]),
+            Err("key: key path is required".to_string())
+        );
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn next_ssh_auth_cycles_password_key_agent() {
+        let expected = [
+            SshAuthMode::Key,
+            SshAuthMode::Agent,
+            SshAuthMode::Password,
+            SshAuthMode::Key,
+        ];
+        let mut current = SshAuthMode::Password;
+        for expected_mode in expected {
+            assert_eq!(next_ssh_auth(current), expected_mode);
+            current = next_ssh_auth(current);
+        }
+        assert_eq!(SshAuthMode::parse("key"), SshAuthMode::Key);
+        assert_eq!(SshAuthMode::parse("agent"), SshAuthMode::Agent);
+        assert_eq!(SshAuthMode::parse("password"), SshAuthMode::Password);
+        assert_eq!(SshAuthMode::parse("gibberish"), SshAuthMode::Password);
+    }
+
+    #[test]
+    fn resolve_ssh_into_fills_server_fields_and_auth() {
+        let mut config = SshEntry::blank();
+        config.name = "bastion".to_string();
+        config.user = "deploy".to_string();
+        config.host = "10.0.0.5".to_string();
+        config.port = "2222".to_string();
+        config.auth = SshAuthMode::Password;
+        config.password = "secret".to_string();
+        config.keep_alive = 30;
+        config.strict_host_key = true;
+        let configs = vec![config];
+
+        let mut server = serde_json::json!({
+            "name": "web1",
+            "host": "old.host",
+            "user": "old",
+            "port": 21,
+            "ssh_config": "bastion",
+        });
+        resolve_ssh_into(&mut server, &configs).expect("resolve server");
+        assert_eq!(server["host"], json!("10.0.0.5"));
+        assert_eq!(server["user"], json!("deploy"));
+        assert_eq!(server["port"], json!(2222));
+        assert_eq!(server["ssh_auth"], json!("password"));
+        assert_eq!(server["ssh_password"], json!("secret"));
+        assert_eq!(server["ssh_strict_host_key"], json!(true));
+        assert_eq!(server["ssh_keep_alive"], json!(30));
+
+        let mut tunnelled = serde_json::json!({
+            "name": "pg",
+            "ssh_tunnel": {"enabled": true, "name": "bastion", "local_port": 15432, "port": 1},
+        });
+        resolve_ssh_tunnel_into(&mut tunnelled, &configs).expect("resolve tunnel");
+        assert_eq!(tunnelled["ssh_tunnel"]["host"], json!("10.0.0.5"));
+        assert_eq!(tunnelled["ssh_tunnel"]["port"], json!(2222));
+        assert_eq!(tunnelled["ssh_tunnel"]["user"], json!("deploy"));
+        assert_eq!(tunnelled["ssh_tunnel"]["local_port"], json!(15432));
+        assert!(tunnelled["ssh_tunnel"].get("name").is_none());
+        assert_eq!(tunnelled["ssh_tunnel"]["keep_alive"], json!(30));
+
+        let mut disabled = serde_json::json!({
+            "ssh_tunnel": {"enabled": false, "name": "bastion"},
+        });
+        resolve_ssh_tunnel_into(&mut disabled, &configs).expect("disabled tunnel untouched");
+        assert!(disabled["ssh_tunnel"].get("host").is_none());
+
+        let mut unnamed = serde_json::json!({
+            "ssh_tunnel": {"enabled": true, "host": "manual.host"},
+        });
+        resolve_ssh_tunnel_into(&mut unnamed, &configs).expect("unnamed tunnel untouched");
+        assert_eq!(unnamed["ssh_tunnel"]["host"], json!("manual.host"));
+    }
+
+    #[test]
+    fn resolve_ssh_into_missing_config_reports_name() {
+        let configs = Vec::new();
+
+        let mut tunnelled =
+            serde_json::json!({"ssh_tunnel": {"enabled": true, "name": "gone"}});
+        assert_eq!(
+            resolve_ssh_tunnel_into(&mut tunnelled, &configs),
+            Err("ssh configuration 'gone' not found".to_string())
+        );
+
+        let mut server = serde_json::json!({"ssh_config": "gone"});
+        assert_eq!(
+            resolve_ssh_into(&mut server, &configs),
+            Err("ssh configuration 'gone' not found".to_string())
+        );
+    }
+
+    #[test]
+    fn unique_ssh_config_name_avoids_collisions() {
+        assert_eq!(unique_ssh_config_name("config", &[]), "config");
+        let mut existing = SshEntry::blank();
+        existing.name = "config".to_string();
+        let configs = vec![existing];
+        assert_eq!(unique_ssh_config_name("config", &configs), "config (1)");
+    }
+
+    #[test]
+    fn ssh_user_host_text_lists_user_host_port() {
+        let mut config = SshEntry::blank();
+        config.user = "deploy".to_string();
+        config.host = "bastion.local".to_string();
+        config.port = "2222".to_string();
+        assert_eq!(ssh_user_host_text(&config), "deploy@bastion.local:2222");
+        config.user = String::new();
+        assert_eq!(ssh_user_host_text(&config), "bastion.local:2222");
+        config.port = String::new();
+        assert_eq!(ssh_user_host_text(&config), "bastion.local");
+    }
+
+    #[test]
+    fn deploy_server_entry_round_trips_ssh_config() {
+        let root = temp_root("deploy_ssh_config_field");
+        let mut server = blank_server(root.clone());
+        server.name = "web1".to_string();
+        server.protocol = Some("sftp".to_string());
+        server.ssh_config = Some("bastion".to_string());
+        let entry = deploy_server_entry(&server);
+        assert_eq!(entry["ssh_config"], json!("bastion"));
+        let parsed = parse_deploy_server(&entry, &root).expect("parse entry");
+        assert_eq!(parsed.ssh_config.as_deref(), Some("bastion"));
+
+        server.ssh_config = None;
+        let entry = deploy_server_entry(&server);
+        assert!(entry.get("ssh_config").is_none());
+        let parsed = parse_deploy_server(&entry, &root).expect("parse entry");
+        assert_eq!(parsed.ssh_config, None);
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn data_source_entry_stores_ssh_tunnel_name() {
+        let mut source = DataSource::blank(PathBuf::from("/tmp"));
+        source.name = "pg".to_string();
+        source.driver = "postgres".to_string();
+        source.ssh_enabled = true;
+        source.ssh_name = "bastion".to_string();
+        source.ssh_local_port = "15432".to_string();
+        let entry = data_source_entry(&source);
+        // staged tunnel is name+local_port only; the NAME is panel-side state,
+        // php-db denies unknown fields so the serialized tunnel carries the
+        // resolved host/user/port instead (written by resolve_ssh_tunnel_into)
+        assert!(entry["ssh_tunnel"].get("name").is_none());
+        assert_eq!(entry["ssh_tunnel"]["local_port"], json!(15432));
+        assert_eq!(entry["ssh_tunnel"]["enabled"], json!(true));
     }
 
     #[test]
@@ -8926,6 +12536,103 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_file_name_detector_matches_only_sqlite_extensions() {
+        for name in ["demo.sqlite", "backup.db", "dump.sqlite3", "notes.DB", "x.SQLite"] {
+            assert!(is_sqlite_file_name(name), "{name} should match");
+        }
+        for name in [
+            "photo.png",
+            "local.php",
+            "README",
+            "notes.sqlite.bak",
+            "archive.sql",
+            ".db",
+        ] {
+            assert!(!is_sqlite_file_name(name), "{name} should not match");
+        }
+    }
+
+    #[test]
+    fn sqlite_data_source_from_file_derives_name_and_connection() {
+        let root = PathBuf::from("/tmp/project");
+        let source = sqlite_data_source_from_file("demo.sqlite", "data/demo.sqlite", &root);
+        assert_eq!(source.name, "demo.sqlite");
+        assert!(source.is_sqlite());
+        assert_eq!(source.path, "data/demo.sqlite");
+        assert_eq!(source.root, root);
+        assert!(source.host.is_empty());
+
+        let entry = data_source_entry(&source);
+        assert_eq!(entry["name"], json!("demo.sqlite"));
+        assert_eq!(entry["driver"], json!("sqlite"));
+        assert_eq!(entry["path"], json!("data/demo.sqlite"));
+        assert!(entry.get("host").is_none());
+        assert!(entry.get("database").is_none());
+        assert!(entry.get("url").is_none());
+    }
+
+    #[test]
+    fn upsert_sqlite_data_source_preserves_other_connections() {
+        let root = temp_root("sqlite_data_source_upsert");
+        std::fs::create_dir_all(root.join(".zed")).expect("create .zed");
+        std::fs::write(
+            root.join(".zed/databases.json"),
+            r#"{"connections":[{"name":"pg","driver":"postgres","url":"postgres://localhost/app","password_env":"PGPASSWORD"}]}"#,
+        )
+        .expect("seed databases.json");
+
+        let name = upsert_sqlite_data_source(&root, "data/demo.sqlite").expect("upsert");
+        assert_eq!(name, "demo.sqlite");
+
+        let config = read_json(&root.join(".zed/databases.json")).expect("parse databases.json");
+        let connections = config["connections"].as_array().expect("connections array");
+        assert_eq!(connections.len(), 2);
+        let pg = &connections[0];
+        assert_eq!(pg["name"], json!("pg"));
+        assert_eq!(pg["url"], json!("postgres://localhost/app"));
+        assert_eq!(pg["password_env"], json!("PGPASSWORD"));
+        let added = &connections[1];
+        assert_eq!(added["name"], json!("demo.sqlite"));
+        assert_eq!(added["driver"], json!("sqlite"));
+        assert_eq!(added["path"], json!("data/demo.sqlite"));
+        assert!(added.get("host").is_none());
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn upsert_sqlite_data_source_uniquifies_repeated_names() {
+        let root = temp_root("sqlite_data_source_unique");
+        std::fs::create_dir_all(root.join(".zed")).expect("create .zed");
+        std::fs::write(
+            root.join(".zed/databases.json"),
+            r#"{"connections":[{"name":"demo.sqlite","driver":"sqlite","path":"old.sqlite"}]}"#,
+        )
+        .expect("seed databases.json");
+
+        let name = upsert_sqlite_data_source(&root, "data/demo.sqlite").expect("upsert");
+        assert_eq!(name, "demo.sqlite (1)");
+
+        let repeated = upsert_sqlite_data_source(&root, "data/demo.sqlite").expect("upsert");
+        assert_eq!(repeated, "demo.sqlite (2)");
+
+        let config = read_json(&root.join(".zed/databases.json")).expect("parse databases.json");
+        let connections = config["connections"].as_array().expect("connections array");
+        assert_eq!(connections.len(), 3);
+        let existing = &connections[0];
+        assert_eq!(existing["name"], json!("demo.sqlite"));
+        assert_eq!(existing["path"], json!("old.sqlite"));
+        let first = &connections[1];
+        assert_eq!(first["name"], json!("demo.sqlite (1)"));
+        assert_eq!(first["path"], json!("data/demo.sqlite"));
+        let second = &connections[2];
+        assert_eq!(second["name"], json!("demo.sqlite (2)"));
+        assert_eq!(second["path"], json!("data/demo.sqlite"));
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
     fn data_source_entry_and_parse_roundtrip() {
         let mut source = DataSource::blank(PathBuf::from("/tmp"));
         source.name = "pg".to_string();
@@ -8937,17 +12644,20 @@ mod tests {
         source.database = "app".to_string();
         source.read_only = true;
         source.ssh_enabled = true;
-        source.ssh_user = "deploy".to_string();
-        source.ssh_host = "127.0.0.1".to_string();
-        source.ssh_port = "2222".to_string();
+        source.ssh_name = "bastion".to_string();
+        source.ssh_local_port = "15432".to_string();
         source.excluded_schemas = vec!["public".to_string()];
         source.options = vec![("connect_timeout".to_string(), "5".to_string())];
 
         let entry = data_source_entry(&source);
         assert_eq!(entry["port"], json!(5432));
         assert_eq!(entry["read_only"], json!(true));
-        assert_eq!(entry["ssh_tunnel"]["port"], json!(2222));
-        assert_eq!(entry["ssh_tunnel"]["user"], json!("deploy"));
+        // staged tunnel is name+local_port only; host/port/user resolved at apply/test
+        assert!(entry["ssh_tunnel"].get("name").is_none());
+        assert_eq!(entry["ssh_tunnel"]["local_port"], json!(15432));
+        assert!(entry["ssh_tunnel"].get("host").is_none());
+        assert!(entry["ssh_tunnel"].get("port").is_none());
+        assert!(entry["ssh_tunnel"].get("user").is_none());
         assert_eq!(entry["excluded_schemas"], json!(["public"]));
         assert_eq!(entry["options"]["connect_timeout"], json!("5"));
 
@@ -8956,8 +12666,8 @@ mod tests {
         assert_eq!(parsed.port, "5432");
         assert!(parsed.read_only);
         assert!(parsed.ssh_enabled);
-        assert_eq!(parsed.ssh_host, "127.0.0.1");
-        assert_eq!(parsed.ssh_port, "2222");
+        assert!(parsed.ssh_name.is_empty());
+        assert_eq!(parsed.ssh_local_port, "15432");
         assert_eq!(parsed.excluded_schemas, vec!["public".to_string()]);
         assert_eq!(
             parsed.options,
@@ -9042,5 +12752,446 @@ mod tests {
             next_data_source_name("a copy", &sources),
             "a copy"
         );
+    }
+
+    #[test]
+    fn deploy_type_badges_normalize_aliases() {
+        assert_eq!(deploy_type_canonical("SSH"), Some("sftp"));
+        assert_eq!(deploy_type_canonical("inplace"), Some("in-place"));
+        assert_eq!(deploy_type_canonical("dav+"), Some("webdavs"));
+        assert_eq!(deploy_type_canonical("ftp-ssl"), Some("ftps"));
+        assert_eq!(deploy_type_canonical("gopher"), None);
+
+        let expected = [
+            ("local", "local"),
+            ("in-place", "dl"),
+            ("sftp", "ssh"),
+            ("ftp", "ftp"),
+            ("ftps", "ftp"),
+            ("webdav", "dav"),
+            ("webdavs", "dav+"),
+        ];
+        for (kind, badge) in expected {
+            assert_eq!(deploy_type_badge_short(kind), badge);
+        }
+        assert_eq!(deploy_type_badge_short("ssh"), "ssh");
+        assert_eq!(deploy_type_badge_short("gopher"), "?");
+
+        assert_eq!(next_deploy_type("webdavs"), "local");
+        assert_eq!(next_deploy_type("sftp"), "ftp");
+        assert_eq!(next_deploy_type("gopher"), "in-place");
+    }
+
+    #[test]
+    fn deploy_connection_fields_matrix_matches_types() {
+        assert_eq!(
+            deploy_connection_fields("sftp"),
+            &[
+                DeployField::SshConfig,
+                DeployField::RsyncToggle,
+                DeployField::RootPath,
+                DeployField::WebUrl,
+                DeployField::TestConnection,
+            ]
+        );
+        for kind in ["ftp", "ftps", "webdav", "webdavs"] {
+            assert_eq!(
+                deploy_connection_fields(kind),
+                &[
+                    DeployField::Host,
+                    DeployField::Port,
+                    DeployField::User,
+                    DeployField::AnonToggle,
+                    DeployField::Password,
+                    DeployField::RootPath,
+                    DeployField::WebUrl,
+                    DeployField::TestConnection,
+                ]
+            );
+        }
+        assert_eq!(
+            deploy_connection_fields("local"),
+            &[
+                DeployField::Folder,
+                DeployField::RootPath,
+                DeployField::WebUrl,
+                DeployField::TestConnection,
+            ]
+        );
+        assert_eq!(
+            deploy_connection_fields("in-place"),
+            &[DeployField::WebUrl, DeployField::TestConnection]
+        );
+
+        assert_eq!(deploy_default_port("ftp"), Some("21"));
+        assert_eq!(deploy_default_port("ftps"), Some("990"));
+        assert_eq!(deploy_default_port("webdav"), Some("80"));
+        assert_eq!(deploy_default_port("webdavs"), Some("443"));
+        assert_eq!(deploy_default_port("sftp"), None);
+    }
+
+    #[test]
+    fn parse_validate_output_reads_engine_shapes() {
+        let per_server: Value = serde_json::json!({
+            "servers": [
+                {"name": "sftp", "warnings": ["SFTP host is not specified"]},
+                {"name": "web1", "warnings": [{"message": "Root path is not specified"}]}
+            ]
+        });
+        let parsed = parse_validate_output(&per_server);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "sftp");
+        assert_eq!(parsed[0].1, vec!["SFTP host is not specified".to_string()]);
+        assert_eq!(parsed[1].1, vec!["Root path is not specified".to_string()]);
+
+        let mapped: Value = serde_json::json!({
+            "warnings": {"web1": ["no root found"]}
+        });
+        let parsed = parse_validate_output(&mapped);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "web1");
+        assert_eq!(parsed[0].1, vec!["no root found".to_string()]);
+
+        let flat: Value = serde_json::json!({"warnings": ["Folder is not specified"]});
+        let parsed = parse_validate_output(&flat);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].0.is_empty());
+        assert_eq!(
+            parsed[0].1,
+            vec!["Folder is not specified".to_string()]
+        );
+
+        assert!(parse_validate_output(&serde_json::json!({})).is_empty());
+        assert!(parse_validate_output(&serde_json::json!({"servers": [{"name": "x"}]})).is_empty());
+    }
+
+    #[test]
+    fn parse_autodetect_root_reads_engine_shapes() {
+        assert_eq!(
+            parse_autodetect_root(&serde_json::json!({"root": "/var/www/app"})),
+            Some("/var/www/app".to_string())
+        );
+        assert_eq!(
+            parse_autodetect_root(&serde_json::json!({"path": "/srv"})),
+            Some("/srv".to_string())
+        );
+        assert_eq!(
+            parse_autodetect_root(&serde_json::json!({"result": {"found": "/www"}})),
+            Some("/www".to_string())
+        );
+        assert_eq!(
+            parse_autodetect_root(&serde_json::json!({"root": ""})),
+            None
+        );
+        assert_eq!(
+            parse_autodetect_root(&serde_json::json!({"entries": []})),
+            None
+        );
+    }
+
+    #[test]
+    fn deploy_server_entry_serializes_new_fields() {
+        let root = temp_root("deploy_new_fields");
+        let mut server = blank_server(root.clone());
+        server.name = "web1".to_string();
+        server.protocol = Some("sftp".to_string());
+        server.use_rsync = true;
+        server.visible = false;
+        server.password = Some("secret".to_string());
+
+        let entry = deploy_server_entry(&server);
+        assert_eq!(entry["use_rsync"], json!(true));
+        assert_eq!(entry["visible"], json!(false));
+        assert_eq!(entry["password"], json!("secret"));
+
+        let parsed = parse_deploy_server(&entry, &root).expect("parse entry");
+        assert!(parsed.use_rsync);
+        assert!(!parsed.visible);
+        assert_eq!(parsed.password.as_deref(), Some("secret"));
+
+        let mut quiet = blank_server(root.clone());
+        quiet.name = "local".to_string();
+        let entry = deploy_server_entry(&quiet);
+        assert!(entry.get("use_rsync").is_none());
+        assert_eq!(entry["visible"], json!(true));
+        assert!(entry.get("password").is_none());
+        let parsed = parse_deploy_server(&entry, &root).expect("parse entry");
+        assert!(!parsed.use_rsync);
+        assert!(parsed.visible);
+        assert_eq!(parsed.password, None);
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn advanced_defaults_parse_from_missing_fields() {
+        let root = Path::new("/tmp");
+        let value: Value = serde_json::from_str(r#"{"name":"ftp1","protocol":"ftp"}"#)
+            .expect("parse config");
+        let server = parse_deploy_server(&value, root).expect("parse server");
+        assert!(server.passive_mode);
+        assert!(!server.show_hidden);
+        assert!(!server.list_compat);
+        assert!(!server.use_mlsd);
+        assert_eq!(server.max_connections, ADVANCED_DEFAULT_MAX_CONNECTIONS);
+        assert!(server.keep_alive_enabled);
+        assert_eq!(
+            server.keep_alive_seconds,
+            ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS
+        );
+        assert_eq!(server.encoding, "UTF-8");
+        assert!(!server.password_session);
+    }
+
+    #[test]
+    fn advanced_round_trips_explicit_values() {
+        let root = Path::new("/tmp");
+        let value: Value = serde_json::from_str(
+            r#"{"name":"ftp1","protocol":"ftps","passive_mode":false,"show_hidden":true,"list_compat":true,"use_mlsd":true,"max_connections":9,"keep_alive_enabled":false,"keep_alive_seconds":120,"encoding":"CP1251"}"#,
+        )
+        .expect("parse config");
+        let server = parse_deploy_server(&value, root).expect("parse server");
+        assert!(!server.passive_mode);
+        assert!(server.show_hidden);
+        assert!(server.list_compat);
+        assert!(server.use_mlsd);
+        assert_eq!(server.max_connections, 9);
+        assert!(!server.keep_alive_enabled);
+        assert_eq!(server.keep_alive_seconds, 120);
+        assert_eq!(server.encoding, "CP1251");
+
+        let entry = deploy_server_entry(&server);
+        assert_eq!(entry["passive_mode"], json!(false));
+        assert_eq!(entry["show_hidden"], json!(true));
+        assert_eq!(entry["list_compat"], json!(true));
+        assert_eq!(entry["use_mlsd"], json!(true));
+        assert_eq!(entry["max_connections"], json!(9));
+        assert_eq!(entry["keep_alive_enabled"], json!(false));
+        assert_eq!(entry["keep_alive_seconds"], json!(120));
+        assert_eq!(entry["encoding"], json!("CP1251"));
+    }
+
+    #[test]
+    fn advanced_fields_serialize_only_for_ftp_family() {
+        let root = temp_root("advanced_family");
+        for protocol in ["ftp", "ftps", "webdav", "webdavs"] {
+            let mut server = blank_server(root.clone());
+            server.protocol = Some(protocol.to_string());
+            let entry = deploy_server_entry(&server);
+            assert_eq!(entry["passive_mode"], json!(true), "{protocol}");
+            assert_eq!(entry["max_connections"], json!(5), "{protocol}");
+            assert_eq!(entry["encoding"], json!("UTF-8"), "{protocol}");
+        }
+        for protocol in ["sftp", "local", "in-place"] {
+            let mut server = blank_server(root.clone());
+            server.protocol = Some(protocol.to_string());
+            server.passive_mode = false;
+            server.max_connections = 9;
+            let entry = deploy_server_entry(&server);
+            assert!(entry.get("passive_mode").is_none(), "{protocol}");
+            assert!(entry.get("max_connections").is_none(), "{protocol}");
+            assert!(entry.get("encoding").is_none(), "{protocol}");
+        }
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn deploy_type_has_advanced_only_for_server_types() {
+        assert!(deploy_type_has_advanced("ftp"));
+        assert!(deploy_type_has_advanced("ftps"));
+        assert!(deploy_type_has_advanced("webdav"));
+        assert!(deploy_type_has_advanced("webdavs"));
+        assert!(!deploy_type_has_advanced("sftp"));
+        assert!(!deploy_type_has_advanced("local"));
+        assert!(!deploy_type_has_advanced("in-place"));
+        assert!(!deploy_type_has_advanced("nonsense"));
+    }
+
+    #[test]
+    fn picker_query_matches_filters_names() {
+        assert!(picker_query_matches("", "anything"));
+        assert!(picker_query_matches("   ", "anything"));
+        assert!(picker_query_matches("pub", "public"));
+        assert!(picker_query_matches("PUB", "public"));
+        assert!(picker_query_matches("src", "public/src"));
+        assert!(!picker_query_matches("zzz", "public"));
+        assert!(picker_query_matches("vendor", "vendor"));
+    }
+
+    #[test]
+    fn parse_local_dir_entries_sorts_dirs_first() {
+        let entries = parse_local_dir_entries(vec![
+            ("README.md".to_string(), false),
+            ("vendor".to_string(), true),
+            ("app.log".to_string(), false),
+            ("public".to_string(), true),
+        ]);
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["public", "vendor", "app.log", "README.md"]);
+        assert!(entries[0].is_directory);
+        assert_eq!(entries[0].path, "public");
+        assert!(!entries[2].is_directory);
+        assert_eq!(entries[2].size, None);
+    }
+
+    #[test]
+    fn password_session_skips_serialization_in_deploy_entry() {
+        let root = temp_root("password_session");
+        let mut server = blank_server(root.clone());
+        server.name = "ftp1".to_string();
+        server.protocol = Some("ftp".to_string());
+        server.password = Some("secret".to_string());
+        let entry = deploy_server_entry(&server);
+        assert_eq!(entry["password"], json!("secret"));
+
+        server.password_session = true;
+        let entry = deploy_server_entry(&server);
+        assert!(entry.get("password").is_none());
+        assert_eq!(entry["passive_mode"], json!(true));
+
+        let parsed = parse_deploy_server(&entry, &root).expect("parse entry");
+        assert_eq!(parsed.password, None);
+        assert!(!parsed.password_session);
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn ssh_entry_session_skips_password_in_store() {
+        let mut config = SshEntry::blank();
+        config.name = "bastion".to_string();
+        config.host = "10.0.0.5".to_string();
+        config.password = "secret".to_string();
+        let entry = ssh_store_entry(&config);
+        assert_eq!(entry["password"], json!("secret"));
+
+        config.password_session = true;
+        let entry = ssh_store_entry(&config);
+        assert!(entry.get("password").is_none());
+        assert_eq!(entry["auth"], json!("password"));
+        assert_eq!(entry["keep_alive"], json!(15));
+    }
+
+    #[test]
+    fn deploy_temp_config_content_shape() {
+        let entries = vec![
+            serde_json::json!({"name": "web1", "protocol": "sftp"}),
+            serde_json::json!({"name": "local", "protocol": "local"}),
+        ];
+        let content = deploy_temp_config_content(&entries, "web1");
+        assert_eq!(content["active"], json!("web1"));
+        let servers = content["servers"].as_array().expect("servers array");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0]["name"], json!("web1"));
+        assert_eq!(servers[1]["protocol"], json!("local"));
+    }
+
+    #[test]
+    fn dialog_buffer_advanced_defaults_for_blank_server() {
+        let buffer = DialogBuffer::load(None);
+        assert_eq!(buffer.max_connections, "5");
+        assert_eq!(buffer.keep_alive_seconds, "300");
+        assert_eq!(buffer.encoding, "UTF-8");
+        assert!(!buffer.password_session);
+
+        let mut server = blank_server(Path::new("/tmp/advanced-buffer").to_path_buf());
+        server.max_connections = 12;
+        server.keep_alive_seconds = 60;
+        server.encoding = String::new();
+        let mut buffer = DialogBuffer::load(Some(&server));
+        assert_eq!(buffer.max_connections, "12");
+        assert_eq!(buffer.keep_alive_seconds, "60");
+        assert_eq!(buffer.encoding, "");
+
+        let mut staged = blank_server(Path::new("/tmp/advanced-buffer2").to_path_buf());
+        buffer.apply(&mut staged, "ftp");
+        assert_eq!(staged.max_connections, 12);
+        assert_eq!(staged.keep_alive_seconds, 60);
+        assert_eq!(staged.encoding, "UTF-8");
+        assert_eq!(staged.password, None);
+    }
+
+    #[test]
+    fn save_password_cycle_order_and_hints() {
+        let mut state = SavePassword::Forever;
+        assert_eq!(state.label(), "Forever");
+        assert_eq!(state.hint(), "Password saved permanently");
+        state = state.next();
+        assert_eq!(state, SavePassword::Session);
+        assert_eq!(state.label(), "Session");
+        assert_eq!(state.hint(), "Password saved for the current session");
+        state = state.next();
+        assert_eq!(state, SavePassword::Forever);
+    }
+
+    #[test]
+    fn dialog_buffer_applies_password_session_flag() {
+        let mut buffer = DialogBuffer::load(None);
+        buffer.name = "ftp1".to_string();
+        buffer.password = "secret".to_string();
+        buffer.password_session = true;
+        let mut staged = blank_server(Path::new("/tmp/pw-session").to_path_buf());
+        staged.password = Some("old".to_string());
+        buffer.apply(&mut staged, "ftp");
+        assert_eq!(staged.password.as_deref(), Some("secret"));
+        assert!(staged.password_session);
+
+        let entry = deploy_server_entry(&staged);
+        assert!(entry.get("password").is_none());
+    }
+
+    #[test]
+    fn reset_password_clears_staged_server_password() {
+        let mut buffer = DialogBuffer::load(None);
+        buffer.password = "secret".to_string();
+        let mut staged = blank_server(Path::new("/tmp/pw-reset").to_path_buf());
+        buffer.apply(&mut staged, "ftp");
+        assert_eq!(staged.password.as_deref(), Some("secret"));
+
+        buffer.password = String::new();
+        buffer.password_session = false;
+        buffer.apply(&mut staged, "ftp");
+        assert_eq!(staged.password, None);
+        assert!(!staged.password_session);
+        let entry = deploy_server_entry(&staged);
+        assert!(entry.get("password").is_none());
+    }
+
+    #[test]
+    fn resolved_tunnel_round_trips_into_temp_config_for_php_db() {
+        // databases.json cannot store the config name (php-db denies unknown
+        // fields) - resolution must produce an engine-clean tunnel object with
+        // the resolved host/user/port/auth keys
+        let mut config = SshEntry::blank();
+        config.name = "local-ssh".to_string();
+        config.host = "127.0.0.1".to_string();
+        config.user = "admin".to_string();
+        config.port = "22".to_string();
+        config.auth = SshAuthMode::Password;
+        config.password = "secret".to_string();
+        config.keep_alive = 15;
+        let configs = vec![config];
+
+        let mut connection =
+            serde_json::json!({"ssh_tunnel": {"enabled": true, "name": "local-ssh", "local_port": 15432}});
+        resolve_ssh_tunnel_into(&mut connection, &configs).expect("resolve tunnel");
+        let tunnel = &connection["ssh_tunnel"];
+        assert_eq!(tunnel["host"], json!("127.0.0.1"));
+        assert_eq!(tunnel["user"], json!("admin"));
+        assert_eq!(tunnel["port"], json!(22));
+        assert_eq!(tunnel["auth"], json!("password"));
+        assert_eq!(tunnel["password"], json!("secret"));
+        assert_eq!(tunnel["strict_host_key"], json!(false));
+        assert_eq!(tunnel["keep_alive"], json!(15));
+        assert_eq!(tunnel["local_port"], json!(15432));
+        for key in ["name", "config_name", "x_marker"] {
+            assert!(tunnel.get(key).is_none(), "{key} must be stripped");
+        }
+
+        // missing config -> the Problems marker string
+        let mut gone =
+            serde_json::json!({"ssh_tunnel": {"enabled": true, "name": "gone", "local_port": 1}});
+        let error = resolve_ssh_tunnel_into(&mut gone, &configs).unwrap_err();
+        assert_eq!(error, "ssh configuration 'gone' not found");
     }
 }
