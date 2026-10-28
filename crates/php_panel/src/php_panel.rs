@@ -1,8 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ops::Range,
     path::{Path, PathBuf},
-    sync::OnceLock,
     time::SystemTime,
 };
 
@@ -11,12 +9,11 @@ use gpui::{
     Action, Anchor, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId, Entity,
     EventEmitter, TextStyle, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, StatefulInteractiveElement, Styled, Subscription,
-    UniformListScrollHandle, WeakEntity, Window, AnyWindowHandle, SharedString, TitlebarOptions,
-    WindowBounds, WindowOptions, actions, px, size, uniform_list,
+    WeakEntity, Window, AnyWindowHandle, SharedString, TitlebarOptions,
+    WindowBounds, WindowOptions, actions, px, size,
 };
 use editor::{Editor, EditorElement, EditorStyle, actions as editor_actions};
 use project::{Project, ProjectPath};
-use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -57,7 +54,6 @@ fn next_tab(active: PanelTab, offset: isize) -> PanelTab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PanelTab {
-    Files,
     Remote,
     Databases,
     Tests,
@@ -66,8 +62,7 @@ enum PanelTab {
 }
 
 impl PanelTab {
-    const ALL: [PanelTab; 6] = [
-        PanelTab::Files,
+    const ALL: [PanelTab; 5] = [
         PanelTab::Remote,
         PanelTab::Databases,
         PanelTab::Tests,
@@ -77,7 +72,6 @@ impl PanelTab {
 
     fn label(self) -> &'static str {
         match self {
-            PanelTab::Files => "Files",
             PanelTab::Remote => "Remote",
             PanelTab::Databases => "Databases",
             PanelTab::Tests => "Tests",
@@ -6183,13 +6177,6 @@ enum TableStatus {
 }
 
 #[derive(Clone)]
-struct Symbol {
-    name: String,
-    kind: &'static str,
-    file: ProjectPath,
-}
-
-#[derive(Clone)]
 struct HttpRequest {
     file: ProjectPath,
     absolute_path: PathBuf,
@@ -6216,119 +6203,6 @@ struct CollectionRequest {
 struct PostmanCollection {
     name: String,
     requests: Vec<CollectionRequest>,
-}
-
-struct SymbolRegexes {
-    php_type: Regex,
-    php_function: Regex,
-    js_class: Regex,
-    js_interface: Regex,
-    js_type: Regex,
-    js_function: Regex,
-    js_const: Regex,
-}
-
-fn symbol_regexes() -> &'static SymbolRegexes {
-    static REGEXES: OnceLock<SymbolRegexes> = OnceLock::new();
-    REGEXES.get_or_init(|| SymbolRegexes {
-        php_type: Regex::new(
-            r"^\s*(?:(?:abstract|final|readonly)\s+)*(class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)",
-        )
-        .expect("valid PHP type regex"),
-        php_function: Regex::new(r"\bfunction\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-            .expect("valid PHP function regex"),
-        js_class: Regex::new(
-            r"^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)",
-        )
-        .expect("valid JS class regex"),
-        js_interface: Regex::new(
-            r"^\s*(?:export\s+)?(?:declare\s+)?interface\s+([A-Za-z_$][A-Za-z0-9_$]*)",
-        )
-        .expect("valid JS interface regex"),
-        js_type: Regex::new(
-            r"^\s*(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^=]*>)?\s*=",
-        )
-        .expect("valid JS type regex"),
-        js_function: Regex::new(
-            r"\b(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\(",
-        )
-        .expect("valid JS function regex"),
-        js_const: Regex::new(
-            r"^\s*(?:export\s+)?const\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=",
-        )
-        .expect("valid JS const regex"),
-    })
-}
-
-fn symbol_extension_supported(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|extension| extension.to_str()),
-        Some("php" | "ts" | "tsx" | "js" | "jsx" | "vue")
-    )
-}
-
-fn scan_symbols(path: &Path, file: &ProjectPath) -> Vec<Symbol> {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let is_php = path.extension().and_then(|extension| extension.to_str()) == Some("php");
-    let patterns = symbol_regexes();
-    let mut symbols = Vec::new();
-
-    for line in contents.lines() {
-        if is_php {
-            if let Some(captures) = patterns.php_type.captures(line) {
-                symbols.push(Symbol {
-                    name: captures[2].to_string(),
-                    kind: match &captures[1] {
-                        "interface" => "interface",
-                        "trait" => "trait",
-                        "enum" => "enum",
-                        _ => "class",
-                    },
-                    file: file.clone(),
-                });
-            } else if let Some(captures) = patterns.php_function.captures(line) {
-                symbols.push(Symbol {
-                    name: captures[1].to_string(),
-                    kind: "function",
-                    file: file.clone(),
-                });
-            }
-        } else if let Some(captures) = patterns.js_class.captures(line) {
-            symbols.push(Symbol {
-                name: captures[1].to_string(),
-                kind: "class",
-                file: file.clone(),
-            });
-        } else if let Some(captures) = patterns.js_interface.captures(line) {
-            symbols.push(Symbol {
-                name: captures[1].to_string(),
-                kind: "interface",
-                file: file.clone(),
-            });
-        } else if let Some(captures) = patterns.js_type.captures(line) {
-            symbols.push(Symbol {
-                name: captures[1].to_string(),
-                kind: "type",
-                file: file.clone(),
-            });
-        } else if let Some(captures) = patterns.js_function.captures(line) {
-            symbols.push(Symbol {
-                name: captures[1].to_string(),
-                kind: "function",
-                file: file.clone(),
-            });
-        } else if let Some(captures) = patterns.js_const.captures(line) {
-            symbols.push(Symbol {
-                name: captures[1].to_string(),
-                kind: "const",
-                file: file.clone(),
-            });
-        }
-    }
-
-    symbols
 }
 
 #[derive(Clone)]
@@ -6721,13 +6595,7 @@ pub struct PhpPanel {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
-    scroll_handle: UniformListScrollHandle,
     active_tab: PanelTab,
-    query: String,
-    files: Vec<ProjectPath>,
-    visible_files: Vec<ProjectPath>,
-    symbols: Vec<Symbol>,
-    symbol_cache: HashMap<ProjectPath, (SystemTime, Vec<Symbol>)>,
     http_requests: Vec<HttpRequest>,
     collections: Vec<PostmanCollection>,
     remote_servers: Vec<RemoteServer>,
@@ -6894,13 +6762,7 @@ impl PhpPanel {
                     focus_handle,
                     workspace: workspace_handle,
                     project,
-                    scroll_handle: UniformListScrollHandle::new(),
-                    active_tab: PanelTab::Files,
-                    query: String::new(),
-                    files: Vec::new(),
-                    visible_files: Vec::new(),
-                    symbols: Vec::new(),
-                    symbol_cache: HashMap::new(),
+                    active_tab: PanelTab::Remote,
                     http_requests: Vec::new(),
                     collections: Vec::new(),
                     remote_servers: Vec::new(),
@@ -6945,13 +6807,11 @@ impl PhpPanel {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let project = self.project.read(cx);
-        let mut files = Vec::new();
         let mut http_requests = Vec::new();
         let mut collections = Vec::new();
         let mut remote_servers = Vec::new();
         let mut deploy_config = None;
         let mut databases = Vec::new();
-        let mut symbol_candidates = Vec::new();
 
         for worktree in project.visible_worktrees(cx) {
             let worktree = worktree.read(cx);
@@ -6971,9 +6831,6 @@ impl PhpPanel {
                     path: entry.path.clone(),
                 };
                 let absolute_path = root.join(entry.path.as_unix_str());
-                if symbol_extension_supported(&absolute_path) {
-                    symbol_candidates.push((project_path.clone(), absolute_path.clone()));
-                }
                 if is_postman_collection(entry.path.as_unix_str()) {
                     if let Ok(contents) = std::fs::read_to_string(&absolute_path) {
                         collections.push(parse_postman_collection(
@@ -6994,7 +6851,6 @@ impl PhpPanel {
                         ));
                     }
                 }
-                files.push(project_path);
             }
 
             if let Some(config) = read_json(&root.join(".zed/deploy.json")) {
@@ -7039,7 +6895,6 @@ impl PhpPanel {
             }
         }
 
-        files.sort_by(|left, right| left.path.as_unix_str().cmp(right.path.as_unix_str()));
         http_requests.sort_by(|left, right| {
             left.file
                 .path
@@ -7048,27 +6903,6 @@ impl PhpPanel {
                 .then(left.line.cmp(&right.line))
         });
 
-        let mut symbols = Vec::new();
-        for (project_path, absolute_path) in symbol_candidates {
-            let Ok(modified) =
-                std::fs::metadata(&absolute_path).and_then(|metadata| metadata.modified())
-            else {
-                continue;
-            };
-            if let Some((cached_modified, cached_symbols)) = self.symbol_cache.get(&project_path) {
-                if *cached_modified == modified {
-                    symbols.extend(cached_symbols.iter().cloned());
-                    continue;
-                }
-            }
-            let scanned = scan_symbols(&absolute_path, &project_path);
-            self.symbol_cache
-                .insert(project_path, (modified, scanned.clone()));
-            symbols.extend(scanned);
-        }
-
-        self.files = files;
-        self.symbols = symbols;
         self.http_requests = http_requests;
         self.collections = collections;
         self.remote_servers = remote_servers;
@@ -7101,31 +6935,6 @@ impl PhpPanel {
             panel: Some(cx.weak_entity()),
             root: self.remote_servers.first().map(|server| server.root.clone()),
         });
-    }
-
-    fn open_first_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let query = self.query.trim().to_lowercase();
-        if query.is_empty() {
-            return;
-        }
-        if let Some(path) = self
-            .files
-            .iter()
-            .find(|path| path.path.as_unix_str().to_lowercase().contains(&query))
-            .cloned()
-        {
-            self.open_file(path, window, cx);
-        }
-    }
-
-    fn open_file(&mut self, path: ProjectPath, _window: &mut Window, cx: &mut Context<Self>) {
-        self.workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace
-                    .open_path(path, None, true, window, cx)
-                    .detach_and_log_err(cx);
-            })
-            .log_err();
     }
 
     fn sync_server(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
@@ -7812,7 +7621,6 @@ impl PhpPanel {
 
     fn open_form(&mut self, kind: FormKind, window: &mut Window, cx: &mut Context<Self>) {
         self.form = Some(FormState::new(kind));
-        self.query.clear();
         self.saved_message = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -7825,7 +7633,6 @@ impl PhpPanel {
         cx: &mut Context<Self>,
     ) {
         self.form = Some(FormState::sql(connection));
-        self.query.clear();
         self.saved_message = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -7894,7 +7701,6 @@ impl PhpPanel {
         match saved {
             Ok(name) => {
                 self.form = None;
-                self.query.clear();
                 self.saved_message = Some("saved".to_string());
                 self.refresh(cx);
                 match kind {
@@ -9509,95 +9315,6 @@ impl Panel for PhpPanel {
 impl Render for PhpPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh(cx);
-        let query = if self.active_tab == PanelTab::Files {
-            self.query.trim().to_lowercase()
-        } else {
-            String::new()
-        };
-        self.visible_files = self
-            .files
-            .iter()
-            .filter(|path| {
-                query.is_empty() || path.path.as_unix_str().to_lowercase().contains(&query)
-            })
-            .cloned()
-            .collect();
-        let file_count = self.visible_files.len();
-        let total = self.files.len();
-
-        let mut matched_symbols = self
-            .symbols
-            .iter()
-            .filter(|symbol| {
-                query.is_empty()
-                    || symbol.name.to_lowercase().contains(&query)
-                    || symbol
-                        .file
-                        .path
-                        .as_unix_str()
-                        .to_lowercase()
-                        .contains(&query)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let symbol_total = matched_symbols.len();
-        if !query.is_empty() {
-            matched_symbols.sort_by_key(|symbol| {
-                let name = symbol.name.to_lowercase();
-                let path = symbol.file.path.as_unix_str().to_lowercase();
-                if name.starts_with(&query) {
-                    0
-                } else if path.starts_with(&query) {
-                    1
-                } else {
-                    2
-                }
-            });
-        }
-        matched_symbols.truncate(200);
-
-        let symbol_rows = matched_symbols
-            .iter()
-            .enumerate()
-            .map(|(index, symbol)| {
-                let target = symbol.file.clone();
-                let text = format!(
-                    "{} · {} · {}",
-                    symbol.name,
-                    symbol.kind,
-                    symbol.file.path.as_unix_str(),
-                );
-                ListItem::new(("symbol", index))
-                    .child(Label::new(text).truncate())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.open_file(target.clone(), window, cx);
-                    }))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-
-        let files_list = uniform_list(
-            "search-files",
-            file_count,
-            cx.processor(|this, range: Range<usize>, _window, cx| {
-                let mut items = Vec::with_capacity(range.len());
-                for index in range {
-                    let entry = this.visible_files[index].clone();
-                    let path = entry.path.as_unix_str().to_string();
-                    items.push(
-                        ListItem::new(index)
-                            .child(Label::new(path).truncate())
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.open_file(entry.clone(), window, cx);
-                            }))
-                            .into_any_element(),
-                    );
-                }
-                items
-            }),
-        )
-        .track_scroll(&self.scroll_handle)
-        .flex_1();
 
         let selected_remote = self.current_remote_server().cloned();
         let active_name = self.active_server.clone();
@@ -10040,19 +9757,9 @@ impl Render for PhpPanel {
         let mut database_rows = Vec::new();
         let mut database_grids = Vec::new();
         for (index, database) in self.databases.iter().enumerate() {
-            let haystack = format!(
-                "{} {} {}",
-                database.name,
-                display_field(&database.driver),
-                display_field(&database.target),
-            )
-            .to_lowercase();
-            let connection_matches = query.is_empty() || haystack.contains(&query);
-
             let expanded = self.db_expanded_conns.contains(&database.name);
 
             let mut schema_rows = Vec::new();
-            let mut schema_matches = false;
             if expanded {
                 match self.database_status.get(&database.name) {
                     Some(DatabaseStatus::Loaded(tables)) => {
@@ -10071,31 +9778,6 @@ impl Render for PhpPanel {
                         for (table_index, table) in tables.iter().enumerate() {
                             let table_key = (database.name.clone(), table.name.clone());
                             let preview_status = self.table_status.get(&table_key);
-                            let preview_matches = matches!(
-                                preview_status,
-                                Some(TableStatus::Loaded(rows))
-                                    if !query.is_empty()
-                                        && rows.iter().any(|row| row.values().any(|value| {
-                                            display_value(value).to_lowercase().contains(&query)
-                                        }))
-                            );
-                            let table_matches = query.is_empty()
-                                || table.name.to_lowercase().contains(&query)
-                                || preview_matches;
-                            let mut matching_columns = Vec::new();
-                            for (column_index, column) in table.columns.iter().enumerate() {
-                                let column_matches = query.is_empty()
-                                    || table_matches
-                                    || column.name.to_lowercase().contains(&query)
-                                    || column.column_type.to_lowercase().contains(&query);
-                                if column_matches {
-                                    matching_columns.push((column_index, column));
-                                }
-                            }
-                            if !table_matches && matching_columns.is_empty() {
-                                continue;
-                            }
-                            schema_matches = true;
 
                             let table_expanded = self.expanded_tables.contains(&table_key);
                             let connection_name = database.name.clone();
@@ -10162,7 +9844,7 @@ impl Render for PhpPanel {
                                 }
                             }
 
-                            for (column_index, column) in matching_columns {
+                            for (column_index, column) in table.columns.iter().enumerate() {
                                 let text = format!(
                                     "{} · {}{}",
                                     column.name,
@@ -10421,10 +10103,6 @@ impl Render for PhpPanel {
                 }
             }
 
-            if !connection_matches && !schema_matches {
-                continue;
-            }
-
             let driver = database.driver.as_deref().unwrap_or("server");
             let paren = match (&database.user, &database.host) {
                 (Some(user), Some(host)) => format!("{user}@{host}"),
@@ -10535,23 +10213,7 @@ impl Render for PhpPanel {
         let mut collection_rows = Vec::new();
         let mut collection_row_index = 0usize;
         for collection in &self.collections {
-            let collection_matches =
-                query.is_empty() || collection.name.to_lowercase().contains(&query);
-            let requests = collection
-                .requests
-                .iter()
-                .filter(|request| {
-                    collection_matches
-                        || format!(
-                            "{} {} {}",
-                            request.folder.join(" "),
-                            request.name,
-                            request.url
-                        )
-                        .to_lowercase()
-                        .contains(&query)
-                })
-                .collect::<Vec<_>>();
+            let requests = collection.requests.iter().collect::<Vec<_>>();
             if requests.is_empty() {
                 continue;
             }
@@ -10613,18 +10275,6 @@ impl Render for PhpPanel {
         let http_rows = self
             .http_requests
             .iter()
-            .filter(|request| {
-                query.is_empty()
-                    || format!(
-                        "{} {} {} {}",
-                        request.name,
-                        request.method,
-                        request.url,
-                        request.file.path.as_unix_str(),
-                    )
-                    .to_lowercase()
-                    .contains(&query)
-            })
             .enumerate()
             .map(|(index, request)| {
                 let file_name = request
@@ -11007,65 +10657,31 @@ impl Render for PhpPanel {
             None
         };
 
-        let section_header = |title: &'static str, cx: &Context<Self>| {
+        let saved_message_row = self.saved_message.clone().map(|message| {
+            let color = if message.starts_with("failed") {
+                Color::Error
+            } else {
+                Color::Success
+            };
             h_flex()
-                .px_2()
+                .id("php-panel-message")
+                .w_full()
+                .flex_none()
+                .px_3()
                 .py_1()
-                .border_t_1()
+                .border_b_1()
                 .border_color(cx.theme().colors().border)
-                .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
-        };
-
-        let files_header = v_flex()
-            .px_3()
-            .py_2()
-            .child(
-                Label::new(if query.is_empty() {
-                    format!("Search everywhere · {total} files · {symbol_total} symbols")
-                } else {
-                    format!(
-                        "Search: {} · {} matches",
-                        self.query.trim(),
-                        file_count + symbol_total
-                    )
-                })
-                .truncate(),
-            )
-            .child(
-                Label::new("type to filter · Enter opens first · Esc clears")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .when_some(self.saved_message.clone(), |this, message| {
-                this.child(
+                .child(
                     Label::new(message)
                         .size(LabelSize::XSmall)
-                        .color(Color::Success),
+                        .color(color)
+                        .truncate(),
                 )
-            });
+        });
 
         let tab_bar = render_tab_bar(self.active_tab, cx);
 
         let content = match self.active_tab {
-            PanelTab::Files => v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(files_header)
-                .child(files_list)
-                .child(section_header("Symbols", cx))
-                .child(
-                    div()
-                        .id("php-symbols")
-                        .flex_shrink_0()
-                        .max_h(relative(0.42))
-                        .overflow_y_scroll()
-                        .children(if symbol_rows.is_empty() {
-                            vec![empty_row("no symbols")]
-                        } else {
-                            symbol_rows
-                        }),
-                )
-                .into_any_element(),
             PanelTab::Remote => v_flex()
                 .id("remote-content")
                 .relative()
@@ -11166,7 +10782,7 @@ impl Render for PhpPanel {
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
             }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 let modifiers = &event.keystroke.modifiers;
                 if this.form.is_none()
                     && modifiers.control
@@ -11176,7 +10792,7 @@ impl Render for PhpPanel {
                     && !modifiers.function
                 {
                     if let Ok(index) = event.keystroke.key.parse::<usize>() {
-                        if (1..=6).contains(&index) {
+                        if (1..=PanelTab::ALL.len()).contains(&index) {
                             this.select_tab(PanelTab::ALL[index - 1], cx);
                             return;
                         }
@@ -11189,35 +10805,8 @@ impl Render for PhpPanel {
                     this.handle_form_key(event, cx);
                     return;
                 }
-                if this.active_tab != PanelTab::Files {
-                    return;
-                }
-                match event.keystroke.key.as_str() {
-                    "backspace" => {
-                        this.query.pop();
-                        this.saved_message = None;
-                        cx.notify();
-                    }
-                    "escape" => {
-                        this.query.clear();
-                        this.saved_message = None;
-                        cx.notify();
-                    }
-                    "enter" => this.open_first_match(window, cx),
-                    "space" => {
-                        this.query.push(' ');
-                        this.saved_message = None;
-                        cx.notify();
-                    }
-                    _ => {
-                        if let Some(character) = &event.keystroke.key_char {
-                            this.query.push_str(character);
-                            this.saved_message = None;
-                            cx.notify();
-                        }
-                    }
-                }
             }))
+            .children(saved_message_row)
             .child(tab_bar)
             .child(content)
     }}
@@ -12182,13 +11771,15 @@ mod tests {
     }
 
     #[test]
-    fn next_tab_advances_cyclically() {
-        assert_eq!(next_tab(PanelTab::Files, 1), PanelTab::Remote);
-        assert_eq!(next_tab(PanelTab::Collections, 1), PanelTab::Files);
-        assert_eq!(next_tab(PanelTab::Files, -1), PanelTab::Collections);
+    fn first_tab_is_remote_and_cycling_wraps() {
+        assert_eq!(PanelTab::ALL.first(), Some(&PanelTab::Remote));
+        assert_eq!(PanelTab::ALL.len(), 5);
+        assert_eq!(next_tab(PanelTab::Remote, 1), PanelTab::Databases);
+        assert_eq!(next_tab(PanelTab::Remote, -1), PanelTab::Collections);
+        assert_eq!(next_tab(PanelTab::Collections, 1), PanelTab::Remote);
         assert_eq!(next_tab(PanelTab::Collections, -1), PanelTab::Http);
         for tab in PanelTab::ALL {
-            assert_eq!(next_tab(tab, 6), tab);
+            assert_eq!(next_tab(tab, 5), tab);
         }
     }
 
