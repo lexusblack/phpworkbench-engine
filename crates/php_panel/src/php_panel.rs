@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -8,12 +8,11 @@ use std::{
 
 use anyhow::Result;
 use gpui::{
-    Anchor, App, AppContext, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter,
-    TextStyle,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
-    AnyWindowHandle, SharedString, TitlebarOptions, WindowBounds, WindowOptions, actions, px, size,
-    uniform_list,
+    Anchor, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId, Entity,
+    EventEmitter, TextStyle, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Subscription,
+    UniformListScrollHandle, WeakEntity, Window, AnyWindowHandle, SharedString, TitlebarOptions,
+    WindowBounds, WindowOptions, actions, px, size, uniform_list,
 };
 use editor::{Editor, EditorElement, EditorStyle, actions as editor_actions};
 use project::{Project, ProjectPath};
@@ -32,7 +31,7 @@ use workspace::{OpenOptions, Panel, StatusItemView, Workspace};
 
 actions!(
     php_panel,
-    [ToggleFocus, OpenDeploymentDialog, BrowseRemoteHost, SelectNextTab, SelectPrevTab]
+    [ToggleFocus, OpenDeploymentDialog, OpenDataSourcesDialog, BrowseRemoteHost, SelectNextTab, SelectPrevTab]
 );
 
 fn next_tab(active: PanelTab, offset: isize) -> PanelTab {
@@ -1232,6 +1231,1862 @@ pub struct DeployShared {
 
 impl gpui::Global for DeployShared {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataSourceTab {
+    General,
+    Options,
+    Ssh,
+    Schemas,
+    Advanced,
+}
+
+impl DataSourceTab {
+    const ALL: [DataSourceTab; 5] = [
+        DataSourceTab::General,
+        DataSourceTab::Options,
+        DataSourceTab::Ssh,
+        DataSourceTab::Schemas,
+        DataSourceTab::Advanced,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            DataSourceTab::General => "General",
+            DataSourceTab::Options => "Options",
+            DataSourceTab::Ssh => "SSH,SSL",
+            DataSourceTab::Schemas => "Schemas",
+            DataSourceTab::Advanced => "Advanced",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DataSource {
+    name: String,
+    driver: String,
+    path: String,
+    host: String,
+    port: String,
+    user: String,
+    password: String,
+    database: String,
+    url: String,
+    read_only: bool,
+    ssh_enabled: bool,
+    ssh_user: String,
+    ssh_host: String,
+    ssh_port: String,
+    ssh_local_port: String,
+    excluded_schemas: Vec<String>,
+    options: Vec<(String, String)>,
+    root: PathBuf,
+}
+
+impl DataSource {
+    fn blank(root: PathBuf) -> Self {
+        Self {
+            name: String::new(),
+            driver: "sqlite".to_string(),
+            path: String::new(),
+            host: String::new(),
+            port: String::new(),
+            user: String::new(),
+            password: String::new(),
+            database: String::new(),
+            url: String::new(),
+            read_only: false,
+            ssh_enabled: false,
+            ssh_user: String::new(),
+            ssh_host: String::new(),
+            ssh_port: String::new(),
+            ssh_local_port: String::new(),
+            excluded_schemas: Vec::new(),
+            options: Vec::new(),
+            root,
+        }
+    }
+
+    fn is_sqlite(&self) -> bool {
+        self.driver == "sqlite"
+    }
+}
+
+const DATA_SOURCE_MANAGED_KEYS: [&str; 13] = [
+    "name",
+    "driver",
+    "path",
+    "url",
+    "host",
+    "port",
+    "user",
+    "database",
+    "password",
+    "read_only",
+    "ssh_tunnel",
+    "excluded_schemas",
+    "options",
+];
+
+fn parse_data_source(value: &Value, root: &Path) -> Option<DataSource> {
+    let name = string_field(value, "name")?;
+    let mut source = DataSource::blank(root.to_path_buf());
+    source.name = name;
+    if let Some(driver) = string_field(value, "driver") {
+        source.driver = driver.to_ascii_lowercase();
+    }
+    source.path = string_field(value, "path").unwrap_or_default();
+    source.user = string_field(value, "user").unwrap_or_default();
+    source.database = string_field(value, "database").unwrap_or_default();
+    source.url = string_field(value, "url").unwrap_or_default();
+    source.password = string_field(value, "password").unwrap_or_default();
+    source.host = string_field(value, "host").unwrap_or_default();
+    source.port = match value.get("port") {
+        Some(Value::Number(port)) => port.to_string(),
+        Some(Value::String(port)) => port.clone(),
+        _ => String::new(),
+    };
+    source.read_only = value.get("read_only").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(tunnel) = value.get("ssh_tunnel") {
+        source.ssh_enabled = tunnel.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        source.ssh_host = string_field(tunnel, "host").unwrap_or_default();
+        source.ssh_user = string_field(tunnel, "user").unwrap_or_default();
+        source.ssh_port = match tunnel.get("port") {
+            Some(Value::Number(port)) => port.to_string(),
+            Some(Value::String(port)) => port.clone(),
+            _ => String::new(),
+        };
+        source.ssh_local_port = match tunnel.get("local_port") {
+            Some(Value::Number(port)) => port.to_string(),
+            Some(Value::String(port)) => port.clone(),
+            _ => String::new(),
+        };
+    }
+    source.excluded_schemas = parse_excluded_schemas(value.get("excluded_schemas"));
+    source.options = value
+        .get("options")
+        .and_then(Value::as_object)
+        .map(options_to_rows)
+        .unwrap_or_default();
+    Some(source)
+}
+
+fn data_source_entry(source: &DataSource) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "name".to_string(),
+        Value::String(source.name.trim().to_string()),
+    );
+    entry.insert("driver".to_string(), Value::String(source.driver.clone()));
+    if source.is_sqlite() {
+        if !source.path.trim().is_empty() {
+            entry.insert(
+                "path".to_string(),
+                Value::String(source.path.trim().to_string()),
+            );
+        }
+    } else {
+        let url = source.url.trim().to_string();
+        if !url.is_empty() {
+            entry.insert("url".to_string(), Value::String(url));
+        } else {
+            if !source.host.trim().is_empty() {
+                entry.insert(
+                    "host".to_string(),
+                    Value::String(source.host.trim().to_string()),
+                );
+            }
+            let port = source.port.trim().to_string();
+            if !port.is_empty() {
+                match port.parse::<u16>() {
+                    Ok(number) => entry.insert("port".to_string(), Value::from(number)),
+                    Err(_) => entry.insert("port".to_string(), Value::String(port)),
+                };
+            }
+            if !source.user.trim().is_empty() {
+                entry.insert(
+                    "user".to_string(),
+                    Value::String(source.user.trim().to_string()),
+                );
+            }
+            if !source.database.trim().is_empty() {
+                entry.insert(
+                    "database".to_string(),
+                    Value::String(source.database.trim().to_string()),
+                );
+            }
+        }
+    }
+    if !source.password.is_empty() {
+        entry.insert(
+            "password".to_string(),
+            Value::String(source.password.clone()),
+        );
+    }
+    if source.read_only {
+        entry.insert("read_only".to_string(), Value::Bool(true));
+    }
+    if source.ssh_enabled {
+        let mut tunnel = serde_json::Map::new();
+        tunnel.insert("enabled".to_string(), Value::Bool(true));
+        if !source.ssh_host.trim().is_empty() {
+            tunnel.insert(
+                "host".to_string(),
+                Value::String(source.ssh_host.trim().to_string()),
+            );
+        }
+        let ssh_port = source.ssh_port.trim().to_string();
+        if !ssh_port.is_empty() {
+            match ssh_port.parse::<u16>() {
+                Ok(number) => tunnel.insert("port".to_string(), Value::from(number)),
+                Err(_) => tunnel.insert("port".to_string(), Value::String(ssh_port)),
+            };
+        }
+        if !source.ssh_user.trim().is_empty() {
+            tunnel.insert(
+                "user".to_string(),
+                Value::String(source.ssh_user.trim().to_string()),
+            );
+        }
+        let local_port = source.ssh_local_port.trim().to_string();
+        if !local_port.is_empty() {
+            match local_port.parse::<u16>() {
+                Ok(number) => tunnel.insert("local_port".to_string(), Value::from(number)),
+                Err(_) => tunnel.insert("local_port".to_string(), Value::String(local_port)),
+            };
+        }
+        entry.insert("ssh_tunnel".to_string(), Value::Object(tunnel));
+    }
+    if !source.excluded_schemas.is_empty() {
+        entry.insert(
+            "excluded_schemas".to_string(),
+            Value::Array(
+                source
+                    .excluded_schemas
+                    .iter()
+                    .map(|name| Value::String(name.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !source.options.is_empty() {
+        entry.insert(
+            "options".to_string(),
+            Value::Object(rows_to_options(&source.options)),
+        );
+    }
+    Value::Object(entry)
+}
+
+fn data_source_test_config(source: &DataSource) -> Value {
+    let mut entry = match data_source_entry(source) {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    entry.insert("name".to_string(), Value::String("_test".to_string()));
+    serde_json::json!({ "connections": [Value::Object(entry)] })
+}
+
+fn save_data_sources(root: &Path, sources: &[DataSource]) -> std::result::Result<(), String> {
+    for source in sources {
+        if source.name.trim().is_empty() {
+            return Err("data source name is required".to_string());
+        }
+    }
+    let mut seen = HashSet::new();
+    for source in sources {
+        let name = source.name.trim().to_string();
+        if !seen.insert(name.clone()) {
+            return Err(format!("duplicate data source name: {name}"));
+        }
+    }
+    let path = root.join(".zed/databases.json");
+    let mut config = load_config_object(&path)?;
+    let existing: Vec<Value> = match config.remove("connections") {
+        Some(Value::Array(connections)) => connections,
+        Some(_) => return Err("connections in databases.json is not an array".to_string()),
+        None => Vec::new(),
+    };
+    let mut connections = Vec::new();
+    for source in sources {
+        let staged = match data_source_entry(source) {
+            Value::Object(fields) => fields,
+            _ => serde_json::Map::new(),
+        };
+        let mut merged = existing
+            .iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some(source.name.trim()))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in &staged {
+            merged.insert(key.clone(), value.clone());
+        }
+        for key in DATA_SOURCE_MANAGED_KEYS {
+            if !staged.contains_key(key) {
+                merged.remove(key);
+            }
+        }
+        connections.push(Value::Object(merged));
+    }
+    config.insert("connections".to_string(), Value::Array(connections));
+    write_config_object(&path, &config)
+}
+
+fn load_data_sources(root: &Path) -> Vec<DataSource> {
+    read_json(&root.join(".zed/databases.json"))
+        .and_then(|config| config.get("connections").and_then(Value::as_array).cloned())
+        .map(|connections| {
+            connections
+                .iter()
+                .filter_map(|connection| parse_data_source(connection, root))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mask_password(password: &str) -> &'static str {
+    if password.is_empty() {
+        ""
+    } else {
+        "•••••"
+    }
+}
+
+fn driver_support_hint(driver: &str) -> &'static str {
+    match driver {
+        "postgres" => "supports 9.x – 17",
+        "mysql" => "supports 5.1 – 8.4",
+        "mariadb" => "supports 10.x – 11.x",
+        "sqlite" => "supports SQLite 3.x",
+        "sqlserver" => "supports 2012 – 2022",
+        "oracle" => "supports 12c – 23ai",
+        "mongodb" => "supports 4.4 – 8.0",
+        "redis" => "supports 5.0 – 7.4",
+        _ => "",
+    }
+}
+
+fn parse_ssh_config(text: &str) -> (String, String, String) {
+    let (user, rest) = match text.trim().split_once('@') {
+        Some((user, rest)) => (user.trim().to_string(), rest.trim().to_string()),
+        None => (String::new(), text.trim().to_string()),
+    };
+    match rest.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port.trim();
+            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                (user, host.trim().to_string(), port.to_string())
+            } else {
+                (user, rest, String::new())
+            }
+        }
+        _ => (user, rest, String::new()),
+    }
+}
+
+fn format_ssh_config(user: &str, host: &str, port: &str) -> String {
+    let mut text = String::new();
+    if !user.is_empty() {
+        text.push_str(user.trim());
+        text.push('@');
+    }
+    text.push_str(host.trim());
+    if !port.is_empty() {
+        text.push(':');
+        text.push_str(port.trim());
+    }
+    text
+}
+
+fn options_to_rows(options: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = options
+        .iter()
+        .map(|(key, value)| match value {
+            Value::String(text) => (key.clone(), text.clone()),
+            other => (
+                key.clone(),
+                serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+            ),
+        })
+        .collect();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+fn rows_to_options(rows: &[(String, String)]) -> serde_json::Map<String, Value> {
+    let mut options = BTreeMap::new();
+    for (key, value) in rows {
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        options.insert(key, Value::String(value.trim().to_string()));
+    }
+    options.into_iter().collect()
+}
+
+fn parse_excluded_schemas(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn schema_checked(excluded: &[String], name: &str) -> bool {
+    !excluded.iter().any(|known| known == name)
+}
+
+fn data_source_problems(source: &DataSource) -> Vec<String> {
+    let mut problems = Vec::new();
+    if source.is_sqlite() {
+        if source.path.trim().is_empty() {
+            problems.push("file path is required".to_string());
+        }
+    } else if source.url.trim().is_empty() {
+        if source.host.trim().is_empty() {
+            problems.push("host is required".to_string());
+        }
+        if source.port.trim().is_empty() {
+            problems.push("port is required".to_string());
+        }
+        if source.user.trim().is_empty() {
+            problems.push("user is required".to_string());
+        }
+        if source.database.trim().is_empty() {
+            problems.push("database is required".to_string());
+        }
+    }
+    if source.name.trim().is_empty() {
+        problems.push("name is required".to_string());
+    }
+    if source.ssh_enabled && source.ssh_host.trim().is_empty() {
+        problems.push("ssh host is required".to_string());
+    }
+    problems
+}
+
+fn next_data_source_name(base: &str, sources: &[DataSource]) -> String {
+    let mut name = base.to_string();
+    let mut index = 0usize;
+    while sources.iter().any(|source| source.name == name) {
+        index += 1;
+        name = format!("{base} ({index})");
+    }
+    name
+}
+
+enum SchemaListState {
+    Idle,
+    Loading,
+    Loaded(Vec<String>),
+    Failed(String),
+}
+
+pub struct DataSourcesDialogWindow(pub Option<AnyWindowHandle>);
+
+impl gpui::Global for DataSourcesDialogWindow {}
+
+pub struct DataSourcesDialog {
+    root: PathBuf,
+    sources: Vec<DataSource>,
+    selected: Option<usize>,
+    tab: DataSourceTab,
+    message: Option<(String, Color)>,
+    test_message: Option<(String, Color)>,
+    schemas_state: SchemaListState,
+    panel: Option<WeakEntity<PhpPanel>>,
+    name_editor: Entity<Editor>,
+    file_editor: Entity<Editor>,
+    host_editor: Entity<Editor>,
+    port_editor: Entity<Editor>,
+    user_editor: Entity<Editor>,
+    password_editor: Entity<Editor>,
+    database_editor: Entity<Editor>,
+    url_editor: Entity<Editor>,
+    ssh_config_editor: Entity<Editor>,
+    ssh_local_port_editor: Entity<Editor>,
+    advanced_rows: Vec<(Entity<Editor>, Entity<Editor>)>,
+}
+
+impl Focusable for DataSourcesDialog {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.name_editor.focus_handle(cx)
+    }
+}
+
+impl DataSourcesDialog {
+    fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut dialog = Self {
+            root,
+            sources: Vec::new(),
+            selected: None,
+            tab: DataSourceTab::General,
+            message: None,
+            test_message: None,
+            schemas_state: SchemaListState::Idle,
+            panel: None,
+            name_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            file_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            host_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            port_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            user_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            password_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            database_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            url_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            ssh_config_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            ssh_local_port_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            advanced_rows: Vec::new(),
+        };
+        dialog.seed_from_disk(window, cx);
+        dialog
+    }
+
+    fn seed_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sources = load_data_sources(&self.root);
+        self.selected = if self.sources.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        if cx.has_global::<DeployShared>() {
+            self.panel = cx.global::<DeployShared>().panel.clone();
+        }
+        self.tab = DataSourceTab::General;
+        self.message = None;
+        self.test_message = None;
+        self.schemas_state = SchemaListState::Idle;
+        self.load_fields(window, cx);
+        cx.notify();
+    }
+
+    fn resume_with_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.root = root;
+        self.seed_from_disk(window, cx);
+    }
+
+    fn load_fields(&mut self, window: &mut Window, cx: &mut App) {
+        let source = self
+            .selected
+            .and_then(|index| self.sources.get(index))
+            .cloned()
+            .unwrap_or_else(|| DataSource::blank(self.root.clone()));
+        let mut set = |editor: &Entity<Editor>, value: String| {
+            editor.update(cx, |editor, cx| editor.set_text(value, window, cx));
+        };
+        set(&self.name_editor, source.name.clone());
+        set(&self.file_editor, source.path.clone());
+        set(&self.host_editor, source.host.clone());
+        set(&self.port_editor, source.port.clone());
+        set(&self.user_editor, source.user.clone());
+        set(&self.password_editor, String::new());
+        set(&self.database_editor, source.database.clone());
+        set(&self.url_editor, source.url.clone());
+        set(
+            &self.ssh_config_editor,
+            format_ssh_config(&source.ssh_user, &source.ssh_host, &source.ssh_port),
+        );
+        set(&self.ssh_local_port_editor, source.ssh_local_port.clone());
+        self.advanced_rows = source
+            .options
+            .iter()
+            .map(|(key, value)| {
+                let key_editor = cx.new(|cx| Editor::single_line(window, cx));
+                key_editor.update(cx, |editor, cx| {
+                    editor.set_text(key.clone(), window, cx)
+                });
+                let value_editor = cx.new(|cx| Editor::single_line(window, cx));
+                value_editor.update(cx, |editor, cx| {
+                    editor.set_text(value.clone(), window, cx)
+                });
+                (key_editor, value_editor)
+            })
+            .collect();
+    }
+
+    fn apply_editors(&mut self, cx: &mut App) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let text = |editor: &Entity<Editor>| editor.read(cx).text(cx);
+        let mut advanced = Vec::new();
+        for (key_editor, value_editor) in &self.advanced_rows {
+            advanced.push((text(key_editor), text(value_editor)));
+        }
+        if let Some(source) = self.sources.get_mut(index) {
+            source.name = text(&self.name_editor);
+            source.path = text(&self.file_editor);
+            source.host = text(&self.host_editor);
+            source.port = text(&self.port_editor);
+            source.user = text(&self.user_editor);
+            let typed_password = text(&self.password_editor);
+            if !typed_password.is_empty() {
+                source.password = typed_password;
+            }
+            source.database = text(&self.database_editor);
+            source.url = text(&self.url_editor);
+            let (ssh_user, ssh_host, ssh_port) = parse_ssh_config(&text(&self.ssh_config_editor));
+            source.ssh_user = ssh_user;
+            source.ssh_host = ssh_host;
+            source.ssh_port = ssh_port;
+            source.ssh_local_port = text(&self.ssh_local_port_editor);
+            source.options = rows_to_options(&advanced)
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = match value {
+                        Value::String(text) => text,
+                        other => serde_json::to_string(&other).unwrap_or_default(),
+                    };
+                    (key, value)
+                })
+                .collect();
+        }
+    }
+
+    fn select_source(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected == Some(index) {
+            return;
+        }
+        self.apply_editors(cx);
+        self.selected = Some(index);
+        self.tab = DataSourceTab::General;
+        self.message = None;
+        self.test_message = None;
+        self.schemas_state = SchemaListState::Idle;
+        self.load_fields(window, cx);
+        cx.notify();
+    }
+
+    fn select_tab(&mut self, tab: DataSourceTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
+        self.apply_editors(cx);
+        self.tab = tab;
+        self.message = None;
+        self.load_fields(window, cx);
+        cx.notify();
+    }
+
+    fn add_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let mut blank = DataSource::blank(self.root.clone());
+        blank.name = next_data_source_name("datasource", &self.sources);
+        self.sources.push(blank);
+        self.selected = Some(self.sources.len() - 1);
+        self.tab = DataSourceTab::General;
+        self.message = None;
+        self.test_message = None;
+        self.schemas_state = SchemaListState::Idle;
+        self.load_fields(window, cx);
+        cx.notify();
+    }
+
+    fn remove_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else {
+            self.message = Some(("no data source selected".to_string(), Color::Error));
+            cx.notify();
+            return;
+        };
+        self.sources.remove(index);
+        self.selected = if self.sources.is_empty() {
+            None
+        } else {
+            Some(index.min(self.sources.len() - 1))
+        };
+        self.tab = DataSourceTab::General;
+        self.message = None;
+        self.test_message = None;
+        self.schemas_state = SchemaListState::Idle;
+        self.load_fields(window, cx);
+        cx.notify();
+    }
+
+    fn copy_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else {
+            self.message = Some(("no data source selected".to_string(), Color::Error));
+            cx.notify();
+            return;
+        };
+        self.apply_editors(cx);
+        let mut copy = self.sources[index].clone();
+        copy.name = next_data_source_name(&format!("{} copy", copy.name), &self.sources);
+        self.sources.push(copy);
+        self.selected = Some(self.sources.len() - 1);
+        self.message = None;
+        self.test_message = None;
+        self.schemas_state = SchemaListState::Idle;
+        self.load_fields(window, cx);
+        cx.notify();
+    }
+
+    fn add_advanced_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let key_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let value_editor = cx.new(|cx| Editor::single_line(window, cx));
+        self.advanced_rows.push((key_editor, value_editor));
+        cx.notify();
+    }
+
+    fn remove_advanced_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        self.advanced_rows.pop();
+        cx.notify();
+    }
+
+    fn toggle_read_only(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected.and_then(|index| self.sources.get_mut(index)) else {
+            return;
+        };
+        source.read_only = !source.read_only;
+        cx.notify();
+    }
+
+    fn toggle_ssh(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected.and_then(|index| self.sources.get_mut(index)) else {
+            return;
+        };
+        source.ssh_enabled = !source.ssh_enabled;
+        cx.notify();
+    }
+
+    fn toggle_all_schemas(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected.and_then(|index| self.sources.get_mut(index)) else {
+            return;
+        };
+        source.excluded_schemas.clear();
+        cx.notify();
+    }
+
+    fn toggle_schema(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(source) = self.selected.and_then(|index| self.sources.get_mut(index)) else {
+            return;
+        };
+        if let Some(position) = source
+            .excluded_schemas
+            .iter()
+            .position(|known| known == &name)
+        {
+            source.excluded_schemas.remove(position);
+        } else {
+            source.excluded_schemas.push(name);
+        }
+        cx.notify();
+    }
+
+    fn refresh_schemas(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(source) = self.sources.get(index) else {
+            return;
+        };
+        let name = source.name.trim().to_string();
+        if name.is_empty() {
+            self.schemas_state = SchemaListState::Failed("data source name is empty".to_string());
+            cx.notify();
+            return;
+        }
+        self.schemas_state = SchemaListState::Loading;
+        cx.notify();
+
+        let config_path = self.root.join(".zed/databases.json");
+        let root = self.root.clone();
+        let weak = cx.weak_entity();
+        let task = cx.background_spawn(async move {
+            let output = std::process::Command::new("php-db")
+                .arg("databases")
+                .arg(&name)
+                .arg("--config")
+                .arg(&config_path)
+                .arg("--json")
+                .current_dir(&root)
+                .output();
+            match output {
+                Ok(output) if output.status.success() => {
+                    parse_database_names(&String::from_utf8_lossy(&output.stdout))
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "databases command failed".to_string()))
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.schemas_state = match result {
+                    Ok(names) => SchemaListState::Loaded(names),
+                    Err(message) => SchemaListState::Failed(message),
+                };
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn test_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected else {
+            self.test_message = Some(("no data source selected".to_string(), Color::Error));
+            cx.notify();
+            return;
+        };
+        self.apply_editors(cx);
+        let Some(source) = self.sources.get(selected).cloned() else {
+            return;
+        };
+        let content = data_source_test_config(&source);
+        let test_path = self.root.join(".zed/.datasources.test.json");
+        if let Err(error) = std::fs::create_dir_all(test_path.parent().expect("test config parent"))
+            .and_then(|_| {
+                std::fs::write(
+                    &test_path,
+                    serde_json::to_string(&content).expect("serialize test config"),
+                )
+            })
+        {
+            self.test_message = Some((format!("cannot write test config: {error}"), Color::Error));
+            cx.notify();
+            return;
+        }
+        self.test_message = Some(("testing...".to_string(), Color::Muted));
+        cx.notify();
+
+        let root = self.root.clone();
+        let weak = cx.weak_entity();
+        let task = cx.background_spawn(async move {
+            let mut command = util::command::new_command("php-db");
+            command
+                .arg("schema")
+                .arg("_test")
+                .arg("--config")
+                .arg(&test_path)
+                .arg("--json")
+                .current_dir(&root);
+            command.output().await.map_err(|error| error.to_string())
+        });
+
+        cx.spawn(async move |_, cx| {
+            let result = task.await;
+            weak.update(cx, |dialog, cx| {
+                dialog.test_message = Some(match result {
+                    Ok(output) if output.status.success() => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let driver = serde_json::from_str::<Value>(stdout.trim())
+                            .ok()
+                            .and_then(|value| string_field(&value, "driver"))
+                            .map(|driver| format!(" · {}", driver_display_name(&driver)))
+                            .unwrap_or_default();
+                        (format!("ok{driver}"), Color::Success)
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let message = first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                            .unwrap_or_else(|| "connection failed".to_string());
+                        (message, Color::Error)
+                    }
+                    Err(error) => (error, Color::Error),
+                });
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) -> std::result::Result<(), String> {
+        self.apply_editors(cx);
+        for source in &self.sources {
+            let problems = data_source_problems(source);
+            if let Some(problem) = problems.first() {
+                return Err(format!("{}: {}", source.name.trim(), problem));
+            }
+        }
+        save_data_sources(&self.root, &self.sources)?;
+        if let Some(panel) = self.panel.clone() {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.refresh(cx);
+                    panel.saved_message = Some("data sources updated".to_string());
+                })
+                .log_err();
+        }
+        Ok(())
+    }
+
+    fn apply(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.save(cx) {
+            Ok(()) => {
+                self.message = Some(("applied".to_string(), Color::Success));
+            }
+            Err(message) => {
+                self.message = Some((message, Color::Error));
+            }
+        }
+        cx.notify();
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(message) = self.save(cx) {
+            self.message = Some((message, Color::Error));
+            cx.notify();
+            return;
+        }
+        self.close(window, cx);
+    }
+
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close(window, cx);
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cx.has_global::<DataSourcesDialogWindow>() {
+            cx.global_mut::<DataSourcesDialogWindow>().0 = None;
+        }
+        window.remove_window();
+        cx.notify();
+    }
+}
+
+pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
+    if !cx.has_global::<DataSourcesDialogWindow>() {
+        cx.set_global(DataSourcesDialogWindow(None));
+    }
+    let existing = cx.global::<DataSourcesDialogWindow>().0;
+    if let Some(handle) = existing.and_then(|any| any.downcast::<DataSourcesDialog>()) {
+        let resumed = handle.update(cx, |dialog, window, cx| {
+            dialog.resume_with_root(root.clone(), window, cx);
+            window.activate_window();
+            cx.notify();
+        });
+        if resumed.is_ok() {
+            return;
+        }
+        cx.global_mut::<DataSourcesDialogWindow>().0 = None;
+    }
+
+    let window_bounds = WindowBounds::centered(size(px(760.), px(720.)), cx);
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from("Data Sources and Drivers")),
+                    ..Default::default()
+                }),
+                window_bounds: Some(window_bounds),
+                ..Default::default()
+            },
+            |window, cx| {
+                window.set_window_title("Data Sources and Drivers");
+                let view = cx.new(|cx| DataSourcesDialog::new(root.clone(), window, cx));
+                window.activate_window();
+                view.focus_handle(cx).focus(window, cx);
+                view
+            },
+        )
+        .log_err();
+    if let Some(handle) = handle {
+        cx.global_mut::<DataSourcesDialogWindow>().0 = Some(handle.into());
+    }
+}
+
+fn ds_editor_box(
+    id: impl Into<ElementId>,
+    editor: &Entity<Editor>,
+    flex: bool,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let mut box_div = div()
+        .id(id)
+        .min_w_0()
+        .bg(colors.editor_background)
+        .border_1()
+        .border_color(colors.border_variant)
+        .rounded_sm()
+        .px_1()
+        .py_0p5()
+        .cursor_text()
+        .child(dialog_editor_element(editor, cx));
+    if flex {
+        box_div = box_div.flex_1();
+    } else {
+        box_div = box_div.flex_none();
+    }
+    box_div.into_any_element()
+}
+
+impl Render for DataSourcesDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let message = self.message.clone();
+        let test_message = self.test_message.clone();
+        let selected_source = self
+            .selected
+            .and_then(|index| self.sources.get(index))
+            .cloned();
+        let problems = selected_source
+            .as_ref()
+            .map(data_source_problems)
+            .unwrap_or_default();
+
+        let mut source_rows = Vec::new();
+        for (index, source) in self.sources.iter().enumerate() {
+            let is_selected = self.selected == Some(index);
+            source_rows.push(
+                h_flex()
+                    .id(("ds-source-row", index))
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_selected, |this| this.bg(colors.element_selected))
+                    .hover(|style| style.bg(colors.element_hover))
+                    .child(driver_badge(
+                        driver_badge_short(&source.driver),
+                        driver_badge_color(&source.driver),
+                        cx,
+                    ))
+                    .child(
+                        Label::new(source.name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(if is_selected {
+                                Color::Accent
+                            } else {
+                                Color::Default
+                            })
+                            .truncate(),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select_source(index, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if source_rows.is_empty() {
+            source_rows.push(
+                h_flex()
+                    .px_1()
+                    .py_0p5()
+                    .child(
+                        Label::new("no data sources")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let mut problem_rows = Vec::new();
+        for (index, problem) in problems.iter().enumerate() {
+            problem_rows.push(
+                h_flex()
+                    .id(("ds-problem-row", index))
+                    .w_full()
+                    .flex_none()
+                    .px_1()
+                    .py_0p5()
+                    .child(
+                        Label::new(problem.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error)
+                            .truncate(),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let mut tab_rows = Vec::new();
+        for tab in DataSourceTab::ALL {
+            let selected = tab == self.tab;
+            tab_rows.push(
+                h_flex()
+                    .id(("ds-tab", tab as usize))
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(selected, |this| {
+                        this.border_b_2().border_color(colors.border_focused)
+                    })
+                    .child(
+                        Label::new(tab.label())
+                            .size(LabelSize::Small)
+                            .color(if selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select_tab(tab, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let tab_content: AnyElement = match self.tab {
+            DataSourceTab::General => {
+                let is_sqlite = selected_source
+                    .as_ref()
+                    .map(|source| source.is_sqlite())
+                    .unwrap_or(true);
+                let mut rows = Vec::new();
+                rows.push(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div().flex_none().w(px(90.)).child(
+                                Label::new("Driver:")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .child(
+                            driver_badge(
+                                driver_badge_short(
+                                    &selected_source
+                                        .as_ref()
+                                        .map(|source| source.driver.clone())
+                                        .unwrap_or_default(),
+                                ),
+                                driver_badge_color(
+                                    &selected_source
+                                        .as_ref()
+                                        .map(|source| source.driver.clone())
+                                        .unwrap_or_default(),
+                                ),
+                                cx,
+                            ),
+                        )
+                        .child(
+                            Label::new(
+                                driver_support_hint(
+                                    &selected_source
+                                        .as_ref()
+                                        .map(|source| source.driver.clone())
+                                        .unwrap_or_default(),
+                                ),
+                            )
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+                if is_sqlite {
+                    rows.push(dialog_field(
+                        "ds-file-editor",
+                        "File:",
+                        &self.file_editor,
+                        None,
+                        cx,
+                    ));
+                } else {
+                    rows.push(dialog_field(
+                        "ds-host-editor",
+                        "Host:",
+                        &self.host_editor,
+                        None,
+                        cx,
+                    ));
+                    rows.push(dialog_field(
+                        "ds-port-editor",
+                        "Port:",
+                        &self.port_editor,
+                        Some(px(60.)),
+                        cx,
+                    ));
+                }
+                rows.push(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div().flex_none().w(px(90.)).child(
+                                Label::new("Authentication:")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .child(
+                            Label::new("User & Password")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+                if !is_sqlite {
+                    rows.push(dialog_field(
+                        "ds-user-editor",
+                        "User:",
+                        &self.user_editor,
+                        None,
+                        cx,
+                    ));
+                    let masked = selected_source
+                        .as_ref()
+                        .map(|source| mask_password(&source.password).to_string())
+                        .unwrap_or_default();
+                    rows.push(
+                        h_flex()
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .child(
+                                div().flex_none().w(px(90.)).child(
+                                    Label::new("Password:")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                            .child(ds_editor_box(
+                                "ds-password-editor",
+                                &self.password_editor,
+                                true,
+                                cx,
+                            ))
+                            .child(
+                                Label::new(masked)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                rows.push(dialog_field(
+                    "ds-database-editor",
+                    "Database:",
+                    &self.database_editor,
+                    None,
+                    cx,
+                ));
+                rows.push(dialog_field(
+                    "ds-url-editor",
+                    "URL:",
+                    &self.url_editor,
+                    None,
+                    cx,
+                ));
+                rows.push(
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .px_1()
+                        .child(
+                            Label::new("Overrides settings above")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+                v_flex()
+                    .id("ds-tab-general")
+                    .w_full()
+                    .children(rows)
+                    .into_any_element()
+            }
+            DataSourceTab::Options => {
+                let read_only = selected_source
+                    .as_ref()
+                    .map(|source| source.read_only)
+                    .unwrap_or(false);
+                v_flex()
+                    .id("ds-tab-options")
+                    .w_full()
+                    .gap_1()
+                    .children(vec![
+                        h_flex()
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .child(
+                                div().flex_none().w(px(90.)).child(
+                                    Label::new("Read-only:")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                            .child(
+                                Button::new(
+                                    "ds-option-readonly",
+                                    if read_only {
+                                        "read-only"
+                                    } else {
+                                        "read-write"
+                                    },
+                                )
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::XSmall)
+                                .style(ButtonStyle::Subtle)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.toggle_read_only(cx);
+                                })),
+                            )
+                            .into_any_element(),
+                        h_flex()
+                            .flex_none()
+                            .px_1()
+                            .child(
+                                Label::new("auto-disconnect: not supported")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element(),
+                    ])
+                    .into_any_element()
+            }
+            DataSourceTab::Ssh => {
+                let ssh_enabled = selected_source
+                    .as_ref()
+                    .map(|source| source.ssh_enabled)
+                    .unwrap_or(false);
+                let mut rows = Vec::new();
+                rows.push(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div().flex_none().w(px(150.)).child(
+                                Label::new("Use SSH tunnel:")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .child(
+                            Button::new(
+                                "ds-option-ssh",
+                                if ssh_enabled { "on" } else { "off" },
+                            )
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::XSmall)
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.toggle_ssh(cx);
+                            })),
+                        )
+                        .into_any_element(),
+                );
+                if ssh_enabled {
+                    rows.push(dialog_field(
+                        "ds-ssh-config-editor",
+                        "SSH configuration:",
+                        &self.ssh_config_editor,
+                        None,
+                        cx,
+                    ));
+                    rows.push(dialog_field(
+                        "ds-ssh-local-port-editor",
+                        "Local port:",
+                        &self.ssh_local_port_editor,
+                        Some(px(60.)),
+                        cx,
+                    ));
+                    rows.push(
+                        h_flex()
+                            .flex_none()
+                            .px_1()
+                            .py_1()
+                            .child(
+                                Label::new("format user@host:port")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                rows.push(
+                    h_flex()
+                        .flex_none()
+                        .px_1()
+                        .py_1()
+                        .child(
+                            Label::new("SSL: not supported")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+                v_flex()
+                    .id("ds-tab-ssh")
+                    .w_full()
+                    .children(rows)
+                    .into_any_element()
+            }
+            DataSourceTab::Schemas => {
+                let mut rows = Vec::new();
+                rows.push(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            IconButton::new("ds-schemas-refresh", IconName::RotateCw)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.refresh_schemas(cx);
+                                })),
+                        )
+                        .child(
+                            Label::new("auto")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+                let excluded = selected_source
+                    .as_ref()
+                    .map(|source| source.excluded_schemas.clone())
+                    .unwrap_or_default();
+                match &self.schemas_state {
+                    SchemaListState::Idle => rows.push(
+                        h_flex()
+                            .px_1()
+                            .py_0p5()
+                            .child(
+                                Label::new("press refresh to load schemas")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element(),
+                    ),
+                    SchemaListState::Loading => rows.push(
+                        h_flex()
+                            .px_1()
+                            .py_0p5()
+                            .child(
+                                Label::new("loading…")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element(),
+                    ),
+                    SchemaListState::Failed(error) => rows.push(
+                        h_flex()
+                            .px_1()
+                            .py_0p5()
+                            .child(
+                                Label::new(error.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error)
+                                    .truncate(),
+                            )
+                            .into_any_element(),
+                    ),
+                    SchemaListState::Loaded(names) => {
+                        rows.push(
+                            h_flex()
+                                .id("ds-schema-row-all")
+                                .w_full()
+                                .flex_none()
+                                .items_center()
+                                .gap_1()
+                                .px_1()
+                                .py_0p5()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(colors.element_hover))
+                                .child(
+                                    Label::new(if excluded.is_empty() { "[x]" } else { "[ ]" })
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new("All schemas")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Default),
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.toggle_all_schemas(cx);
+                                }))
+                                .into_any_element(),
+                        );
+                        for (index, name) in names.iter().enumerate() {
+                            let checked = schema_checked(&excluded, name);
+                            let name = name.clone();
+                            rows.push(
+                                h_flex()
+                                    .id(("ds-schema-row", index))
+                                    .w_full()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(colors.element_hover))
+                                    .child(
+                                        Label::new(if checked { "[x]" } else { "[ ]" })
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(name.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Default),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _window, cx| {
+                                            this.toggle_schema(name.clone(), cx);
+                                        },
+                                    ))
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
+                v_flex()
+                    .id("ds-tab-schemas")
+                    .w_full()
+                    .children(rows)
+                    .into_any_element()
+            }
+            DataSourceTab::Advanced => {
+                let mut rows = Vec::new();
+                for (index, (key_editor, value_editor)) in self.advanced_rows.iter().enumerate() {
+                    rows.push(
+                        h_flex()
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .py_0p5()
+                            .child(ds_editor_box(
+                                ("ds-advanced-name", index),
+                                key_editor,
+                                true,
+                                cx,
+                            ))
+                            .child(ds_editor_box(
+                                ("ds-advanced-value", index),
+                                value_editor,
+                                true,
+                                cx,
+                            ))
+                            .into_any_element(),
+                    );
+                }
+                rows.push(
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .py_1()
+                        .child(
+                            IconButton::new("ds-advanced-add", IconName::Plus)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, window, cx| {
+                                        this.add_advanced_row(window, cx);
+                                    },
+                                )),
+                        )
+                        .child(
+                            IconButton::new("ds-advanced-remove", IconName::SquareMinus)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, window, cx| {
+                                        this.remove_advanced_row(window, cx);
+                                    },
+                                )),
+                        )
+                        .into_any_element(),
+                );
+                v_flex()
+                    .id("ds-tab-advanced")
+                    .w_full()
+                    .children(rows)
+                    .into_any_element()
+            }
+        };
+
+        let test_line = match test_message.as_ref() {
+            Some((text, color)) => h_flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .py_1()
+                .child(
+                    Button::new("ds-test", "Test Connection")
+                        .size(ButtonSize::Compact)
+                        .label_size(LabelSize::XSmall)
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.test_connection(cx);
+                        })),
+                )
+                .child(
+                    Label::new(text.clone())
+                        .size(LabelSize::XSmall)
+                        .color(*color)
+                        .flex_1()
+                        .truncate(),
+                )
+                .into_any_element(),
+            None => h_flex()
+                .flex_none()
+                .items_center()
+                .px_1()
+                .py_1()
+                .child(
+                    Button::new("ds-test", "Test Connection")
+                        .size(ButtonSize::Compact)
+                        .label_size(LabelSize::XSmall)
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.test_connection(cx);
+                        })),
+                )
+                .into_any_element(),
+        };
+
+        let message_line: Option<AnyElement> = message.as_ref().map(|(text, color)| {
+            h_flex()
+                .flex_none()
+                .px_3()
+                .py_1()
+                .child(
+                    Label::new(text.clone())
+                        .size(LabelSize::XSmall)
+                        .color(*color)
+                        .truncate(),
+                )
+                .into_any_element()
+        });
+
+        v_flex()
+            .id("data-sources-dialog")
+            .size_full()
+            .bg(colors.background)
+            .text_ui(cx)
+            .on_action(cx.listener(|this, _: &editor_actions::Cancel, window, cx| {
+                this.cancel(window, cx);
+            }))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        v_flex()
+                            .w(px(200.))
+                            .flex_none()
+                            .h_full()
+                            .border_r_1()
+                            .border_color(colors.border)
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_between()
+                                    .px_2()
+                                    .py_1()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                Icon::new(IconName::DatabaseZap)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new("Data Sources")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Default),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_0p5()
+                                            .child(
+                                                IconButton::new("ds-add", IconName::Plus)
+                                                    .shape(IconButtonShape::Square)
+                                                    .icon_size(IconSize::XSmall)
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, window, cx| {
+                                                            this.add_source(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                IconButton::new(
+                                                    "ds-remove",
+                                                    IconName::SquareMinus,
+                                                )
+                                                .shape(IconButtonShape::Square)
+                                                .icon_size(IconSize::XSmall)
+                                                .on_click(cx.listener(
+                                                    |this, _: &ClickEvent, window, cx| {
+                                                        this.remove_source(window, cx);
+                                                    },
+                                                )),
+                                            )
+                                            .child(
+                                                IconButton::new("ds-copy", IconName::Copy)
+                                                    .shape(IconButtonShape::Square)
+                                                    .icon_size(IconSize::XSmall)
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, window, cx| {
+                                                            this.copy_source(window, cx);
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("ds-source-list")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .children(source_rows),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_none()
+                                    .border_t_1()
+                                    .border_color(colors.border)
+                                    .px_2()
+                                    .py_1()
+                                    .child(
+                                        Label::new("Problems")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .children(problem_rows),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .border_b_1()
+                                    .border_color(colors.border)
+                                    .child(
+                                        Label::new("Name:")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(ds_editor_box(
+                                        "ds-name-editor",
+                                        &self.name_editor,
+                                        true,
+                                        cx,
+                                    ))
+                                    .child(
+                                        Label::new("Color")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .px_2()
+                                    .border_b_1()
+                                    .border_color(colors.border)
+                                    .children(tab_rows),
+                            )
+                            .child(
+                                div()
+                                    .id("ds-tab-content")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .p_2()
+                                    .child(tab_content),
+                            )
+                            .child(test_line),
+                    ),
+            )
+            .children(message_line)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        Button::new("ds-cancel", "Cancel")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.cancel(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("ds-apply", "Apply")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.apply(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("ds-ok", "OK")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.confirm(window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
 const SERVER_PROTOCOLS: [&str; 2] = ["local", "sftp"];
 const DATABASE_DRIVERS: [&str; 8] = [
     "postgres",
@@ -1879,6 +3734,25 @@ impl PhpPanel {
                     return;
                 };
                 open_deployment_window(root, cx);
+            });
+            workspace.register_action(|workspace, _: &OpenDataSourcesDialog, _, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+                open_data_sources_window(root, cx);
             });
             workspace.register_action(
                 |workspace, _: &BrowseRemoteHost, window, cx| {
@@ -5250,6 +7124,16 @@ impl Render for PhpPanel {
                             ),
                             DatabaseStatus::Failed(message) => (message.clone(), Color::Error),
                         })
+                })
+                .or_else(|| {
+                    self.query_status
+                        .get(&database.name)
+                        .and_then(|status| match status {
+                            TableStatus::Loading | TableStatus::Loaded(_) => None,
+                            TableStatus::Failed(message) => {
+                                Some((message.clone(), Color::Error))
+                            }
+                        })
                 });
 
             let mut connection_row = h_flex()
@@ -5714,12 +7598,15 @@ impl Render for PhpPanel {
                     .cursor_pointer()
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
                     .child(
-                        Label::new("Data Source")
+                        Label::new("Data Sources and Drivers...")
                             .size(LabelSize::Small)
                             .color(Color::Accent),
                     )
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.open_form(FormKind::Database, window, cx);
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.db_menu_open = false;
+                        if let Some(root) = this.worktree_root(cx) {
+                            open_data_sources_window(root, cx);
+                        }
                     }))
                     .into_any_element(),
             );
@@ -6949,5 +8836,211 @@ mod tests {
         for tab in PanelTab::ALL {
             assert_eq!(next_tab(tab, 6), tab);
         }
+    }
+
+    #[test]
+    fn mask_password_shows_dots_only_when_set() {
+        assert_eq!(mask_password(""), "");
+        assert_eq!(mask_password("s3cret"), "•••••");
+    }
+
+    #[test]
+    fn driver_support_hint_covers_all_drivers() {
+        for driver in DATABASE_DRIVERS {
+            assert!(!driver_support_hint(driver).is_empty());
+            assert!(driver_support_hint(driver).contains("supports"));
+        }
+        assert_eq!(driver_support_hint("unknown"), "");
+    }
+
+    #[test]
+    fn parse_ssh_config_splits_user_host_port() {
+        let (user, host, port) = parse_ssh_config("deploy@127.0.0.1:2222");
+        assert_eq!(user, "deploy");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, "2222");
+        let (user, host, port) = parse_ssh_config("db.local");
+        assert_eq!(user, "");
+        assert_eq!(host, "db.local");
+        assert_eq!(port, "");
+        let (user, host, port) = parse_ssh_config("  root @ box : 22 ");
+        assert_eq!(user, "root");
+        assert_eq!(host, "box");
+        assert_eq!(port, "22");
+        assert_eq!(
+            format_ssh_config("deploy", "127.0.0.1", "2222"),
+            "deploy@127.0.0.1:2222"
+        );
+        assert_eq!(format_ssh_config("", "box", ""), "box");
+    }
+
+    #[test]
+    fn data_source_options_rows_roundtrip_sorted_and_skip_blank() {
+        let mut options = serde_json::Map::new();
+        options.insert("b_key".to_string(), json!("2"));
+        options.insert("a_key".to_string(), json!(1));
+        let rows = options_to_rows(&options);
+        assert_eq!(rows, vec![("a_key".to_string(), "1".to_string()), ("b_key".to_string(), "2".to_string())]);
+
+        let staged = vec![
+            ("z_key".to_string(), "true".to_string()),
+            (String::new(), "skipped".to_string()),
+            ("a_key".to_string(), "text".to_string()),
+        ];
+        let options = rows_to_options(&staged);
+        let keys = options.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys, vec!["a_key".to_string(), "z_key".to_string()]);
+        assert_eq!(options["a_key"], json!("text"));
+        assert_eq!(options["z_key"], json!("true"));
+    }
+
+    #[test]
+    fn data_source_excluded_schemas_roundtrip() {
+        let value = json!(["demo.sqlite", "other"]);
+        assert_eq!(
+            parse_excluded_schemas(Some(&value)),
+            vec!["demo.sqlite".to_string(), "other".to_string()]
+        );
+        assert!(parse_excluded_schemas(None).is_empty());
+
+        let excluded = vec!["demo.sqlite".to_string()];
+        assert!(!schema_checked(&excluded, "demo.sqlite"));
+        assert!(schema_checked(&excluded, "other"));
+        let mut toggled = excluded.clone();
+        toggled.retain(|name| name != "demo.sqlite");
+        assert!(schema_checked(&toggled, "demo.sqlite"));
+    }
+
+    #[test]
+    fn data_source_test_config_serializes_only_selected_connection() {
+        let mut source = DataSource::blank(PathBuf::from("/tmp"));
+        source.name = "app".to_string();
+        source.path = "demo.sqlite".to_string();
+        source.read_only = true;
+        let config = data_source_test_config(&source);
+        let connections = config["connections"].as_array().expect("connections array");
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0]["name"], json!("_test"));
+        assert_eq!(connections[0]["path"], json!("demo.sqlite"));
+        assert_eq!(connections[0]["read_only"], json!(true));
+    }
+
+    #[test]
+    fn data_source_entry_and_parse_roundtrip() {
+        let mut source = DataSource::blank(PathBuf::from("/tmp"));
+        source.name = "pg".to_string();
+        source.driver = "postgres".to_string();
+        source.host = "localhost".to_string();
+        source.port = "5432".to_string();
+        source.user = "app".to_string();
+        source.password = "secret".to_string();
+        source.database = "app".to_string();
+        source.read_only = true;
+        source.ssh_enabled = true;
+        source.ssh_user = "deploy".to_string();
+        source.ssh_host = "127.0.0.1".to_string();
+        source.ssh_port = "2222".to_string();
+        source.excluded_schemas = vec!["public".to_string()];
+        source.options = vec![("connect_timeout".to_string(), "5".to_string())];
+
+        let entry = data_source_entry(&source);
+        assert_eq!(entry["port"], json!(5432));
+        assert_eq!(entry["read_only"], json!(true));
+        assert_eq!(entry["ssh_tunnel"]["port"], json!(2222));
+        assert_eq!(entry["ssh_tunnel"]["user"], json!("deploy"));
+        assert_eq!(entry["excluded_schemas"], json!(["public"]));
+        assert_eq!(entry["options"]["connect_timeout"], json!("5"));
+
+        let parsed = parse_data_source(&entry, Path::new("/tmp")).expect("parse entry");
+        assert_eq!(parsed.name, "pg");
+        assert_eq!(parsed.port, "5432");
+        assert!(parsed.read_only);
+        assert!(parsed.ssh_enabled);
+        assert_eq!(parsed.ssh_host, "127.0.0.1");
+        assert_eq!(parsed.ssh_port, "2222");
+        assert_eq!(parsed.excluded_schemas, vec!["public".to_string()]);
+        assert_eq!(
+            parsed.options,
+            vec![("connect_timeout".to_string(), "5".to_string())]
+        );
+    }
+
+    #[test]
+    fn data_source_problems_list_validation_errors() {
+        let mut source = DataSource::blank(PathBuf::from("/tmp"));
+        source.name = "app".to_string();
+        source.driver = "sqlite".to_string();
+        assert!(data_source_problems(&source).contains(&"file path is required".to_string()));
+        source.path = "demo.sqlite".to_string();
+        assert!(data_source_problems(&source).is_empty());
+        source.driver = "postgres".to_string();
+        source.url = "postgres://app@localhost:5432/app".to_string();
+        assert!(data_source_problems(&source).is_empty());
+        source.url = String::new();
+        let problems = data_source_problems(&source);
+        for expected in ["host is required", "port is required", "user is required", "database is required"] {
+            assert!(problems.contains(&expected.to_string()), "missing {expected}");
+        }
+        source.ssh_enabled = true;
+        assert!(data_source_problems(&source).contains(&"ssh host is required".to_string()));
+    }
+
+    #[test]
+    fn save_data_sources_preserves_unknown_keys_and_drops_removed() {
+        let root = temp_root("data_sources_save");
+        let zed = root.join(".zed");
+        std::fs::create_dir_all(&zed).expect("create .zed");
+        std::fs::write(
+            zed.join("databases.json"),
+            r#"{
+  "connections": [
+    { "name": "app", "driver": "sqlite", "path": "old.sqlite", "password_env": "PGPASSWORD" },
+    { "name": "stale", "driver": "sqlite", "path": "gone.sqlite" }
+  ]
+}"#,
+        )
+        .expect("seed databases.json");
+
+        let mut app = DataSource::blank(root.clone());
+        app.name = "app".to_string();
+        app.driver = "sqlite".to_string();
+        app.path = "demo.sqlite".to_string();
+        app.read_only = true;
+        let mut pg = DataSource::blank(root.clone());
+        pg.name = "pg".to_string();
+        pg.driver = "postgres".to_string();
+        pg.url = "postgres://app@localhost:5432/app".to_string();
+
+        save_data_sources(&root, &[app, pg]).expect("save data sources");
+
+        let config = read_json(&zed.join("databases.json")).expect("parse databases.json");
+        let connections = config["connections"].as_array().expect("connections array");
+        assert_eq!(connections.len(), 2);
+        assert_eq!(connections[0]["path"], json!("demo.sqlite"));
+        assert_eq!(connections[0]["read_only"], json!(true));
+        assert_eq!(connections[0]["password_env"], json!("PGPASSWORD"));
+        assert_eq!(connections[1]["url"], json!("postgres://app@localhost:5432/app"));
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn next_data_source_name_prefills_unique_names() {
+        let mut blank = DataSource::blank(PathBuf::from("/tmp"));
+        blank.name = "datasource".to_string();
+        assert_eq!(next_data_source_name("datasource", &[]), "datasource");
+        let sources = vec![blank.clone()];
+        assert_eq!(
+            next_data_source_name("datasource", &sources),
+            "datasource (1)"
+        );
+        let mut copy = blank.clone();
+        copy.name = "datasource copy".to_string();
+        blank.name = "a".to_string();
+        let sources = vec![blank, copy];
+        assert_eq!(
+            next_data_source_name("a copy", &sources),
+            "a copy"
+        );
     }
 }

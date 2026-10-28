@@ -301,6 +301,11 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     php_panel::OpenDeploymentDialog,
                 ),
                 MenuItem::action("Browse Remote Host", php_panel::BrowseRemoteHost),
+                MenuItem::separator(),
+                MenuItem::action(
+                    "Data Sources and Drivers...",
+                    php_panel::OpenDataSourcesDialog,
+                ),
             ],
         },
         Menu {
