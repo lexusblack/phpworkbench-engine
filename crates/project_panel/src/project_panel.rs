@@ -1155,6 +1155,15 @@ impl ProjectPanel {
                 !is_dir && MarkdownPreviewView::is_markdown_path(file_name, project.languages());
             let is_svg = !is_dir && SvgPreviewView::is_svg_path(file_name);
 
+            // "Add as Data Source" targets SQLite files picked in the project tree.
+            let is_sqlite_file = !is_dir && php_panel::is_sqlite_file_name(&file_name.to_string_lossy());
+            let sqlite_file_abs_path = if is_sqlite_file {
+                let abs_path = worktree.abs_path().join(entry.path.as_ref());
+                Some(abs_path.to_string_lossy().replace('\\', "/"))
+            } else {
+                None
+            };
+
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
             let should_hide_rename = is_root
@@ -1205,6 +1214,14 @@ impl ProjectPanel {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
                             })
                             .action("Open in Terminal", Box::new(OpenInTerminal))
+                            .when(is_sqlite_file, |menu| {
+                                menu.separator().action(
+                                    "Add as Data Source",
+                                    Box::new(php_panel::AddAsDataSource {
+                                        abs_path: sqlite_file_abs_path.clone(),
+                                    }),
+                                )
+                            })
                             .when(is_markdown, |menu| {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                             })
