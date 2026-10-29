@@ -306,6 +306,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     "Data Sources and Drivers...",
                     php_panel::OpenDataSourcesDialog,
                 ),
+                MenuItem::action(
+                    "SSH Configurations...",
+                    php_panel::OpenSshConfigsDialog,
+                ),
             ],
         },
         Menu {

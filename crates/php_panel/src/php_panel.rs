@@ -5,24 +5,24 @@ use std::{
 };
 
 use anyhow::Result;
+use editor::{Editor, EditorElement, EditorEvent, EditorStyle, actions as editor_actions};
+use file_icons::FileIcons;
 use gpui::{
-    Action, Anchor, App, AppContext, AsyncWindowContext, ClickEvent, Context, ElementId, Entity,
-    EventEmitter, TextStyle, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, StatefulInteractiveElement, Styled, Subscription,
-    WeakEntity, Window, AnyWindowHandle, SharedString, TitlebarOptions,
-    WindowBounds, WindowOptions, actions, px, size,
+    Action, Anchor, AnyWindowHandle, App, AppContext, AsyncWindowContext, ClickEvent, Context,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, TextStyle, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, px, size,
 };
-use editor::{Editor, EditorElement, EditorStyle, actions as editor_actions};
 use project::{Project, ProjectPath};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use file_icons::FileIcons;
+use settings::Settings as _;
 use ui::{
     Button, ContextMenu, IconButtonShape, Label, LabelSize, ListItem, PopoverMenu, Tooltip,
     prelude::*,
 };
-use settings::Settings as _;
 use util::ResultExt as _;
 
 use workspace::dock::{DockPosition, PanelEvent};
@@ -30,7 +30,15 @@ use workspace::{OpenOptions, Panel, StatusItemView, Workspace};
 
 actions!(
     php_panel,
-    [ToggleFocus, OpenDeploymentDialog, OpenDataSourcesDialog, OpenSshConfigsDialog, BrowseRemoteHost, SelectNextTab, SelectPrevTab]
+    [
+        ToggleFocus,
+        OpenDeploymentDialog,
+        OpenDataSourcesDialog,
+        OpenSshConfigsDialog,
+        BrowseRemoteHost,
+        SelectNextTab,
+        SelectPrevTab
+    ]
 );
 
 /// Adds a SQLite file picked in the project tree as a data source.
@@ -97,6 +105,7 @@ struct RemoteServer {
     excluded: Vec<String>,
     upload_on_save: bool,
     use_rsync: bool,
+    use_sudo: bool,
     visible: bool,
     passive_mode: bool,
     show_hidden: bool,
@@ -176,7 +185,31 @@ fn parse_local_dir_entries(items: Vec<(String, bool)>) -> Vec<RemoteEntry> {
     entries
 }
 
-const DEPLOY_TYPES: [&str; 7] = ["local", "in-place", "sftp", "ftp", "ftps", "webdav", "webdavs"];
+const DEPLOY_TYPES: [&str; 7] = [
+    "in-place", "local", "ftp", "ftps", "sftp", "webdav", "webdavs",
+];
+
+/// PhpStorm's Deployment > Type dropdown, in the exact menu order and wording.
+const DEPLOY_TYPE_OPTIONS: [(&str, &str); 7] = [
+    ("in-place", "In place"),
+    ("local", "Local or mounted folder"),
+    ("ftp", "FTP"),
+    ("ftps", "FTPS"),
+    ("sftp", "SFTP"),
+    ("webdav", "WebDAV"),
+    ("webdavs", "WebDAV over HTTPS"),
+];
+
+fn deploy_type_options() -> &'static [(&'static str, &'static str)] {
+    &DEPLOY_TYPE_OPTIONS
+}
+
+fn deploy_type_canonical_from_label(label: &str) -> Option<&'static str> {
+    DEPLOY_TYPE_OPTIONS
+        .iter()
+        .find(|(_, known)| *known == label)
+        .map(|(protocol, _)| *protocol)
+}
 
 fn deploy_type_canonical(protocol: &str) -> Option<&'static str> {
     match protocol.trim().to_ascii_lowercase().as_str() {
@@ -189,15 +222,6 @@ fn deploy_type_canonical(protocol: &str) -> Option<&'static str> {
         "webdavs" | "davs" | "dav+" => Some("webdavs"),
         _ => None,
     }
-}
-
-fn next_deploy_type(current: &str) -> &'static str {
-    let canonical = deploy_type_canonical(current).unwrap_or("local");
-    let position = DEPLOY_TYPES
-        .iter()
-        .position(|known| *known == canonical)
-        .unwrap_or(0);
-    DEPLOY_TYPES[(position + 1) % DEPLOY_TYPES.len()]
 }
 
 fn deploy_type_badge_short(protocol: &str) -> &'static str {
@@ -231,13 +255,14 @@ fn deploy_type_display_name(protocol: &str) -> String {
         Some("ftp") => "FTP".to_string(),
         Some("ftps") => "FTPS".to_string(),
         Some("webdav") => "WebDAV".to_string(),
-        Some("webdavs") => "WebDAV (HTTPS)".to_string(),
+        Some("webdavs") => "WebDAV over HTTPS".to_string(),
         _ => protocol.to_string(),
     }
 }
 
 fn deploy_default_port(protocol: &str) -> Option<&'static str> {
     match deploy_type_canonical(protocol) {
+        Some("sftp") => Some("22"),
         Some("ftp") => Some("21"),
         Some("ftps") => Some("990"),
         Some("webdav") => Some("80"),
@@ -249,50 +274,52 @@ fn deploy_default_port(protocol: &str) -> Option<&'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeployField {
     SshConfig,
-    Host,
-    Port,
-    User,
-    AnonToggle,
+    HostPort,
+    UserAnonymous,
     Password,
     Folder,
     RootPath,
     WebUrl,
     TestConnection,
     RsyncToggle,
+    SudoToggle,
 }
 
 fn deploy_connection_fields(protocol: &str) -> &'static [DeployField] {
     match deploy_type_canonical(protocol) {
         Some("sftp") => &[
             DeployField::SshConfig,
+            DeployField::TestConnection,
+            DeployField::RootPath,
+            DeployField::WebUrl,
             DeployField::RsyncToggle,
-            DeployField::RootPath,
-            DeployField::WebUrl,
-            DeployField::TestConnection,
+            DeployField::SudoToggle,
         ],
-        Some("ftp") | Some("ftps") | Some("webdav") | Some("webdavs") => &[
-            DeployField::Host,
-            DeployField::Port,
-            DeployField::User,
-            DeployField::AnonToggle,
+        Some("ftp") | Some("ftps") => &[
+            DeployField::HostPort,
+            DeployField::UserAnonymous,
             DeployField::Password,
+            DeployField::TestConnection,
             DeployField::RootPath,
             DeployField::WebUrl,
-            DeployField::TestConnection,
+            DeployField::RsyncToggle,
         ],
-        Some("local") => &[
-            DeployField::Folder,
+        Some("webdav") | Some("webdavs") => &[
+            DeployField::HostPort,
+            DeployField::UserAnonymous,
+            DeployField::Password,
+            DeployField::TestConnection,
             DeployField::RootPath,
             DeployField::WebUrl,
-            DeployField::TestConnection,
         ],
-        Some("in-place") => &[DeployField::WebUrl, DeployField::TestConnection],
-        _ => &[
-            DeployField::RootPath,
-            DeployField::WebUrl,
-            DeployField::TestConnection,
-        ],
+        Some("local") => &[DeployField::Folder, DeployField::WebUrl],
+        Some("in-place") => &[DeployField::WebUrl],
+        _ => &[DeployField::RootPath, DeployField::WebUrl],
     }
+}
+
+fn deploy_mapping_labels() -> [&'static str; 3] {
+    ["Local path:", "Deployment path:", "Web path:"]
 }
 
 #[derive(Clone)]
@@ -541,7 +568,6 @@ fn dialog_add_server(servers: &mut Vec<RemoteServer>, root: &Path, next_number: 
     servers.push(blank);
 }
 
-
 pub struct DeployDialogWindow(pub Option<AnyWindowHandle>);
 
 impl gpui::Global for DeployDialogWindow {}
@@ -556,6 +582,7 @@ pub struct DeploymentDialog {
     panel: Option<WeakEntity<PhpPanel>>,
     ssh_config_name: String,
     ssh_menu_open: bool,
+    type_menu_open: bool,
     ssh_configs: Vec<SshEntry>,
     advanced_open: bool,
     save_password: SavePassword,
@@ -597,6 +624,7 @@ impl DeploymentDialog {
             panel: None,
             ssh_config_name: String::new(),
             ssh_menu_open: false,
+            type_menu_open: false,
             ssh_configs: Vec::new(),
             advanced_open: false,
             save_password: SavePassword::Forever,
@@ -618,8 +646,59 @@ impl DeploymentDialog {
             autodetect_seq: 0,
             _subscriptions: Vec::new(),
         };
+        let name_editor = dialog.name_editor.clone();
+        dialog.bind_validation_editor(name_editor, cx, |server, text| server.name = text);
+        let host_editor = dialog.host_editor.clone();
+        dialog.bind_validation_editor(host_editor, cx, |server, text| {
+            server.host = if text.is_empty() { None } else { Some(text) };
+        });
+        let port_editor = dialog.port_editor.clone();
+        dialog.bind_validation_editor(port_editor, cx, |server, text| {
+            server.port = if text.is_empty() { None } else { Some(text) };
+        });
+        let user_editor = dialog.user_editor.clone();
+        dialog.bind_validation_editor(user_editor, cx, |server, text| {
+            server.user = if text.is_empty() { None } else { Some(text) };
+        });
+        let remote_root_editor = dialog.remote_root_editor.clone();
+        dialog.bind_validation_editor(remote_root_editor, cx, |server, text| {
+            server.remote_root = if text.is_empty() { None } else { Some(text) };
+        });
+        let local_root_editor = dialog.local_root_editor.clone();
+        dialog.bind_validation_editor(local_root_editor, cx, |server, text| {
+            server.local_root = if text.is_empty() { None } else { Some(text) };
+        });
+        let web_url_editor = dialog.web_url_editor.clone();
+        dialog.bind_validation_editor(web_url_editor, cx, |server, text| {
+            server.web_url = if text.is_empty() { None } else { Some(text) };
+        });
         dialog.seed_from_disk(window, cx);
         dialog
+    }
+
+    fn bind_validation_editor<F>(
+        &mut self,
+        editor: Entity<Editor>,
+        cx: &mut Context<Self>,
+        update: F,
+    ) where
+        F: Fn(&mut RemoteServer, String) + 'static,
+    {
+        let subscription = cx.subscribe(&editor, move |this, editor, event, cx| {
+            if !matches!(event, EditorEvent::BufferEdited) {
+                return;
+            }
+            let text = editor.read(cx).text(cx);
+            if let Some(index) = this.selected {
+                if let Some(server) = this.servers.get_mut(index) {
+                    update(server, text);
+                }
+            }
+            this.update_next_number();
+            this.schedule_validate_soon(cx);
+            cx.notify();
+        });
+        self._subscriptions.push(subscription);
     }
 
     fn seed_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -643,7 +722,11 @@ impl DeploymentDialog {
             .map(str::to_string);
         self.selected = resolve_active_server(configured_active, configured_default, &names)
             .and_then(|name| self.servers.iter().position(|server| server.name == name))
-            .or(if self.servers.is_empty() { None } else { Some(0) });
+            .or(if self.servers.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
         if cx.has_global::<DeployShared>() {
             self.panel = cx.global::<DeployShared>().panel.clone();
         }
@@ -678,11 +761,14 @@ impl DeploymentDialog {
         set(&self.name_editor, buffer.name.clone());
         set(&self.host_editor, buffer.host.clone());
         let port = if buffer.port.is_empty() {
-            deploy_default_port(&self.protocol).unwrap_or_default().to_string()
+            deploy_default_port(&self.protocol)
+                .unwrap_or_default()
+                .to_string()
         } else {
             buffer.port.clone()
         };
-        set(&self.port_editor, port);        set(&self.user_editor, buffer.user.clone());
+        set(&self.port_editor, port);
+        set(&self.user_editor, buffer.user.clone());
         set(&self.password_editor, buffer.password.clone());
         self.save_password = if buffer.password_session {
             SavePassword::Session
@@ -695,6 +781,7 @@ impl DeploymentDialog {
             .and_then(|server| server.ssh_config.clone())
             .unwrap_or_default();
         self.ssh_menu_open = false;
+        self.type_menu_open = false;
         set(&self.remote_root_editor, buffer.remote_root.clone());
         set(&self.local_root_editor, buffer.local_root.clone());
         set(&self.web_url_editor, buffer.web_url.clone());
@@ -796,14 +883,39 @@ impl DeploymentDialog {
         cx.notify();
     }
 
-    fn cycle_deploy_type(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_type_menu(&mut self, cx: &mut Context<Self>) {
         self.apply_editors(cx);
-        self.protocol = next_deploy_type(&self.protocol).to_string();
+        self.ssh_menu_open = false;
+        self.type_menu_open = !self.type_menu_open;
+        cx.notify();
+    }
+
+    fn close_type_menu(&mut self, cx: &mut Context<Self>) {
+        self.type_menu_open = false;
+        cx.notify();
+    }
+
+    fn select_deploy_type(&mut self, protocol: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        self.type_menu_open = false;
+        let canonical = deploy_type_canonical(protocol).unwrap_or("local");
+        self.protocol = canonical.to_string();
+        let default_port = deploy_default_port(canonical)
+            .unwrap_or_default()
+            .to_string();
         if let Some(index) = self.selected {
             if let Some(server) = self.servers.get_mut(index) {
-                server.protocol = Some(self.protocol.clone());
+                server.protocol = Some(canonical.to_string());
+                server.port = if default_port.is_empty() {
+                    None
+                } else {
+                    Some(default_port.clone())
+                };
             }
         }
+        self.port_editor.update(cx, |editor, cx| {
+            editor.set_text(default_port, window, cx);
+        });
         self.message = None;
         self.autodetect_status = None;
         self.load_editors(window, cx);
@@ -831,6 +943,45 @@ impl DeploymentDialog {
         if let Some(server) = self.servers.get_mut(index) {
             server.use_rsync = !server.use_rsync;
         }
+        cx.notify();
+    }
+
+    fn toggle_sudo(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        if let Some(server) = self.servers.get_mut(index) {
+            server.use_sudo = !server.use_sudo;
+        }
+        cx.notify();
+    }
+
+    fn duplicate_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            self.message = Some(("no server selected".to_string(), Color::Error));
+            cx.notify();
+            return;
+        };
+        let Some(mut copy) = self.servers.get(index).cloned() else {
+            return;
+        };
+        let base = copy
+            .name
+            .trim_end_matches(|ch: char| ch.is_ascii_digit())
+            .to_string();
+        let (name, next_number) =
+            deploy_copy_name(&self.servers, &base, self.next_number);
+        copy.name = name;
+        self.next_number = next_number;
+        self.servers.insert(index + 1, copy);
+        self.selected = Some(index + 1);
+        self.tab = DeployTab::Connection;
+        self.message = None;
+        self.autodetect_status = None;
+        self.load_editors(window, cx);
+        self.schedule_validate(cx);
         cx.notify();
     }
 
@@ -904,29 +1055,30 @@ impl DeploymentDialog {
             .collect();
         let content = deploy_temp_config_content(&entries, &server.name);
         let picker_path = self.root.join(".zed/deploy.picker.json");
-        if let Err(error) = std::fs::create_dir_all(picker_path.parent().expect("picker config parent"))
-            .and_then(|_| {
-                std::fs::write(
-                    &picker_path,
-                    serde_json::to_string(&content).expect("serialize picker config"),
-                )
-            })
-        {
+        if let Err(error) = std::fs::create_dir_all(
+            picker_path.parent().expect("picker config parent"),
+        )
+        .and_then(|_| {
+            std::fs::write(
+                &picker_path,
+                serde_json::to_string(&content).expect("serialize picker config"),
+            )
+        }) {
             self.message = Some((format!("cannot write picker config: {error}"), Color::Error));
             cx.notify();
             return;
         }
-        let local_base = match deploy_type_canonical(&server.protocol.clone().unwrap_or_default())
-        {
+        let local_base = match deploy_type_canonical(&server.protocol.clone().unwrap_or_default()) {
             Some("local") => Some(match server.local_root.as_deref() {
                 Some(local) if !local.trim().is_empty() => self.root.join(local.trim()),
                 _ => self.root.clone(),
             }),
             _ => None,
         };
-        let host_display = server.host.clone().unwrap_or_else(|| {
-            local_base_display(&local_base, &self.root)
-        });
+        let host_display = server
+            .host
+            .clone()
+            .unwrap_or_else(|| local_base_display(&local_base, &self.root));
         let title = format!("Choose Root Path on {} ({})", server.name, host_display);
         open_root_picker_window(
             self.root.clone(),
@@ -967,16 +1119,11 @@ impl DeploymentDialog {
         let keep_alive_enabled = selected.is_some_and(|server| server.keep_alive_enabled);
         let mut rows: Vec<AnyElement> = Vec::new();
         rows.push(
-            dialog_toggle_row(
-                "deploy-advanced-passive",
-                passive,
-                "Passive mode",
-                cx,
-            )
-            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                this.toggle_advanced_flag(|server| &mut server.passive_mode, cx);
-            }))
-            .into_any_element(),
+            dialog_toggle_row("deploy-advanced-passive", passive, "Passive mode", cx)
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.toggle_advanced_flag(|server| &mut server.passive_mode, cx);
+                }))
+                .into_any_element(),
         );
         rows.push(
             dialog_toggle_row(
@@ -990,42 +1137,40 @@ impl DeploymentDialog {
             }))
             .into_any_element(),
         );
-        rows.push(
-            dialog_row(
-                "Use LIST command:",
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        dialog_toggle_with(
-                            "deploy-advanced-list-compat",
-                            list_compat,
-                            "Compatible with old version...",
-                            None,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.toggle_advanced_flag(|server| &mut server.list_compat, cx);
-                        }))
-                        .into_any_element(),
+        rows.push(dialog_row(
+            "Use LIST command:",
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    dialog_toggle_with(
+                        "deploy-advanced-list-compat",
+                        list_compat,
+                        "Compatible with old version...",
+                        None,
+                        cx,
                     )
-                    .child(
-                        dialog_toggle_with(
-                            "deploy-advanced-mlsd",
-                            use_mlsd,
-                            "Instead of MLSD",
-                            None,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.toggle_advanced_flag(|server| &mut server.use_mlsd, cx);
-                        }))
-                        .into_any_element(),
-                    ),
-            ),
-        );
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_advanced_flag(|server| &mut server.list_compat, cx);
+                    }))
+                    .into_any_element(),
+                )
+                .child(
+                    dialog_toggle_with(
+                        "deploy-advanced-mlsd",
+                        use_mlsd,
+                        "Instead of MLSD",
+                        None,
+                        cx,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_advanced_flag(|server| &mut server.use_mlsd, cx);
+                    }))
+                    .into_any_element(),
+                ),
+        ));
         rows.push(dialog_row(
             "Number of connections:",
             dialog_editor(
@@ -1151,7 +1296,8 @@ impl DeploymentDialog {
         open_ssh_configs_window(self.root.clone(), cx);
     }
 
-    fn run_autodetect(&mut self, window: &mut Window, cx: &mut Context<Self>) {        let Some(selected) = self.selected else {
+    fn run_autodetect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected else {
             return;
         };
         self.apply_editors(cx);
@@ -1170,8 +1316,14 @@ impl DeploymentDialog {
         let _ = resolve_ssh_into(&mut entry, &configs);
         let content = deploy_temp_config_content(&[entry], &name);
         let autodetect_path = root.join(".zed/deploy.autodetect.json");
-        if std::fs::write(&autodetect_path, serde_json::to_string(&content).expect("serialize autodetect config")).is_err() {
-            self.autodetect_status = Some(("cannot write autodetect config".to_string(), Color::Error));
+        if std::fs::write(
+            &autodetect_path,
+            serde_json::to_string(&content).expect("serialize autodetect config"),
+        )
+        .is_err()
+        {
+            self.autodetect_status =
+                Some(("cannot write autodetect config".to_string(), Color::Error));
             cx.notify();
             return;
         }
@@ -1222,6 +1374,24 @@ impl DeploymentDialog {
         .detach();
     }
 
+    fn schedule_validate_soon(&mut self, cx: &mut Context<Self>) {
+        self.validate_seq += 1;
+        let seq = self.validate_seq;
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(220))
+                .await;
+            weak.update(cx, |dialog, cx| {
+                if dialog.validate_seq == seq {
+                    dialog.schedule_validate(cx);
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     fn schedule_validate(&mut self, cx: &mut Context<Self>) {
         self.validate_seq += 1;
         let seq = self.validate_seq;
@@ -1253,13 +1423,14 @@ impl DeploymentDialog {
             .collect::<Vec<_>>();
         let content = deploy_temp_config_content(&entries, &active.name);
         let validate_path = self.root.join(".zed/deploy.validate.json");
-        let written = std::fs::create_dir_all(validate_path.parent().expect("validate config parent"))
-            .and_then(|_| {
-                std::fs::write(
-                    &validate_path,
-                    serde_json::to_string(&content).expect("serialize validate config"),
-                )
-            });
+        let written =
+            std::fs::create_dir_all(validate_path.parent().expect("validate config parent"))
+                .and_then(|_| {
+                    std::fs::write(
+                        &validate_path,
+                        serde_json::to_string(&content).expect("serialize validate config"),
+                    )
+                });
         self.validate_warnings = Vec::new();
         if written.is_err() {
             return;
@@ -1382,13 +1553,12 @@ impl DeploymentDialog {
             .iter()
             .map(|server| server.name.clone())
             .collect::<Vec<_>>();
-        let configured = read_json(&self.root.join(".zed/deploy.json"))
-            .and_then(|config| {
-                config
-                    .get("active")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
+        let configured = read_json(&self.root.join(".zed/deploy.json")).and_then(|config| {
+            config
+                .get("active")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
         let active = configured
             .filter(|name| names.iter().any(|known| known == name))
             .or_else(|| names.first().cloned());
@@ -1452,7 +1622,7 @@ fn dialog_text_style(cx: &App) -> TextStyle {
         font_family: font.family.clone(),
         font_features: font.features.clone(),
         font_fallbacks: font.fallbacks.clone(),
-        font_size: rems(0.75).into(),
+        font_size: rems(1.0).into(),
         font_weight: font.weight,
         line_height: relative(1.3),
         ..TextStyle::default()
@@ -1469,13 +1639,15 @@ fn dialog_editor_element(editor: &Entity<Editor>, cx: &App) -> AnyElement {
     EditorElement::new(editor, style).into_any_element()
 }
 
-const DIALOG_LABEL_WIDTH: Pixels = px(110.);
-const DIALOG_ROW_HEIGHT: Pixels = px(27.);
-const DIALOG_CONTROL_HEIGHT: Pixels = px(24.);
-const DIALOG_CONTROL_INDENT: Pixels = px(126.);
+const DIALOG_LABEL_WIDTH: Pixels = px(148.);
+const DIALOG_ROW_HEIGHT: Pixels = px(29.);
+const DIALOG_CONTROL_HEIGHT: Pixels = px(26.);
+const DIALOG_CONTROL_INDENT: Pixels = px(164.);
 
 fn dialog_label(label: impl Into<SharedString>) -> Label {
-    Label::new(label).size(LabelSize::Small).color(Color::Muted)
+    Label::new(label)
+        .size(LabelSize::Custom(rems(1.0)))
+        .color(Color::Muted)
 }
 
 fn dialog_row(label: &'static str, control: impl IntoElement) -> AnyElement {
@@ -1528,7 +1700,13 @@ fn dialog_editor(
         .rounded_xs()
         .px_2()
         .cursor_text()
-        .child(dialog_editor_element(editor, cx));
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(dialog_editor_element(editor, cx)),
+        );
     if let Some(width) = width {
         box_div = box_div.flex_none().w(width);
     } else {
@@ -1544,7 +1722,7 @@ fn dialog_static(text: impl Into<SharedString>, color: Color) -> AnyElement {
         .py_0p5()
         .child(
             Label::new(text)
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Custom(rems(1.0)))
                 .color(color)
                 .truncate(),
         )
@@ -1559,7 +1737,7 @@ fn dialog_section_header(text: &'static str) -> AnyElement {
         .py_2()
         .child(
             Label::new(text)
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Custom(rems(1.0)))
                 .color(Color::Muted),
         )
         .into_any_element()
@@ -1603,13 +1781,17 @@ fn dialog_toggle_with(
         .hover(|style| style.bg(cx.theme().colors().element_hover))
         .child(
             Label::new(if checked { "[x]" } else { "[ ]" })
-                .size(LabelSize::Small)
+                .size(LabelSize::Custom(rems(1.0)))
                 .color(if checked { Color::Accent } else { Color::Muted }),
         )
         .child(
             Label::new(label)
-                .size(LabelSize::Small)
-                .color(if checked { Color::Default } else { Color::Muted }),
+                .size(LabelSize::Custom(rems(1.0)))
+                .color(if checked {
+                    Color::Default
+                } else {
+                    Color::Muted
+                }),
         )
         .when_some(trailing, |this, trailing| this.child(trailing))
 }
@@ -1635,13 +1817,11 @@ fn dialog_button(
             button = button.style(ButtonStyle::Subtle);
         }
         DialogButtonVariant::Link => {
-            button = button
-                .style(ButtonStyle::Subtle)
-                .color(Color::Muted);
+            button = button.style(ButtonStyle::Subtle).color(Color::Muted);
         }
     }
     button
-        .label_size(LabelSize::Small)
+        .label_size(LabelSize::Custom(rems(0.93)))
         .size(ButtonSize::Default)
         .truncate(true)
 }
@@ -1670,14 +1850,12 @@ impl Render for DeploymentDialog {
         let mut server_rows = Vec::new();
         for (index, server) in self.servers.iter().enumerate() {
             let is_selected = self.selected == Some(index);
-            let badge = deploy_type_badge_short(
-                server.protocol.as_deref().unwrap_or("server"),
-            );
+            let badge = deploy_type_badge_short(server.protocol.as_deref().unwrap_or("server"));
             let name_element: AnyElement = if is_selected {
                 dialog_editor("deploy-name-editor", &self.name_editor, None, window, cx)
             } else {
                 Label::new(server.name.clone())
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Custom(rems(0.93)))
                     .color(if !server.visible {
                         Color::Muted
                     } else {
@@ -1699,7 +1877,11 @@ impl Render for DeploymentDialog {
                     .cursor_pointer()
                     .when(is_selected, |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .child(driver_badge(badge, deploy_type_badge_color(server.protocol.as_deref().unwrap_or("server")), cx))
+                    .child(driver_badge(
+                        badge,
+                        deploy_type_badge_color(server.protocol.as_deref().unwrap_or("server")),
+                        cx,
+                    ))
                     .child(name_element)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.select_server(index, window, cx);
@@ -1712,7 +1894,11 @@ impl Render for DeploymentDialog {
         }
 
         let mut tab_rows = Vec::new();
-        for tab in [DeployTab::Connection, DeployTab::Mappings, DeployTab::Excluded] {
+        for tab in [
+            DeployTab::Connection,
+            DeployTab::Mappings,
+            DeployTab::Excluded,
+        ] {
             let selected = tab == self.tab;
             tab_rows.push(
                 h_flex()
@@ -1726,7 +1912,7 @@ impl Render for DeploymentDialog {
                     })
                     .child(
                         Label::new(tab.label())
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(rems(1.0)))
                             .color(if selected {
                                 Color::Default
                             } else {
@@ -1740,30 +1926,36 @@ impl Render for DeploymentDialog {
             );
         }
 
-        let type_button = h_flex()
-            .flex_none()
+        let type_picker = h_flex()
+            .id("deploy-type-picker")
+            .flex_1()
+            .min_w_0()
             .items_center()
-            .gap_1()
+            .gap_2()
+            .px_1()
+            .py_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.element_hover))
             .child(dialog_badge(
                 deploy_type_badge_short(&protocol),
                 deploy_type_badge_color(&protocol),
                 cx,
             ))
             .child(
-                dialog_button(
-                    "deploy-type",
-                    deploy_type_display_name(&protocol),
-                    DialogButtonVariant::Secondary,
-                )
-                .end_icon(
-                    Icon::new(IconName::ChevronDown)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.cycle_deploy_type(window, cx);
-                })),
+                Label::new(deploy_type_display_name(&protocol))
+                    .size(LabelSize::Custom(rems(1.0)))
+                    .truncate(),
             )
+            .child(div().flex_1().min_w_0())
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_type_menu(cx);
+            }))
             .into_any_element();
 
         let visible_state = self
@@ -1771,38 +1963,21 @@ impl Render for DeploymentDialog {
             .and_then(|index| self.servers.get(index))
             .map(|server| server.visible)
             .unwrap_or(true);
-        let visible_button = dialog_button(
-            "deploy-visible",
-            if visible_state {
-                "visible only for this project"
-            } else {
-                "global"
-            },
-            DialogButtonVariant::Secondary,
-        )
-        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-            this.toggle_visible(cx);
-        }));
 
         let rsync_state = self
             .selected
             .and_then(|index| self.servers.get(index))
             .map(|server| server.use_rsync)
             .unwrap_or(false);
-        let anonymous_state = self
-            .user_editor
-            .read(cx)
-            .text(cx)
-            .trim()
-            .eq("anonymous");
+        let sudo_state = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.use_sudo)
+            .unwrap_or(false);
+        let anonymous_state = self.user_editor.read(cx).text(cx).trim().eq("anonymous");
 
         let local_folder_empty = deploy_type_canonical(&protocol) == Some("local")
-            && self
-                .local_root_editor
-                .read(cx)
-                .text(cx)
-                .trim()
-                .is_empty();
+            && self.local_root_editor.read(cx).text(cx).trim().is_empty();
 
         let mut connection_rows: Vec<AnyElement> = Vec::new();
         for field in deploy_connection_fields(&protocol) {
@@ -1925,28 +2100,56 @@ impl Render for DeploymentDialog {
                         .children(rows)
                         .into_any_element()
                 }
-                DeployField::Host => dialog_row(
+                DeployField::HostPort => dialog_row(
                     "Host:",
-                    dialog_editor("deploy-host-editor", &self.host_editor, None, window, cx),
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(dialog_editor(
+                            "deploy-host-editor",
+                            &self.host_editor,
+                            None,
+                            window,
+                            cx,
+                        ))
+                        .child(dialog_label("Port:"))
+                        .child(dialog_editor(
+                            "deploy-port-editor",
+                            &self.port_editor,
+                            Some(px(64.)),
+                            window,
+                            cx,
+                        )),
                 ),
-                DeployField::Port => dialog_row(
-                    "Port:",
-                    dialog_editor("deploy-port-editor", &self.port_editor, Some(px(60.)), window, cx),
-                ),
-                DeployField::User => dialog_row(
+                DeployField::UserAnonymous => dialog_row(
                     "Username:",
-                    dialog_editor("deploy-user-editor", &self.user_editor, None, window, cx),
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(dialog_editor(
+                            "deploy-user-editor",
+                            &self.user_editor,
+                            None,
+                            window,
+                            cx,
+                        ))
+                        .child(
+                            dialog_toggle_row(
+                                "deploy-anon",
+                                anonymous_state,
+                                "Login as anonymous",
+                                cx,
+                            )
+                            .flex_none()
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.toggle_anonymous(window, cx);
+                            })),
+                        ),
                 ),
-                DeployField::AnonToggle => dialog_toggle_row(
-                    "deploy-anon",
-                    anonymous_state,
-                    "Login as anonymous",
-                    cx,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.toggle_anonymous(window, cx);
-                }))
-                .into_any_element(),
                 DeployField::Password => h_flex()
                     .w_full()
                     .flex_none()
@@ -1968,22 +2171,12 @@ impl Render for DeploymentDialog {
                             .items_center()
                             .gap_2()
                             .pl(DIALOG_CONTROL_INDENT)
-                            .child(
-                                dialog_button(
-                                    "deploy-save-password",
-                                    format!("Save: {}", self.save_password.label()),
-                                    DialogButtonVariant::Secondary,
-                                )
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.cycle_save_password(cx);
-                                })),
-                            )
                             .child(dialog_static(self.save_password.hint(), Color::Muted))
                             .child(
                                 dialog_button(
                                     "deploy-reset-password",
                                     "Reset",
-                                    DialogButtonVariant::Secondary,
+                                    DialogButtonVariant::Link,
                                 )
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.reset_password(window, cx);
@@ -1993,13 +2186,28 @@ impl Render for DeploymentDialog {
                     .into_any_element(),
                 DeployField::Folder => dialog_row(
                     "Folder:",
-                    dialog_editor(
-                        "deploy-local-root-editor",
-                        &self.local_root_editor,
-                        None,
-                        window,
-                        cx,
-                    ),
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(dialog_editor(
+                            "deploy-local-root-editor",
+                            &self.local_root_editor,
+                            None,
+                            window,
+                            cx,
+                        ))
+                        .child(
+                            IconButton::new("dp-local-browse", IconName::Folder)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Choose folder"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.open_root_picker(cx);
+                                })),
+                        ),
                 ),
                 DeployField::RootPath => h_flex()
                     .w_full()
@@ -2033,6 +2241,15 @@ impl Render for DeploymentDialog {
                                     )),
                             )
                             .child(
+                                IconButton::new("dp-root-help", IconName::CircleHelp)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(
+                                        "The deployment root is the server path that mirrors the local project root",
+                                    )),
+                            )
+                            .child(
                                 dialog_button(
                                     "deploy-autodetect",
                                     "Autodetect",
@@ -2051,7 +2268,23 @@ impl Render for DeploymentDialog {
                     .into_any_element(),
                 DeployField::WebUrl => dialog_row(
                     "Web server URL:",
-                    dialog_editor("deploy-url-editor", &self.web_url_editor, None, window, cx),
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(dialog_editor(
+                            "deploy-url-editor",
+                            &self.web_url_editor,
+                            None,
+                            window,
+                            cx,
+                        ))
+                        .child(
+                            Icon::new(IconName::Public)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        ),
                 ),
                 DeployField::TestConnection => {
                     let test_button = dialog_button(
@@ -2088,18 +2321,70 @@ impl Render for DeploymentDialog {
                             .into_any_element(),
                     }
                 }
-                DeployField::RsyncToggle => dialog_toggle_row(
-                    "deploy-rsync",
-                    rsync_state,
-                    "Use rsync for download/upload/sync",
+                DeployField::RsyncToggle => h_flex()
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        dialog_toggle_row(
+                            "deploy-rsync",
+                            rsync_state,
+                            "Use rsync for download/upload/sync",
+                            cx,
+                        )
+                        .flex_none()
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_rsync(cx);
+                        })),
+                    )
+                    .child(
+                        Button::new("deploy-rsync-settings", "Rsync Settings")
+                            .style(ButtonStyle::Subtle)
+                            .color(Color::Accent)
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text("rsync uses ssh defaults")),
+                    )
+                    .into_any_element(),
+                DeployField::SudoToggle => dialog_toggle_row(
+                    "deploy-sudo",
+                    sudo_state,
+                    "Use sudo to run SFTP server",
                     cx,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                    this.toggle_rsync(cx);
+                    this.toggle_sudo(cx);
                 }))
                 .into_any_element(),
             });
         }
+
+        let selected_name = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.name.clone());
+        let selected_warnings: Vec<String> = self
+            .validate_warnings
+            .iter()
+            .filter(|(name, _)| name.is_empty() || Some(name) == selected_name.as_ref())
+            .flat_map(|(_, warnings)| warnings.iter().cloned())
+            .collect();
+        let warning_lines = selected_warnings
+            .iter()
+            .map(|warning| {
+                h_flex()
+                    .flex_none()
+                    .px_1()
+                    .py_0p5()
+                    .child(
+                        Label::new(format!("⚠ {warning}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning)
+                            .truncate(),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
 
         let tab_content: AnyElement = match self.tab {
             DeployTab::Connection => v_flex()
@@ -2107,51 +2392,114 @@ impl Render for DeploymentDialog {
                 .w_full()
                 .children({
                     let mut rows: Vec<AnyElement> = Vec::new();
-                    rows.push(dialog_row(
-                        "Type:",
-                        type_button,
-                    ));
-                    rows.push(dialog_row(
-                        "Visibility:",
-                        visible_button,
-                    ));
-                    rows.extend(connection_rows);
                     rows.push(
-                        h_flex()
-                            .id("deploy-advanced-toggle")
-                            .w_full()
-                            .flex_none()
-                            .items_center()
-                            .gap_1()
-                            .px_1()
-                            .py_0p5()
-                            .min_h(px(24.))
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(cx.theme().colors().element_hover))
-                            .child(
-                                Label::new(if self.advanced_open {
-                                    "▾ Advanced"
-                                } else {
-                                    "▸ Advanced"
-                                })
-                                .size(LabelSize::Small)
-                                .color(Color::Default),
-                            )
-                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                this.toggle_advanced(cx);
-                            }))
-                            .into_any_element(),
+                        dialog_toggle_row(
+                            "deploy-visible",
+                            visible_state,
+                            "Visible only for this project",
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_visible(cx);
+                        }))
+                        .into_any_element(),
                     );
-                    if self.advanced_open {
-                        if deploy_type_has_advanced(&self.protocol) {
+                    rows.push(dialog_row("Type:", type_picker));
+                    if self.type_menu_open {
+                        let mut menu_rows = Vec::new();
+                        for (menu_index, (canonical, label)) in
+                            deploy_type_options().iter().enumerate()
+                        {
+                            let is_current = *canonical == protocol;
+                            menu_rows.push(
+                                h_flex()
+                                    .id(("deploy-type-row", menu_index))
+                                    .w_full()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .when(is_current, |this| this.bg(colors.element_selected))
+                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                    .child(dialog_badge(
+                                        deploy_type_badge_short(canonical),
+                                        deploy_type_badge_color(canonical),
+                                        cx,
+                                    ))
+                                    .child(
+                                        Label::new(*label)
+                                            .size(LabelSize::Custom(rems(1.0)))
+                                            .color(if is_current {
+                                                Color::Accent
+                                            } else {
+                                                Color::Default
+                                            })
+                                            .truncate(),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.select_deploy_type(canonical, window, cx);
+                                        },
+                                    ))
+                                    .into_any_element(),
+                            );
+                        }
+                        rows.push(
+                            v_flex()
+                                .id("deploy-type-menu")
+                                .w_full()
+                                .flex_none()
+                                .gap_0p5()
+                                .px_1()
+                                .py_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.elevated_surface_background)
+                                .shadow_sm()
+                                .children(menu_rows)
+                                .into_any_element(),
+                        );
+                    }
+                    rows.extend(connection_rows);
+                    rows.extend(warning_lines);
+                    if deploy_type_has_advanced(&self.protocol) {
+                        rows.push(
+                            h_flex()
+                                .id("deploy-advanced-toggle")
+                                .w_full()
+                                .flex_none()
+                                .items_center()
+                                .gap_1()
+                                .px_1()
+                                .py_0p5()
+                                .min_h(px(24.))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .child(
+                                    Label::new(if self.advanced_open {
+                                        "▾ Advanced"
+                                    } else {
+                                        "▸ Advanced"
+                                    })
+                                    .size(LabelSize::Custom(rems(1.0)))
+                                    .color(Color::Default),
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.toggle_advanced(cx);
+                                }))
+                                .into_any_element(),
+                        );
+                        if self.advanced_open {
                             let selected = self
                                 .selected
                                 .and_then(|index| self.servers.get(index))
                                 .cloned();
                             rows.extend(self.render_advanced_rows(selected.as_ref(), window, cx));
-                        } else {
-                            rows.push(dialog_static("advanced: none", Color::Muted));
                         }
                     }
                     rows
@@ -2160,38 +2508,41 @@ impl Render for DeploymentDialog {
             DeployTab::Mappings => v_flex()
                 .id("deploy-tab-mappings")
                 .w_full()
-                .children(vec![
-                    dialog_row(
-                        "Local path:",
-                        dialog_editor(
-                            "deploy-local-root-editor",
-                            &self.local_root_editor,
-                            None,
-                            window,
-                            cx,
+                .children({
+                    let [local_label, deploy_label, web_label] = deploy_mapping_labels();
+                    vec![
+                        dialog_row(
+                            local_label,
+                            dialog_editor(
+                                "deploy-local-root-editor",
+                                &self.local_root_editor,
+                                None,
+                                window,
+                                cx,
+                            ),
                         ),
-                    ),
-                    dialog_row(
-                        "Deployment path:",
-                        dialog_editor(
-                            "deploy-deploy-path-editor",
-                            &self.remote_root_editor,
-                            None,
-                            window,
-                            cx,
+                        dialog_row(
+                            deploy_label,
+                            dialog_editor(
+                                "deploy-deploy-path-editor",
+                                &self.remote_root_editor,
+                                None,
+                                window,
+                                cx,
+                            ),
                         ),
-                    ),
-                    dialog_row(
-                        "Web path:",
-                        dialog_editor(
-                            "deploy-web-path-editor",
-                            &self.web_url_editor,
-                            None,
-                            window,
-                            cx,
+                        dialog_row(
+                            web_label,
+                            dialog_editor(
+                                "deploy-web-path-editor",
+                                &self.web_url_editor,
+                                None,
+                                window,
+                                cx,
+                            ),
                         ),
-                    ),
-                ])
+                    ]
+                })
                 .into_any_element(),
             DeployTab::Excluded => v_flex()
                 .id("deploy-tab-excluded")
@@ -2218,36 +2569,12 @@ impl Render for DeploymentDialog {
                 .py_1()
                 .child(
                     Label::new(text.clone())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(rems(1.0)))
                         .color(*color)
                         .truncate(),
                 )
-                    .into_any_element()
+                .into_any_element()
         });
-
-        let selected_name = self
-            .selected
-            .and_then(|index| self.servers.get(index))
-            .map(|server| server.name.clone());
-        let warning_lines = self
-            .validate_warnings
-            .iter()
-            .filter(|(name, _)| name.is_empty() || Some(name) == selected_name.as_ref())
-            .flat_map(|(_, warnings)| warnings.iter())
-            .map(|warning| {
-                h_flex()
-                    .flex_none()
-                    .px_3()
-                    .py_0p5()
-                    .child(
-                        Label::new(warning.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Warning)
-                            .truncate(),
-                    )
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
 
         v_flex()
             .id("deploy-dialog")
@@ -2256,6 +2583,14 @@ impl Render for DeploymentDialog {
             .text_ui(cx)
             .on_action(cx.listener(|this, _: &editor_actions::Cancel, window, cx| {
                 this.cancel(window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "escape" && (this.type_menu_open || this.ssh_menu_open) {
+                    this.type_menu_open = false;
+                    this.ssh_menu_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
             }))
             .child(
                 h_flex()
@@ -2266,7 +2601,7 @@ impl Render for DeploymentDialog {
                     .py_2()
                     .child(
                         Label::new("Deployment")
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(rems(1.0)))
                             .color(Color::Default),
                     )
                     .child(
@@ -2287,7 +2622,7 @@ impl Render for DeploymentDialog {
                     .border_color(colors.border)
                     .child(
                         v_flex()
-                            .w(px(150.))
+                            .w(px(195.))
                             .flex_none()
                             .h_full()
                             .border_r_1()
@@ -2296,7 +2631,6 @@ impl Render for DeploymentDialog {
                                 h_flex()
                                     .flex_none()
                                     .items_center()
-                                    .justify_end()
                                     .gap_0p5()
                                     .px_1()
                                     .py_1()
@@ -2304,6 +2638,7 @@ impl Render for DeploymentDialog {
                                         IconButton::new("deploy-add", IconName::Plus)
                                             .shape(IconButtonShape::Square)
                                             .icon_size(IconSize::XSmall)
+                                            .tooltip(Tooltip::text("Add server"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
                                                     this.add_server(window, cx);
@@ -2314,9 +2649,32 @@ impl Render for DeploymentDialog {
                                         IconButton::new("deploy-remove", IconName::SquareMinus)
                                             .shape(IconButtonShape::Square)
                                             .icon_size(IconSize::XSmall)
+                                            .tooltip(Tooltip::text("Remove server"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
                                                     this.remove_server(window, cx);
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        IconButton::new("deploy-copy", IconName::Copy)
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::XSmall)
+                                            .tooltip(Tooltip::text("Duplicate server"))
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.duplicate_server(window, cx);
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        IconButton::new("deploy-check", IconName::Check)
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::XSmall)
+                                            .tooltip(Tooltip::text("Validate configuration"))
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _window, cx| {
+                                                    this.schedule_validate(cx);
                                                 },
                                             )),
                                     ),
@@ -2328,6 +2686,28 @@ impl Render for DeploymentDialog {
                                     .min_h_0()
                                     .overflow_y_scroll()
                                     .children(server_rows),
+                            )
+                            .child(
+                                v_flex()
+                                    .id("deploy-problems")
+                                    .flex_none()
+                                    .max_h(px(120.))
+                                    .border_t_1()
+                                    .border_color(colors.border)
+                                    .px_1()
+                                    .py_1()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new("Problems")
+                                            .size(LabelSize::Custom(rems(1.0)))
+                                            .color(Color::Muted),
+                                    )
+                                    .children(selected_warnings.iter().map(|warning| {
+                                        Label::new(format!("⚠ {warning}"))
+                                            .size(LabelSize::Custom(rems(1.0)))
+                                            .color(Color::Warning)
+                                            .into_any_element()
+                                    })),
                             ),
                     )
                     .child(
@@ -2356,31 +2736,44 @@ impl Render for DeploymentDialog {
                     ),
             )
             .children(message_line)
-            .children(warning_lines)
             .child(
                 h_flex()
                     .flex_none()
                     .items_center()
-                    .justify_end()
+                    .justify_between()
                     .gap_2()
                     .px_3()
                     .py_2()
                     .child(
-                        dialog_button(
-                            "deploy-cancel",
-                            "Cancel",
-                            DialogButtonVariant::Secondary,
-                        )
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.cancel(window, cx);
-                        })),
+                        IconButton::new("deploy-help", IconName::CircleHelp)
+                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Deployment help")),
                     )
                     .child(
-                        dialog_button("deploy-ok", "OK", DialogButtonVariant::Primary).on_click(
-                            cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.confirm(window, cx);
-                            }),
-                        ),
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                dialog_button(
+                                    "deploy-cancel",
+                                    "Cancel",
+                                    DialogButtonVariant::Secondary,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, window, cx| {
+                                        this.cancel(window, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                dialog_button("deploy-ok", "OK", DialogButtonVariant::Primary)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.confirm(window, cx);
+                                    })),
+                            ),
                     ),
             )
     }
@@ -2443,7 +2836,7 @@ pub fn open_deployment_window(root: PathBuf, cx: &mut App) {
         cx.global_mut::<DeployDialogWindow>().0 = None;
     }
 
-    let window_bounds = WindowBounds::centered(size(px(660.), px(460.)), cx);
+    let window_bounds = WindowBounds::centered(size(px(660.), px(470.)), cx);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -2465,6 +2858,17 @@ pub fn open_deployment_window(root: PathBuf, cx: &mut App) {
         .log_err();
     if let Some(handle) = handle {
         cx.global_mut::<DeployDialogWindow>().0 = Some(handle.into());
+    }
+}
+
+fn deploy_copy_name(servers: &[RemoteServer], base: &str, start: usize) -> (String, usize) {
+    let mut number = start.max(1);
+    loop {
+        let candidate = format!("{base}{number}");
+        if !servers.iter().any(|server| server.name == candidate) {
+            return (candidate, number + 1);
+        }
+        number += 1;
     }
 }
 
@@ -2605,9 +3009,15 @@ fn parse_data_source(value: &Value, root: &Path) -> Option<DataSource> {
         Some(Value::String(port)) => port.clone(),
         _ => String::new(),
     };
-    source.read_only = value.get("read_only").and_then(Value::as_bool).unwrap_or(false);
+    source.read_only = value
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if let Some(tunnel) = value.get("ssh_tunnel") {
-        source.ssh_enabled = tunnel.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        source.ssh_enabled = tunnel
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         source.ssh_name = string_field(tunnel, "name").unwrap_or_default();
         source.ssh_host = string_field(tunnel, "host").unwrap_or_default();
         source.ssh_user = string_field(tunnel, "user").unwrap_or_default();
@@ -2790,7 +3200,10 @@ fn save_data_sources(root: &Path, sources: &[DataSource]) -> std::result::Result
         if let Err(message) = resolve_ssh_tunnel_into(&mut merged, &ssh_configs) {
             return Err(format!("{}: {}", source.name.trim(), message));
         }
-        let merged = match merged { Value::Object(map) => map, _ => serde_json::Map::new() };
+        let merged = match merged {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
         connections.push(Value::Object(merged));
     }
     config.insert("connections".to_string(), Value::Array(connections));
@@ -2967,7 +3380,10 @@ fn ssh_store_entry(config: &SshEntry) -> Value {
         Value::String(config.host.trim().to_string()),
     );
     entry.insert("port".to_string(), Value::from(ssh_entry_port(config)));
-    entry.insert("auth".to_string(), Value::String(config.auth.key().to_string()));
+    entry.insert(
+        "auth".to_string(),
+        Value::String(config.auth.key().to_string()),
+    );
     if !config.password.is_empty() && !config.password_session {
         entry.insert(
             "password".to_string(),
@@ -3049,21 +3465,18 @@ fn save_ssh_configs(root: &Path, configs: &[SshEntry]) -> std::result::Result<()
 fn unique_ssh_config_name(base: &str, configs: &[SshEntry]) -> String {
     let mut name = base.to_string();
     let mut index = 0usize;
-    while configs
-        .iter()
-        .any(|config| config.name.trim() == name)
-    {
+    while configs.iter().any(|config| config.name.trim() == name) {
         index += 1;
         name = format!("{base} ({index})");
     }
     name
 }
 
-fn ssh_apply_auth_to_tunnel(
-    tunnel: &mut serde_json::Map<String, Value>,
-    config: &SshEntry,
-) {
-    tunnel.insert("auth".to_string(), Value::String(config.auth.key().to_string()));
+fn ssh_apply_auth_to_tunnel(tunnel: &mut serde_json::Map<String, Value>, config: &SshEntry) {
+    tunnel.insert(
+        "auth".to_string(),
+        Value::String(config.auth.key().to_string()),
+    );
     if !config.password.is_empty() {
         tunnel.insert(
             "password".to_string(),
@@ -3083,10 +3496,7 @@ fn ssh_apply_auth_to_tunnel(
     tunnel.insert("keep_alive".to_string(), Value::from(config.keep_alive));
 }
 
-fn ssh_apply_auth_to_server(
-    server: &mut serde_json::Map<String, Value>,
-    config: &SshEntry,
-) {
+fn ssh_apply_auth_to_server(server: &mut serde_json::Map<String, Value>, config: &SshEntry) {
     server.insert(
         "ssh_auth".to_string(),
         Value::String(config.auth.key().to_string()),
@@ -3107,16 +3517,10 @@ fn ssh_apply_auth_to_server(
         "ssh_strict_host_key".to_string(),
         Value::Bool(config.strict_host_key),
     );
-    server.insert(
-        "ssh_keep_alive".to_string(),
-        Value::from(config.keep_alive),
-    );
+    server.insert("ssh_keep_alive".to_string(), Value::from(config.keep_alive));
 }
 
-fn resolve_ssh_into(
-    server: &mut Value,
-    configs: &[SshEntry],
-) -> std::result::Result<(), String> {
+fn resolve_ssh_into(server: &mut Value, configs: &[SshEntry]) -> std::result::Result<(), String> {
     let Some(name) = string_field(server, "ssh_config").filter(|name| !name.is_empty()) else {
         return Ok(());
     };
@@ -3126,8 +3530,14 @@ fn resolve_ssh_into(
     let Some(map) = server.as_object_mut() else {
         return Ok(());
     };
-    map.insert("host".to_string(), Value::String(config.host.trim().to_string()));
-    map.insert("user".to_string(), Value::String(config.user.trim().to_string()));
+    map.insert(
+        "host".to_string(),
+        Value::String(config.host.trim().to_string()),
+    );
+    map.insert(
+        "user".to_string(),
+        Value::String(config.user.trim().to_string()),
+    );
     map.insert("port".to_string(), Value::from(ssh_entry_port(config)));
     ssh_apply_auth_to_server(map, config);
     Ok(())
@@ -3140,7 +3550,10 @@ fn resolve_ssh_tunnel_into(
     let Some(Value::Object(tunnel)) = connection.get_mut("ssh_tunnel") else {
         return Ok(());
     };
-    let enabled = tunnel.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    let enabled = tunnel
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if !enabled {
         return Ok(());
     }
@@ -3159,8 +3572,14 @@ fn resolve_ssh_tunnel_into(
     // the marker is transient: php-db denies unknown fields, so strip it now
     // that the resolved host/user/port/auth keys carry the connection data
     tunnel.remove("name");
-    tunnel.insert("host".to_string(), Value::String(config.host.trim().to_string()));
-    tunnel.insert("user".to_string(), Value::String(config.user.trim().to_string()));
+    tunnel.insert(
+        "host".to_string(),
+        Value::String(config.host.trim().to_string()),
+    );
+    tunnel.insert(
+        "user".to_string(),
+        Value::String(config.user.trim().to_string()),
+    );
     tunnel.insert("port".to_string(), Value::from(ssh_entry_port(config)));
     ssh_apply_auth_to_tunnel(tunnel, config);
     Ok(())
@@ -3441,18 +3860,15 @@ impl DataSourcesDialog {
         set(&self.ssh_local_port_editor, source.ssh_local_port.clone());
         self.ssh_local_port_editor.update(cx, |editor, cx| {
             editor.set_placeholder_text("<Dynamic>", window, cx);
-        });        self.advanced_rows = source
+        });
+        self.advanced_rows = source
             .options
             .iter()
             .map(|(key, value)| {
                 let key_editor = cx.new(|cx| Editor::single_line(window, cx));
-                key_editor.update(cx, |editor, cx| {
-                    editor.set_text(key.clone(), window, cx)
-                });
+                key_editor.update(cx, |editor, cx| editor.set_text(key.clone(), window, cx));
                 let value_editor = cx.new(|cx| Editor::single_line(window, cx));
-                value_editor.update(cx, |editor, cx| {
-                    editor.set_text(value.clone(), window, cx)
-                });
+                value_editor.update(cx, |editor, cx| editor.set_text(value.clone(), window, cx));
                 (key_editor, value_editor)
             })
             .collect();
@@ -4032,7 +4448,10 @@ impl SshConfigsDialog {
         config.password_session = self.save_password == SavePassword::Session;
         config.strict_host_key = self.strict;
         config.keep_alive = if self.keep_alive_enabled {
-            text(&self.keep_alive_editor).trim().parse::<u16>().unwrap_or(15)
+            text(&self.keep_alive_editor)
+                .trim()
+                .parse::<u16>()
+                .unwrap_or(15)
         } else {
             0
         };
@@ -4254,15 +4673,19 @@ impl Render for SshConfigsDialog {
             config_rows.push(dialog_static("no configurations", Color::Muted));
         }
 
-        let auth_button = dialog_button("ssh-auth-type", self.auth.label(), DialogButtonVariant::Secondary)
-            .end_icon(
-                Icon::new(IconName::ChevronDown)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
-            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                this.cycle_auth(cx);
-            }));
+        let auth_button = dialog_button(
+            "ssh-auth-type",
+            self.auth.label(),
+            DialogButtonVariant::Secondary,
+        )
+        .end_icon(
+            Icon::new(IconName::ChevronDown)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+            this.cycle_auth(cx);
+        }));
 
         let mut rows: Vec<AnyElement> = Vec::new();
         rows.push(dialog_row(
@@ -4276,13 +4699,21 @@ impl Render for SshConfigsDialog {
                 .min_w_0()
                 .items_center()
                 .gap_2()
-                .child(dialog_editor("ssh-host-editor", &self.host_editor, None, window, cx))
-                .child(
-                    div().flex_none().w(px(35.)).child(
-                        dialog_label("Port:"),
-                    ),
-                )
-                .child(dialog_editor("ssh-port-editor", &self.port_editor, Some(px(60.)), window, cx)),
+                .child(dialog_editor(
+                    "ssh-host-editor",
+                    &self.host_editor,
+                    None,
+                    window,
+                    cx,
+                ))
+                .child(div().flex_none().w(px(35.)).child(dialog_label("Port:")))
+                .child(dialog_editor(
+                    "ssh-port-editor",
+                    &self.port_editor,
+                    Some(px(60.)),
+                    window,
+                    cx,
+                )),
         ));
         rows.push(dialog_row(
             "Username:",
@@ -4299,7 +4730,13 @@ impl Render for SshConfigsDialog {
                         .gap_0p5()
                         .child(dialog_row(
                             "Password:",
-                            dialog_editor("ssh-password-editor", &self.password_editor, None, window, cx),
+                            dialog_editor(
+                                "ssh-password-editor",
+                                &self.password_editor,
+                                None,
+                                window,
+                                cx,
+                            ),
                         ))
                         .child(
                             h_flex()
@@ -4313,9 +4750,11 @@ impl Render for SshConfigsDialog {
                                         format!("Save: {}", self.save_password.label()),
                                         DialogButtonVariant::Secondary,
                                     )
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                        this.cycle_save_password(cx);
-                                    })),
+                                    .on_click(cx.listener(
+                                        |this, _: &ClickEvent, _window, cx| {
+                                            this.cycle_save_password(cx);
+                                        },
+                                    )),
                                 )
                                 .child(dialog_static(self.save_password.hint(), Color::Muted))
                                 .child(
@@ -4324,9 +4763,11 @@ impl Render for SshConfigsDialog {
                                         "Reset",
                                         DialogButtonVariant::Secondary,
                                     )
-                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                        this.reset_password(window, cx);
-                                    })),
+                                    .on_click(cx.listener(
+                                        |this, _: &ClickEvent, window, cx| {
+                                            this.reset_password(window, cx);
+                                        },
+                                    )),
                                 ),
                         )
                         .into_any_element(),
@@ -4335,7 +4776,13 @@ impl Render for SshConfigsDialog {
             SshAuthMode::Key => {
                 rows.push(dialog_row(
                     "Private key file:",
-                    dialog_editor("ssh-key-path-editor", &self.key_path_editor, None, window, cx),
+                    dialog_editor(
+                        "ssh-key-path-editor",
+                        &self.key_path_editor,
+                        None,
+                        window,
+                        cx,
+                    ),
                 ));
             }
             SshAuthMode::Agent => {}
@@ -4504,9 +4951,11 @@ impl Render for SshConfigsDialog {
                                     "Cancel",
                                     DialogButtonVariant::Secondary,
                                 )
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.cancel(window, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, window, cx| {
+                                        this.cancel(window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 dialog_button("ssh-apply", "Apply", DialogButtonVariant::Secondary)
@@ -4525,14 +4974,14 @@ impl Render for SshConfigsDialog {
     }
 }
 
-fn ssh_probe_command(
-    config: &SshEntry,
-) -> std::result::Result<util::command::Command, String> {
+fn ssh_probe_command(config: &SshEntry) -> std::result::Result<util::command::Command, String> {
     let port = config.port.trim().to_string();
-    let port = if port.is_empty() { "22".to_string() } else { port };
-    if !port.chars().all(|character| character.is_ascii_digit())
-        || port.parse::<u16>().is_err()
-    {
+    let port = if port.is_empty() {
+        "22".to_string()
+    } else {
+        port
+    };
+    if !port.chars().all(|character| character.is_ascii_digit()) || port.parse::<u16>().is_err() {
         return Err("wrong port number".to_string());
     }
     let host = config.host.trim().to_string();
@@ -4726,7 +5175,8 @@ impl RootPickerDialog {
                         let mut items: Vec<(String, bool)> = Vec::new();
                         for entry in reader.flatten() {
                             let name = entry.file_name().to_string_lossy().to_string();
-                            let is_directory = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            let is_directory =
+                                entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                             items.push((name, is_directory));
                         }
                         Ok(parse_local_dir_entries(items))
@@ -4770,10 +5220,8 @@ impl RootPickerDialog {
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    Err(
-                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
-                            .unwrap_or_else(|| "ls command failed".to_string()),
-                    )
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "ls command failed".to_string()))
                 }
                 Err(error) => Err(error.to_string()),
             }
@@ -4867,9 +5315,13 @@ impl Render for RootPickerDialog {
                 })
                 .hover(|style| style.bg(colors.element_hover))
                 .child(
-                    Label::new(if self.expanded.contains(".") { "▾" } else { "▸" })
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    Label::new(if self.expanded.contains(".") {
+                        "▾"
+                    } else {
+                        "▸"
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
                 )
                 .child(
                     Label::new(self.root_label())
@@ -5015,18 +5467,20 @@ impl RootPickerDialog {
             let matches = picker_query_matches(query, &entry.name);
             let children = self.entries.get(&entry.path).cloned();
             let expanded = self.expanded.contains(&entry.path);
-            let descendant_matches = query.trim().is_empty() || match children.as_ref() {
-                Some(Ok(children)) => {
-                    expanded
-                        && (children
-                            .iter()
-                            .any(|child| picker_query_matches(query, &child.name))
-                            || children.iter().any(|child| {
-                                child.is_directory && self.descendant_matches(query, &child.path)
-                            }))
-                }
-                _ => false,
-            };
+            let descendant_matches = query.trim().is_empty()
+                || match children.as_ref() {
+                    Some(Ok(children)) => {
+                        expanded
+                            && (children
+                                .iter()
+                                .any(|child| picker_query_matches(query, &child.name))
+                                || children.iter().any(|child| {
+                                    child.is_directory
+                                        && self.descendant_matches(query, &child.path)
+                                }))
+                    }
+                    _ => false,
+                };
             if !matches && !descendant_matches {
                 continue;
             }
@@ -5059,7 +5513,7 @@ impl RootPickerDialog {
                                     .color(Color::Muted),
                             )
                             .hover(|style| style.bg(colors.element_hover))
-                             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                                 this.toggle_dir(toggle_path.clone(), cx);
                             })),
                     )
@@ -5073,13 +5527,11 @@ impl RootPickerDialog {
                         .color(Color::Accent),
                     );
             } else {
-                item = item
-                    .child(div().flex_none().w(px(14.)))
-                    .child(
-                        Icon::new(IconName::File)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    );
+                item = item.child(div().flex_none().w(px(14.))).child(
+                    Icon::new(IconName::File)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                );
             }
             item = item.child(
                 Label::new(entry.name.clone())
@@ -5112,7 +5564,9 @@ impl RootPickerDialog {
         let Some(Ok(children)) = self.entries.get(path) else {
             return false;
         };
-        children.iter().any(|child| picker_query_matches(query, &child.name))
+        children
+            .iter()
+            .any(|child| picker_query_matches(query, &child.name))
             || children
                 .iter()
                 .any(|child| child.is_directory && self.descendant_matches(query, &child.path))
@@ -5321,7 +5775,7 @@ impl Render for DataSourcesDialog {
                     })
                     .child(
                         Label::new(tab.label())
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(rems(1.0)))
                             .color(if selected {
                                 Color::Default
                             } else {
@@ -5345,46 +5799,44 @@ impl Render for DataSourcesDialog {
                 let is_sqlite = driver == "sqlite";
                 let mut rows = Vec::new();
 
-                rows.push(
-                    dialog_row(
-                        "Driver:",
-                        h_flex()
-                            .id("ds-driver-picker")
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_2()
-                            .px_1()
-                            .py_0p5()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(colors.element_hover))
-                            .child(driver_badge(
-                                driver_badge_short(&driver),
-                                driver_badge_color(&driver),
-                                cx,
-                            ))
-                            .child(
-                                Label::new(driver_display_name(&driver))
-                                    .size(LabelSize::Small)
-                                    .truncate(),
-                            )
-                            .child(
-                                Label::new(driver_support_hint(&driver))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(div().flex_1().min_w_0())
-                            .child(
-                                Icon::new(IconName::ChevronDown)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                this.toggle_driver_menu(cx);
-                            })),
-                    ),
-                );
+                rows.push(dialog_row(
+                    "Driver:",
+                    h_flex()
+                        .id("ds-driver-picker")
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(colors.element_hover))
+                        .child(driver_badge(
+                            driver_badge_short(&driver),
+                            driver_badge_color(&driver),
+                            cx,
+                        ))
+                        .child(
+                            Label::new(driver_display_name(&driver))
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        )
+                        .child(
+                            Label::new(driver_support_hint(&driver))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(div().flex_1().min_w_0())
+                        .child(
+                            Icon::new(IconName::ChevronDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_driver_menu(cx);
+                        })),
+                ));
 
                 if self.driver_menu_open && selected_source.is_some() {
                     let mut menu_rows = Vec::new();
@@ -5417,11 +5869,9 @@ impl Render for DataSourcesDialog {
                                         })
                                         .truncate(),
                                 )
-                                .on_click(cx.listener(
-                                    move |this, _: &ClickEvent, window, cx| {
-                                        this.switch_driver(menu_driver.to_string(), window, cx);
-                                    },
-                                ))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.switch_driver(menu_driver.to_string(), window, cx);
+                                }))
                                 .into_any_element(),
                         );
                     }
@@ -5479,7 +5929,13 @@ impl Render for DataSourcesDialog {
                         ),
                         DsGeneralField::Port => dialog_row(
                             "Port:",
-                            dialog_editor("ds-port-editor", &self.port_editor, Some(px(60.)), window, cx),
+                            dialog_editor(
+                                "ds-port-editor",
+                                &self.port_editor,
+                                Some(px(60.)),
+                                window,
+                                cx,
+                            ),
                         ),
                         _ => continue,
                     });
@@ -5566,16 +6022,14 @@ impl Render for DataSourcesDialog {
                             "Read-only:",
                             dialog_button(
                                 "ds-option-readonly",
-                                if read_only {
-                                    "read-only"
-                                } else {
-                                    "read-write"
-                                },
+                                if read_only { "read-only" } else { "read-write" },
                                 DialogButtonVariant::Secondary,
                             )
-                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                this.toggle_read_only(cx);
-                            })),
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _window, cx| {
+                                    this.toggle_read_only(cx);
+                                },
+                            )),
                         ),
                         dialog_static("auto-disconnect: not supported", Color::Muted),
                     ])
@@ -5588,70 +6042,61 @@ impl Render for DataSourcesDialog {
                     .unwrap_or(false);
                 let mut rows = Vec::new();
                 rows.push(
-                    dialog_toggle_row(
-                        "ds-ssh-toggle",
-                        ssh_enabled,
-                        "Use SSH tunnel",
-                        cx,
-                    )
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.toggle_ssh(cx);
-                    }))
-                    .into_any_element(),
+                    dialog_toggle_row("ds-ssh-toggle", ssh_enabled, "Use SSH tunnel", cx)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_ssh(cx);
+                        }))
+                        .into_any_element(),
                 );
                 if ssh_enabled {
                     let config_name = selected_source
                         .as_ref()
                         .map(|source| source.ssh_name.trim().to_string())
                         .unwrap_or_default();
-                    rows.push(
-                        dialog_row(
-                            "SSH configuration:",
-                            h_flex()
-                                .id("ds-ssh-config")
-                                .flex_1()
-                                .min_w_0()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    dialog_button(
-                                        "ds-ssh-config-select",
-                                        if config_name.is_empty() {
-                                            "<select configuration>"
-                                        } else {
-                                            config_name.as_str()
-                                        },
-                                        if config_name.is_empty() {
-                                            DialogButtonVariant::Link
-                                        } else {
-                                            DialogButtonVariant::Primary
-                                        },
-                                    )
-                                    .end_icon(
-                                        Icon::new(IconName::ChevronDown)
-                                            .size(IconSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _: &ClickEvent, _window, cx| {
-                                            this.toggle_ssh_menu(cx);
-                                        },
-                                    )),
+                    rows.push(dialog_row(
+                        "SSH configuration:",
+                        h_flex()
+                            .id("ds-ssh-config")
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                dialog_button(
+                                    "ds-ssh-config-select",
+                                    if config_name.is_empty() {
+                                        "<select configuration>"
+                                    } else {
+                                        config_name.as_str()
+                                    },
+                                    if config_name.is_empty() {
+                                        DialogButtonVariant::Link
+                                    } else {
+                                        DialogButtonVariant::Primary
+                                    },
                                 )
-                                .child(
-                                    IconButton::new("ds-ssh-edit", IconName::Ellipsis)
-                                        .shape(IconButtonShape::Square)
-                                        .icon_size(IconSize::XSmall)
-                                        .icon_color(Color::Muted)
-                                        .tooltip(Tooltip::text("Edit SSH configurations"))
-                                        .on_click(cx.listener(
-                                            |this, _: &ClickEvent, window, cx| {
-                                                this.open_ssh_configs(window, cx);
-                                            },
-                                        )),
-                                ),
-                        ),
-                    );
+                                .end_icon(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, _window, cx| {
+                                        this.toggle_ssh_menu(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                IconButton::new("ds-ssh-edit", IconName::Ellipsis)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Edit SSH configurations"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.open_ssh_configs(window, cx);
+                                    })),
+                            ),
+                    ));
                     if self.ssh_menu_open {
                         for (index, config) in self.ssh_configs.iter().enumerate() {
                             let is_active = config_name == config.name;
@@ -5708,11 +6153,9 @@ impl Render for DataSourcesDialog {
                                         .size(LabelSize::XSmall)
                                         .color(Color::Muted),
                                 )
-                                .on_click(cx.listener(
-                                    |this, _: &ClickEvent, window, cx| {
-                                        this.open_ssh_configs(window, cx);
-                                    },
-                                ))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.open_ssh_configs(window, cx);
+                                }))
                                 .into_any_element(),
                         );
                     }
@@ -5820,11 +6263,9 @@ impl Render for DataSourcesDialog {
                                     name.clone(),
                                     cx,
                                 )
-                                .on_click(cx.listener(
-                                    move |this, _: &ClickEvent, _window, cx| {
-                                        this.toggle_schema(name.clone(), cx);
-                                    },
-                                ))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                    this.toggle_schema(name.clone(), cx);
+                                }))
                                 .into_any_element(),
                             );
                         }
@@ -5873,21 +6314,17 @@ impl Render for DataSourcesDialog {
                             IconButton::new("ds-advanced-add", IconName::Plus)
                                 .shape(IconButtonShape::Square)
                                 .icon_size(IconSize::XSmall)
-                                .on_click(cx.listener(
-                                    |this, _: &ClickEvent, window, cx| {
-                                        this.add_advanced_row(window, cx);
-                                    },
-                                )),
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.add_advanced_row(window, cx);
+                                })),
                         )
                         .child(
                             IconButton::new("ds-advanced-remove", IconName::SquareMinus)
                                 .shape(IconButtonShape::Square)
                                 .icon_size(IconSize::XSmall)
-                                .on_click(cx.listener(
-                                    |this, _: &ClickEvent, window, cx| {
-                                        this.remove_advanced_row(window, cx);
-                                    },
-                                )),
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.remove_advanced_row(window, cx);
+                                })),
                         )
                         .into_any_element(),
                 );
@@ -5974,17 +6411,14 @@ impl Render for DataSourcesDialog {
                                                     )),
                                             )
                                             .child(
-                                                IconButton::new(
-                                                    "ds-remove",
-                                                    IconName::SquareMinus,
-                                                )
-                                                .shape(IconButtonShape::Square)
-                                                .icon_size(IconSize::XSmall)
-                                                .on_click(cx.listener(
-                                                    |this, _: &ClickEvent, window, cx| {
-                                                        this.remove_source(window, cx);
-                                                    },
-                                                )),
+                                                IconButton::new("ds-remove", IconName::SquareMinus)
+                                                    .shape(IconButtonShape::Square)
+                                                    .icon_size(IconSize::XSmall)
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, window, cx| {
+                                                            this.remove_source(window, cx);
+                                                        },
+                                                    )),
                                             )
                                             .child(
                                                 IconButton::new("ds-copy", IconName::Copy)
@@ -6015,7 +6449,7 @@ impl Render for DataSourcesDialog {
                                     .py_1()
                                     .child(
                                         Label::new("Problems")
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(rems(1.0)))
                                             .color(Color::Muted),
                                     )
                                     .children(problem_rows),
@@ -6108,19 +6542,17 @@ impl Render for DataSourcesDialog {
                                     "Cancel",
                                     DialogButtonVariant::Secondary,
                                 )
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.cancel(window, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, window, cx| {
+                                        this.cancel(window, cx);
+                                    },
+                                )),
                             )
                             .child(
-                                dialog_button(
-                                    "ds-apply",
-                                    "Apply",
-                                    DialogButtonVariant::Secondary,
-                                )
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.apply(window, cx);
-                                })),
+                                dialog_button("ds-apply", "Apply", DialogButtonVariant::Secondary)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.apply(window, cx);
+                                    })),
                             )
                             .child(
                                 dialog_button("ds-ok", "OK", DialogButtonVariant::Primary)
@@ -6515,7 +6947,8 @@ fn collection_response_status(response: &Value) -> Option<u16> {
 
 fn parse_test_files(stdout: &str) -> std::result::Result<Vec<String>, String> {
     let value: Value = serde_json::from_str(stdout).map_err(|_| {
-        first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid JSON from php-test".to_string())
+        first_non_empty_line(stdout.lines())
+            .unwrap_or_else(|| "invalid JSON from php-test".to_string())
     })?;
     let files = value
         .get("files")
@@ -6530,7 +6963,8 @@ fn parse_test_files(stdout: &str) -> std::result::Result<Vec<String>, String> {
 
 fn parse_test_run(stdout: &str) -> std::result::Result<TestRunResult, String> {
     let value: Value = serde_json::from_str(stdout).map_err(|_| {
-        first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid JSON from php-test".to_string())
+        first_non_empty_line(stdout.lines())
+            .unwrap_or_else(|| "invalid JSON from php-test".to_string())
     })?;
     let tests = value
         .get("tests")
@@ -6581,7 +7015,10 @@ fn parse_test_run(stdout: &str) -> std::result::Result<TestRunResult, String> {
         skipped: summary_number("skipped").unwrap_or_else(|| count(TestStatus::Skip)),
     };
 
-    Ok(TestRunResult { tests: cases, summary })
+    Ok(TestRunResult {
+        tests: cases,
+        summary,
+    })
 }
 
 fn first_non_empty_line<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
@@ -6693,18 +7130,16 @@ impl PhpPanel {
                 };
                 open_ssh_configs_window(root, cx);
             });
-            workspace.register_action(
-                |workspace, _: &BrowseRemoteHost, window, cx| {
-                    if cx.has_global::<DeployShared>() {
-                        if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
-                            panel
-                                .update(cx, |panel, cx| panel.select_tab(PanelTab::Remote, cx))
-                                .ok();
-                        }
+            workspace.register_action(|workspace, _: &BrowseRemoteHost, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Remote, cx))
+                            .ok();
                     }
-                    workspace.toggle_panel_focus::<PhpPanel>(window, cx);
-                },
-            );
+                }
+                workspace.toggle_panel_focus::<PhpPanel>(window, cx);
+            });
             workspace.register_action(|_, _: &SelectNextTab, window, cx| {
                 select_tab_cyclically(window, cx, |active| next_tab(active, 1));
             });
@@ -6879,12 +7314,10 @@ impl PhpPanel {
                                 .or_else(|| string_field(connection, "url"))
                                 .or_else(|| {
                                     let host = string_field(connection, "host")?;
-                                    Some(
-                                        match connection.get("port").and_then(Value::as_u64) {
-                                            Some(port) => format!("{host}:{port}"),
-                                            None => host,
-                                        },
-                                    )
+                                    Some(match connection.get("port").and_then(Value::as_u64) {
+                                        Some(port) => format!("{host}:{port}"),
+                                        None => host,
+                                    })
                                 }),
                             user: string_field(connection, "user"),
                             host: string_field(connection, "host"),
@@ -6926,14 +7359,16 @@ impl PhpPanel {
             .and_then(|config| config.get("default"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        self.active_server =
-            resolve_active_server(configured_active, configured_default, &names);
+        self.active_server = resolve_active_server(configured_active, configured_default, &names);
 
         cx.set_global(DeployShared {
             servers: names.clone(),
             active: self.active_server.clone(),
             panel: Some(cx.weak_entity()),
-            root: self.remote_servers.first().map(|server| server.root.clone()),
+            root: self
+                .remote_servers
+                .first()
+                .map(|server| server.root.clone()),
         });
     }
 
@@ -7140,7 +7575,8 @@ impl PhpPanel {
         cx: &mut Context<Self>,
     ) {
         let key = (server.clone(), path.clone());
-        self.remote_status.insert(key.clone(), RemoteStatus::Loading);
+        self.remote_status
+            .insert(key.clone(), RemoteStatus::Loading);
         cx.notify();
 
         let task_server = server.clone();
@@ -7163,10 +7599,8 @@ impl PhpPanel {
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    Err(
-                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
-                            .unwrap_or_else(|| "ls command failed".to_string()),
-                    )
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "ls command failed".to_string()))
                 }
                 Err(error) => Err(error.to_string()),
             }
@@ -7186,7 +7620,8 @@ impl PhpPanel {
                         this.remote_status.remove(&key);
                     }
                     Err(message) => {
-                        this.remote_status.insert(key, RemoteStatus::Failed(message));
+                        this.remote_status
+                            .insert(key, RemoteStatus::Failed(message));
                     }
                 }
                 cx.notify();
@@ -7211,7 +7646,8 @@ impl PhpPanel {
         self.remote_current_path
             .insert(server.clone(), remote_parent_path(&path));
         self.remote_selected_file = Some((server.clone(), path.clone()));
-        self.remote_status.insert(key.clone(), RemoteStatus::Loading);
+        self.remote_status
+            .insert(key.clone(), RemoteStatus::Loading);
         cx.notify();
 
         let target = PathBuf::from(format!(
@@ -7241,10 +7677,8 @@ impl PhpPanel {
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    Err(
-                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
-                            .unwrap_or_else(|| "download failed".to_string()),
-                    )
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "download failed".to_string()))
                 }
                 Err(error) => Err(error.to_string()),
             }
@@ -7259,18 +7693,14 @@ impl PhpPanel {
                         this.workspace
                             .update_in(cx, |workspace, window, cx| {
                                 workspace
-                                    .open_abs_path(
-                                        target,
-                                        OpenOptions::default(),
-                                        window,
-                                        cx,
-                                    )
+                                    .open_abs_path(target, OpenOptions::default(), window, cx)
                                     .detach_and_log_err(cx);
                             })
                             .log_err();
                     }
                     Err(message) => {
-                        this.remote_status.insert(key, RemoteStatus::Failed(message));
+                        this.remote_status
+                            .insert(key, RemoteStatus::Failed(message));
                     }
                 }
                 cx.notify();
@@ -7351,20 +7781,10 @@ impl PhpPanel {
             item = item.on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
                 if is_directory {
                     if event.click_count() < 2 {
-                        this.toggle_remote_dir(
-                            server_name.clone(),
-                            path.clone(),
-                            root.clone(),
-                            cx,
-                        );
+                        this.toggle_remote_dir(server_name.clone(), path.clone(), root.clone(), cx);
                     }
                 } else if event.click_count() >= 2 {
-                    this.download_remote_file(
-                        server_name.clone(),
-                        path.clone(),
-                        root.clone(),
-                        cx,
-                    );
+                    this.download_remote_file(server_name.clone(), path.clone(), root.clone(), cx);
                 } else {
                     this.select_remote_file(server_name.clone(), path.clone(), cx);
                 }
@@ -7413,10 +7833,8 @@ impl PhpPanel {
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    Err(
-                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
-                            .unwrap_or_else(|| "request failed".to_string()),
-                    )
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "request failed".to_string()))
                 }
                 Err(error) => Err(error.to_string()),
             }
@@ -7626,12 +8044,7 @@ impl PhpPanel {
         cx.notify();
     }
 
-    fn open_sql_form(
-        &mut self,
-        connection: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_sql_form(&mut self, connection: String, window: &mut Window, cx: &mut Context<Self>) {
         self.form = Some(FormState::sql(connection));
         self.saved_message = None;
         window.focus(&self.focus_handle, cx);
@@ -7639,12 +8052,10 @@ impl PhpPanel {
     }
 
     fn handle_form_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let outcome = self.form.as_mut().map(|form| {
-            form.handle_key(
-                &event.keystroke.key,
-                event.keystroke.key_char.as_deref(),
-            )
-        });
+        let outcome = self
+            .form
+            .as_mut()
+            .map(|form| form.handle_key(&event.keystroke.key, event.keystroke.key_char.as_deref()));
         match outcome {
             Some(FormKeyOutcome::Cancel) => {
                 self.form = None;
@@ -7910,10 +8321,8 @@ impl PhpPanel {
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    Err(
-                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
-                            .unwrap_or_else(|| "schema command failed".to_string()),
-                    )
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "schema command failed".to_string()))
                 }
                 Err(error) => Err(error.to_string()),
             }
@@ -8018,10 +8427,8 @@ impl PhpPanel {
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    Err(
-                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
-                            .unwrap_or_else(|| "databases command failed".to_string()),
-                    )
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "databases command failed".to_string()))
                 }
                 Err(error) => Err(error.to_string()),
             }
@@ -8064,10 +8471,8 @@ impl PhpPanel {
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    Err(
-                        first_non_empty_line(stderr.lines().chain(stdout.lines()))
-                            .unwrap_or_else(|| "views command failed".to_string()),
-                    )
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "views command failed".to_string()))
                 }
                 Err(error) => Err(error.to_string()),
             }
@@ -8371,12 +8776,12 @@ fn deploy_server_entry(server: &RemoteServer) -> Value {
     if server.use_rsync {
         entry.insert("use_rsync".to_string(), Value::Bool(true));
     }
+    if server.use_sudo {
+        entry.insert("use_sudo".to_string(), Value::Bool(true));
+    }
     entry.insert("visible".to_string(), Value::Bool(server.visible));
     if deploy_type_has_advanced(protocol) {
-        entry.insert(
-            "passive_mode".to_string(),
-            Value::Bool(server.passive_mode),
-        );
+        entry.insert("passive_mode".to_string(), Value::Bool(server.passive_mode));
         entry.insert("show_hidden".to_string(), Value::Bool(server.show_hidden));
         entry.insert("list_compat".to_string(), Value::Bool(server.list_compat));
         entry.insert("use_mlsd".to_string(), Value::Bool(server.use_mlsd));
@@ -8438,6 +8843,10 @@ fn parse_deploy_server(server: &Value, root: &Path) -> Option<RemoteServer> {
             .unwrap_or(false),
         use_rsync: server
             .get("use_rsync")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        use_sudo: server
+            .get("use_sudo")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         visible: server
@@ -8562,7 +8971,14 @@ fn parse_validate_output(value: &Value) -> Vec<(String, Vec<String>)> {
 }
 
 fn parse_autodetect_root(value: &Value) -> Option<String> {
-    for key in ["root", "path", "remote_root", "directory", "found", "listing"] {
+    for key in [
+        "root",
+        "path",
+        "remote_root",
+        "directory",
+        "found",
+        "listing",
+    ] {
         if let Some(text) = string_field(value, key) {
             if !text.is_empty() {
                 return Some(text);
@@ -8606,6 +9022,7 @@ fn blank_server(root: PathBuf) -> RemoteServer {
         excluded: Vec::new(),
         upload_on_save: false,
         use_rsync: false,
+        use_sudo: false,
         visible: true,
         passive_mode: true,
         show_hidden: false,
@@ -8695,12 +9112,15 @@ fn apply_mapping_fields(server: &mut RemoteServer, fields: &[String]) {
         Some(remote_root)
     };
     let web_url = form_field(fields, 2);
-    server.web_url = if web_url.is_empty() { None } else { Some(web_url) };
+    server.web_url = if web_url.is_empty() {
+        None
+    } else {
+        Some(web_url)
+    };
 }
 
 fn apply_excluded_field(server: &mut RemoteServer, fields: &[String]) {
-    server.excluded =
-        parse_excluded(fields.first().map(String::as_str).unwrap_or_default());
+    server.excluded = parse_excluded(fields.first().map(String::as_str).unwrap_or_default());
 }
 
 fn validate_staged_servers(servers: &[RemoteServer]) -> Option<String> {
@@ -8924,7 +9344,11 @@ enum DsGeneralField {
 fn data_source_general_fields(driver: &str) -> &'static [DsGeneralField] {
     match driver {
         "sqlite" => &[],
-        "redis" => &[DsGeneralField::Host, DsGeneralField::Port, DsGeneralField::Password],
+        "redis" => &[
+            DsGeneralField::Host,
+            DsGeneralField::Port,
+            DsGeneralField::Password,
+        ],
         "mongodb" => &[
             DsGeneralField::Host,
             DsGeneralField::Port,
@@ -9070,8 +9494,7 @@ fn parse_database_views(stdout: &str) -> Result<Vec<DatabaseTable>, String> {
 
 fn parse_database_names(stdout: &str) -> Result<Vec<String>, String> {
     let value: Value = serde_json::from_str(stdout).map_err(|_| {
-        first_non_empty_line(stdout.lines())
-            .unwrap_or_else(|| "invalid databases JSON".to_string())
+        first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid databases JSON".to_string())
     })?;
     let databases = value
         .get("databases")
@@ -9371,14 +9794,17 @@ impl Render for PhpPanel {
                             .unwrap_or_else(|| "-".to_string()),
                         cx,
                     ))
-                    .when_some(picker.as_ref().map(|(_, name)| name.clone()), |this, name| {
-                        this.child(
-                            Label::new(name)
-                                .size(LabelSize::Small)
-                                .color(Color::Default)
-                                .truncate(),
-                        )
-                    })
+                    .when_some(
+                        picker.as_ref().map(|(_, name)| name.clone()),
+                        |this, name| {
+                            this.child(
+                                Label::new(name)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Default)
+                                    .truncate(),
+                            )
+                        },
+                    )
                     .when(picker.is_none(), |this| {
                         this.child(
                             Label::new("no server")
@@ -9389,11 +9815,11 @@ impl Render for PhpPanel {
                     }),
             )
             .child(
-                div()
-                    .flex_none()
-                    .child(Icon::new(IconName::ChevronDown)
+                div().flex_none().child(
+                    Icon::new(IconName::ChevronDown)
                         .size(IconSize::XSmall)
-                        .color(Color::Muted)),
+                        .color(Color::Muted),
+                ),
             )
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                 this.server_menu_open = !this.server_menu_open;
@@ -9697,13 +10123,16 @@ impl Render for PhpPanel {
                     .py_1()
                     .gap_1()
                     .child(
-                        div()
-                            .flex_none()
-                            .child(Icon::new(IconName::ChevronDown)
+                        div().flex_none().child(
+                            Icon::new(IconName::ChevronDown)
                                 .size(IconSize::XSmall)
-                                .color(Color::Muted)),
+                                .color(Color::Muted),
+                        ),
                     )
-                    .child(remote_protocol_badge(&remote_root_badge(&selected_remote), cx))
+                    .child(remote_protocol_badge(
+                        &remote_root_badge(&selected_remote),
+                        cx,
+                    ))
                     .child(
                         Label::new(server.name.clone())
                             .size(LabelSize::Small)
@@ -9719,14 +10148,7 @@ impl Render for PhpPanel {
                     .into_any_element(),
             );
             if let Some(entries) = self.remote_entries.get(&server.name) {
-                self.push_remote_rows(
-                    server,
-                    entries,
-                    0,
-                    &mut remote_line,
-                    &mut remote_rows,
-                    cx,
-                );
+                self.push_remote_rows(server, entries, 0, &mut remote_line, &mut remote_rows, cx);
                 if remote_rows.is_empty() {
                     remote_rows.push(empty_row("empty directory"));
                 }
@@ -9808,9 +10230,7 @@ impl Render for PhpPanel {
                                     ));
                             if let Some(status) = preview_status {
                                 let (status_text, color) = match status {
-                                    TableStatus::Loading => {
-                                        ("loading…".to_string(), Color::Muted)
-                                    }
+                                    TableStatus::Loading => ("loading…".to_string(), Color::Muted),
                                     TableStatus::Loaded(rows) => (
                                         format!(
                                             "{} {}",
@@ -9819,9 +10239,7 @@ impl Render for PhpPanel {
                                         ),
                                         Color::Default,
                                     ),
-                                    TableStatus::Failed(message) => {
-                                        (message.clone(), Color::Error)
-                                    }
+                                    TableStatus::Failed(message) => (message.clone(), Color::Error),
                                 };
                                 table_item = table_item.end_slot(
                                     Label::new(status_text)
@@ -9920,17 +10338,14 @@ impl Render for PhpPanel {
                                             .color(Color::Muted),
                                     ),
                             )
-                            .on_click(cx.listener(
-                                move |this, _: &ClickEvent, _window, cx| {
-                                    if this.db_expanded_views.remove(&views_connection) {
-                                        cx.notify();
-                                    } else {
-                                        this.db_expanded_views
-                                            .insert(views_connection.clone());
-                                        cx.notify();
-                                    }
-                                },
-                            ))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                if this.db_expanded_views.remove(&views_connection) {
+                                    cx.notify();
+                                } else {
+                                    this.db_expanded_views.insert(views_connection.clone());
+                                    cx.notify();
+                                }
+                            }))
                             .into_any_element(),
                     );
                     if views_open {
@@ -9957,9 +10372,7 @@ impl Render for PhpPanel {
                                     ));
                             if let Some(status) = self.table_status.get(&view_key) {
                                 let (status_text, color) = match status {
-                                    TableStatus::Loading => {
-                                        ("loading…".to_string(), Color::Muted)
-                                    }
+                                    TableStatus::Loading => ("loading…".to_string(), Color::Muted),
                                     TableStatus::Loaded(rows) => (
                                         format!(
                                             "{} {}",
@@ -9968,9 +10381,7 @@ impl Render for PhpPanel {
                                         ),
                                         Color::Default,
                                     ),
-                                    TableStatus::Failed(message) => {
-                                        (message.clone(), Color::Error)
-                                    }
+                                    TableStatus::Failed(message) => (message.clone(), Color::Error),
                                 };
                                 view_item = view_item.end_slot(
                                     Label::new(status_text)
@@ -10024,15 +10435,13 @@ impl Render for PhpPanel {
                                             .color(Color::Muted),
                                     ),
                             )
-                            .on_click(cx.listener(
-                                move |this, _: &ClickEvent, _window, cx| {
-                                    this.toggle_database_names(
-                                        names_connection.clone(),
-                                        names_root.clone(),
-                                        cx,
-                                    );
-                                },
-                            ))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                this.toggle_database_names(
+                                    names_connection.clone(),
+                                    names_root.clone(),
+                                    cx,
+                                );
+                            }))
                             .into_any_element(),
                     );
                     if names_open {
@@ -10141,9 +10550,7 @@ impl Render for PhpPanel {
                         .get(&database.name)
                         .and_then(|status| match status {
                             TableStatus::Loading | TableStatus::Loaded(_) => None,
-                            TableStatus::Failed(message) => {
-                                Some((message.clone(), Color::Error))
-                            }
+                            TableStatus::Failed(message) => Some((message.clone(), Color::Error)),
                         })
                 });
 
@@ -10190,11 +10597,10 @@ impl Render for PhpPanel {
                         .flex_none(),
                 );
             }
-            connection_row = connection_row.on_click(cx.listener(
-                move |this, _: &ClickEvent, _window, cx| {
+            connection_row =
+                connection_row.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                     this.toggle_connection_expand(name.clone(), is_sqlite, root.clone(), cx);
-                },
-            ));
+                }));
             database_rows.push(connection_row.into_any_element());
 
             database_rows.extend(schema_rows);
@@ -10809,7 +11215,8 @@ impl Render for PhpPanel {
             .children(saved_message_row)
             .child(tab_bar)
             .child(content)
-    }}
+    }
+}
 
 fn select_tab_cyclically(
     window: &mut Window,
@@ -11023,10 +11430,13 @@ impl Render for DeployServerIndicator {
             .clone()
             .or_else(|| shared.servers.first().cloned());
 
-        let trigger = Button::new("deploy-server-indicator", active.unwrap_or_else(|| "no server".to_string()))
-            .size(ButtonSize::Compact)
-            .label_size(LabelSize::Small)
-            .tooltip(Tooltip::text("Deployment server"));
+        let trigger = Button::new(
+            "deploy-server-indicator",
+            active.unwrap_or_else(|| "no server".to_string()),
+        )
+        .size(ButtonSize::Compact)
+        .label_size(LabelSize::Small)
+        .tooltip(Tooltip::text("Deployment server"));
 
         PopoverMenu::new("deploy-server-menu")
             .menu(|window, cx| {
@@ -11185,12 +11595,20 @@ mod tests {
         assert_eq!(sql.handle_key("enter", None), FormKeyOutcome::Save);
     }
 
-#[test]
+    #[test]
     fn save_server_creates_config_with_numeric_port() {
         let root = temp_root("server_create");
         let name = save_server_config(
             &root,
-            &fields(&["dev", "sftp", "example.test", "2222", "deploy", "/var/www", "."]),
+            &fields(&[
+                "dev",
+                "sftp",
+                "example.test",
+                "2222",
+                "deploy",
+                "/var/www",
+                ".",
+            ]),
         )
         .expect("save server");
         assert_eq!(name, "dev");
@@ -11263,7 +11681,11 @@ mod tests {
             Some("sftp".to_string())
         );
         assert_eq!(
-            resolve_active_server(Some("missing".to_string()), Some("sftp".to_string()), &names),
+            resolve_active_server(
+                Some("missing".to_string()),
+                Some("sftp".to_string()),
+                &names
+            ),
             Some("sftp".to_string())
         );
         assert_eq!(
@@ -11302,6 +11724,7 @@ mod tests {
                     excluded: Vec::new(),
                     upload_on_save: false,
                     use_rsync: false,
+                    use_sudo: false,
                     visible: true,
                     passive_mode: true,
                     show_hidden: false,
@@ -11328,6 +11751,7 @@ mod tests {
                     excluded: Vec::new(),
                     upload_on_save: false,
                     use_rsync: false,
+                    use_sudo: false,
                     visible: true,
                     passive_mode: true,
                     show_hidden: false,
@@ -11381,14 +11805,17 @@ mod tests {
     #[test]
     fn save_database_maps_target_by_shape() {
         let root = temp_root("database_targets");
+        save_database_config(&root, &fields(&["notes", "sqlite", "notes.sqlite", "", ""]))
+            .expect("save sqlite connection");
         save_database_config(
             &root,
-            &fields(&["notes", "sqlite", "notes.sqlite", "", ""]),
-        )
-        .expect("save sqlite connection");
-        save_database_config(
-            &root,
-            &fields(&["pg", "postgres", "postgres://app@localhost:5432/app", "", ""]),
+            &fields(&[
+                "pg",
+                "postgres",
+                "postgres://app@localhost:5432/app",
+                "",
+                "",
+            ]),
         )
         .expect("save url connection");
         save_database_config(
@@ -11464,7 +11891,10 @@ mod tests {
         assert_eq!(result.tests.len(), 3);
         assert_eq!(result.tests[0].status, TestStatus::Pass);
         assert_eq!(result.tests[1].status, TestStatus::Fail);
-        assert_eq!(result.tests[1].message, "Failed asserting that 5 is identical to 4.");
+        assert_eq!(
+            result.tests[1].message,
+            "Failed asserting that 5 is identical to 4."
+        );
         assert_eq!(result.tests[2].status, TestStatus::Skip);
         assert_eq!(result.summary.total, 3);
         assert_eq!(result.summary.passed, 1);
@@ -11480,10 +11910,7 @@ mod tests {
         let value: Value = serde_json::from_str(numeric).expect("parse config");
         let server = parse_deploy_server(&value, root).expect("parse server");
         assert_eq!(server.port.as_deref(), Some("2222"));
-        assert_eq!(
-            server.local_root.as_deref(),
-            Some(".")
-        );
+        assert_eq!(server.local_root.as_deref(), Some("."));
         assert_eq!(server.web_url.as_deref(), Some("https://app.test"));
         assert_eq!(
             server.excluded,
@@ -11666,7 +12093,11 @@ mod tests {
     fn excluded_paths_convert_between_text_and_list() {
         assert_eq!(
             parse_excluded("vendor/, node_modules/ ,tmp"),
-            vec!["vendor/".to_string(), "node_modules/".to_string(), "tmp".to_string()]
+            vec![
+                "vendor/".to_string(),
+                "node_modules/".to_string(),
+                "tmp".to_string()
+            ]
         );
         assert_eq!(parse_excluded(""), Vec::<String>::new());
         assert_eq!(excluded_text(Some(&parse_excluded("a,b"))), "a, b");
@@ -11674,10 +12105,7 @@ mod tests {
 
         let mut server = blank_server(PathBuf::from("/tmp"));
         server.excluded = vec!["vendor/".to_string()];
-        assert_eq!(
-            excluded_text(Some(server.excluded.as_slice())),
-            "vendor/"
-        );
+        assert_eq!(excluded_text(Some(server.excluded.as_slice())), "vendor/");
         apply_excluded_field(&mut server, &fields(&["src/, dist/"]));
         assert_eq!(
             server.excluded,
@@ -11739,10 +12167,7 @@ mod tests {
         assert_eq!(next_connection_name("sqlite", &[]), "sqlite");
         let taken = vec![connection_entry("sqlite")];
         assert_eq!(next_connection_name("sqlite", &taken), "sqlite (1)");
-        let taken = vec![
-            connection_entry("sqlite"),
-            connection_entry("sqlite (1)"),
-        ];
+        let taken = vec![connection_entry("sqlite"), connection_entry("sqlite (1)")];
         assert_eq!(next_connection_name("sqlite", &taken), "sqlite (2)");
     }
 
@@ -11832,10 +12257,7 @@ mod tests {
             ]
         );
         // unknown drivers keep the server shape (matches the old non-sqlite columns)
-        assert!(
-            data_source_general_fields("custom")
-                .contains(&DsGeneralField::Host)
-        );
+        assert!(data_source_general_fields("custom").contains(&DsGeneralField::Host));
     }
 
     #[test]
@@ -11885,8 +12307,11 @@ mod tests {
 
         std::fs::write(root.join(".zed/ssh.json"), "not json").expect("break ssh.json");
         assert!(load_ssh_configs(&root).is_empty());
-        std::fs::write(root.join(".zed/ssh.json"), r#"{"configs":[{"name":"legacy"}]}"#)
-            .expect("legacy ssh.json");
+        std::fs::write(
+            root.join(".zed/ssh.json"),
+            r#"{"configs":[{"name":"legacy"}]}"#,
+        )
+        .expect("legacy ssh.json");
         let configs = load_ssh_configs(&root);
         assert_eq!(configs.len(), 1);
         assert_eq!(ssh_entry_port(&configs[0]), 22);
@@ -12001,8 +12426,7 @@ mod tests {
     fn resolve_ssh_into_missing_config_reports_name() {
         let configs = Vec::new();
 
-        let mut tunnelled =
-            serde_json::json!({"ssh_tunnel": {"enabled": true, "name": "gone"}});
+        let mut tunnelled = serde_json::json!({"ssh_tunnel": {"enabled": true, "name": "gone"}});
         assert_eq!(
             resolve_ssh_tunnel_into(&mut tunnelled, &configs),
             Err("ssh configuration 'gone' not found".to_string())
@@ -12081,7 +12505,13 @@ mod tests {
         options.insert("b_key".to_string(), json!("2"));
         options.insert("a_key".to_string(), json!(1));
         let rows = options_to_rows(&options);
-        assert_eq!(rows, vec![("a_key".to_string(), "1".to_string()), ("b_key".to_string(), "2".to_string())]);
+        assert_eq!(
+            rows,
+            vec![
+                ("a_key".to_string(), "1".to_string()),
+                ("b_key".to_string(), "2".to_string())
+            ]
+        );
 
         let staged = vec![
             ("z_key".to_string(), "true".to_string()),
@@ -12128,7 +12558,13 @@ mod tests {
 
     #[test]
     fn sqlite_file_name_detector_matches_only_sqlite_extensions() {
-        for name in ["demo.sqlite", "backup.db", "dump.sqlite3", "notes.DB", "x.SQLite"] {
+        for name in [
+            "demo.sqlite",
+            "backup.db",
+            "dump.sqlite3",
+            "notes.DB",
+            "x.SQLite",
+        ] {
             assert!(is_sqlite_file_name(name), "{name} should match");
         }
         for name in [
@@ -12279,8 +12715,16 @@ mod tests {
         assert!(data_source_problems(&source).is_empty());
         source.url = String::new();
         let problems = data_source_problems(&source);
-        for expected in ["host is required", "port is required", "user is required", "database is required"] {
-            assert!(problems.contains(&expected.to_string()), "missing {expected}");
+        for expected in [
+            "host is required",
+            "port is required",
+            "user is required",
+            "database is required",
+        ] {
+            assert!(
+                problems.contains(&expected.to_string()),
+                "missing {expected}"
+            );
         }
         source.ssh_enabled = true;
         assert!(data_source_problems(&source).contains(&"ssh host is required".to_string()));
@@ -12320,7 +12764,10 @@ mod tests {
         assert_eq!(connections[0]["path"], json!("demo.sqlite"));
         assert_eq!(connections[0]["read_only"], json!(true));
         assert_eq!(connections[0]["password_env"], json!("PGPASSWORD"));
-        assert_eq!(connections[1]["url"], json!("postgres://app@localhost:5432/app"));
+        assert_eq!(
+            connections[1]["url"],
+            json!("postgres://app@localhost:5432/app")
+        );
 
         std::fs::remove_dir_all(&root).expect("clean temporary project root");
     }
@@ -12339,10 +12786,7 @@ mod tests {
         copy.name = "datasource copy".to_string();
         blank.name = "a".to_string();
         let sources = vec![blank, copy];
-        assert_eq!(
-            next_data_source_name("a copy", &sources),
-            "a copy"
-        );
+        assert_eq!(next_data_source_name("a copy", &sources), "a copy");
     }
 
     #[test]
@@ -12368,9 +12812,44 @@ mod tests {
         assert_eq!(deploy_type_badge_short("ssh"), "ssh");
         assert_eq!(deploy_type_badge_short("gopher"), "?");
 
-        assert_eq!(next_deploy_type("webdavs"), "local");
-        assert_eq!(next_deploy_type("sftp"), "ftp");
-        assert_eq!(next_deploy_type("gopher"), "in-place");
+        assert_eq!(deploy_type_display_name("webdavs"), "WebDAV over HTTPS");
+        assert_eq!(deploy_type_display_name("in-place"), "In place");
+        assert_eq!(deploy_type_display_name("local"), "Local or mounted folder");
+    }
+
+    #[test]
+    fn deploy_type_dropdown_options_exact_order_and_labels() {
+        assert_eq!(
+            deploy_type_options(),
+            &[
+                ("in-place", "In place"),
+                ("local", "Local or mounted folder"),
+                ("ftp", "FTP"),
+                ("ftps", "FTPS"),
+                ("sftp", "SFTP"),
+                ("webdav", "WebDAV"),
+                ("webdavs", "WebDAV over HTTPS"),
+            ]
+        );
+    }
+
+    #[test]
+    fn deploy_type_dropdown_labels_map_to_canonical_protocols() {
+        for (canonical, label) in deploy_type_options() {
+            assert_eq!(deploy_type_canonical_from_label(label), Some(*canonical));
+            assert_eq!(deploy_type_canonical(canonical), Some(*canonical));
+        }
+        assert_eq!(deploy_type_canonical_from_label("sftp"), None);
+        assert_eq!(deploy_type_canonical_from_label("WebDAV (HTTPS)"), None);
+        assert_eq!(deploy_type_canonical_from_label("SSH"), None);
+    }
+
+    #[test]
+    fn deploy_mapping_labels_match_phpstorm() {
+        assert_eq!(
+            deploy_mapping_labels(),
+            ["Local path:", "Deployment path:", "Web path:"]
+        );
     }
 
     #[test]
@@ -12379,46 +12858,96 @@ mod tests {
             deploy_connection_fields("sftp"),
             &[
                 DeployField::SshConfig,
-                DeployField::RsyncToggle,
+                DeployField::TestConnection,
                 DeployField::RootPath,
                 DeployField::WebUrl,
-                DeployField::TestConnection,
+                DeployField::RsyncToggle,
+                DeployField::SudoToggle,
             ]
         );
-        for kind in ["ftp", "ftps", "webdav", "webdavs"] {
+        for kind in ["ftp", "ftps"] {
             assert_eq!(
                 deploy_connection_fields(kind),
                 &[
-                    DeployField::Host,
-                    DeployField::Port,
-                    DeployField::User,
-                    DeployField::AnonToggle,
+                    DeployField::HostPort,
+                    DeployField::UserAnonymous,
                     DeployField::Password,
+                    DeployField::TestConnection,
                     DeployField::RootPath,
                     DeployField::WebUrl,
+                    DeployField::RsyncToggle,
+                ]
+            );
+        }
+        for kind in ["webdav", "webdavs"] {
+            assert_eq!(
+                deploy_connection_fields(kind),
+                &[
+                    DeployField::HostPort,
+                    DeployField::UserAnonymous,
+                    DeployField::Password,
                     DeployField::TestConnection,
+                    DeployField::RootPath,
+                    DeployField::WebUrl,
                 ]
             );
         }
         assert_eq!(
             deploy_connection_fields("local"),
-            &[
-                DeployField::Folder,
-                DeployField::RootPath,
-                DeployField::WebUrl,
-                DeployField::TestConnection,
-            ]
+            &[DeployField::Folder, DeployField::WebUrl]
         );
-        assert_eq!(
-            deploy_connection_fields("in-place"),
-            &[DeployField::WebUrl, DeployField::TestConnection]
-        );
+        assert_eq!(deploy_connection_fields("in-place"), &[DeployField::WebUrl]);
 
         assert_eq!(deploy_default_port("ftp"), Some("21"));
         assert_eq!(deploy_default_port("ftps"), Some("990"));
         assert_eq!(deploy_default_port("webdav"), Some("80"));
         assert_eq!(deploy_default_port("webdavs"), Some("443"));
-        assert_eq!(deploy_default_port("sftp"), None);
+        assert_eq!(deploy_default_port("sftp"), Some("22"));
+    }
+
+    #[test]
+    fn deploy_type_switch_prefills_default_ports() {
+        assert_eq!(deploy_default_port("webdavs"), Some("443"));
+        assert_eq!(deploy_default_port("webdav"), Some("80"));
+        assert_eq!(deploy_default_port("ftp"), Some("21"));
+        assert_eq!(deploy_default_port("ftps"), Some("990"));
+        assert_eq!(deploy_default_port("sftp"), Some("22"));
+        assert_eq!(deploy_default_port("local"), None);
+        assert_eq!(deploy_default_port("in-place"), None);
+    }
+
+    #[test]
+    fn deploy_type_options_render_badges_and_display_names() {
+        for (canonical, label) in deploy_type_options() {
+            assert_ne!(deploy_type_badge_short(canonical), "?");
+            assert_eq!(deploy_type_display_name(canonical), *label);
+        }
+        assert_eq!(deploy_type_badge_short("webdavs"), "dav+");
+        assert_eq!(deploy_type_badge_short("sftp"), "ssh");
+    }
+
+    #[test]
+    fn use_sudo_round_trips_through_config() {
+        let root = temp_root("deploy_use_sudo");
+        let mut server = blank_server(root.clone());
+        server.name = "web1".to_string();
+        server.protocol = Some("sftp".to_string());
+        server.use_sudo = true;
+
+        let entry = deploy_server_entry(&server);
+        assert_eq!(entry["use_sudo"], json!(true));
+        let parsed = parse_deploy_server(&entry, &root).expect("parse entry");
+        assert!(parsed.use_sudo);
+
+        let mut plain = blank_server(root.clone());
+        plain.name = "web2".to_string();
+        plain.protocol = Some("sftp".to_string());
+        let entry = deploy_server_entry(&plain);
+        assert!(entry.get("use_sudo").is_none());
+        let parsed = parse_deploy_server(&entry, &root).expect("parse entry");
+        assert!(!parsed.use_sudo);
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
     }
 
     #[test]
@@ -12447,10 +12976,7 @@ mod tests {
         let parsed = parse_validate_output(&flat);
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].0.is_empty());
-        assert_eq!(
-            parsed[0].1,
-            vec!["Folder is not specified".to_string()]
-        );
+        assert_eq!(parsed[0].1, vec!["Folder is not specified".to_string()]);
 
         assert!(parse_validate_output(&serde_json::json!({})).is_empty());
         assert!(parse_validate_output(&serde_json::json!({"servers": [{"name": "x"}]})).is_empty());
@@ -12517,8 +13043,8 @@ mod tests {
     #[test]
     fn advanced_defaults_parse_from_missing_fields() {
         let root = Path::new("/tmp");
-        let value: Value = serde_json::from_str(r#"{"name":"ftp1","protocol":"ftp"}"#)
-            .expect("parse config");
+        let value: Value =
+            serde_json::from_str(r#"{"name":"ftp1","protocol":"ftp"}"#).expect("parse config");
         let server = parse_deploy_server(&value, root).expect("parse server");
         assert!(server.passive_mode);
         assert!(!server.show_hidden);
@@ -12763,8 +13289,7 @@ mod tests {
         config.keep_alive = 15;
         let configs = vec![config];
 
-        let mut connection =
-            serde_json::json!({"ssh_tunnel": {"enabled": true, "name": "local-ssh", "local_port": 15432}});
+        let mut connection = serde_json::json!({"ssh_tunnel": {"enabled": true, "name": "local-ssh", "local_port": 15432}});
         resolve_ssh_tunnel_into(&mut connection, &configs).expect("resolve tunnel");
         let tunnel = &connection["ssh_tunnel"];
         assert_eq!(tunnel["host"], json!("127.0.0.1"));
@@ -12785,4 +13310,25 @@ mod tests {
         let error = resolve_ssh_tunnel_into(&mut gone, &configs).unwrap_err();
         assert_eq!(error, "ssh configuration 'gone' not found");
     }
+    #[test]
+    fn deploy_copy_name_skips_existing_suffixes() {
+        let root = temp_root("deploy_copy_name");
+        let mut servers = Vec::new();
+        for name in ["sftp", "sftp1", "sftp3"] {
+            let mut server = blank_server(root.clone());
+            server.name = name.to_string();
+            servers.push(server);
+        }
+        assert_eq!(
+            deploy_copy_name(&servers, "sftp", 1),
+            ("sftp2".to_string(), 3)
+        );
+        assert_eq!(
+            deploy_copy_name(&servers, "sftp", 3),
+            ("sftp4".to_string(), 5)
+        );
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+
 }
