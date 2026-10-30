@@ -9,10 +9,11 @@ use editor::{Editor, EditorElement, EditorEvent, EditorStyle, actions as editor_
 use file_icons::FileIcons;
 use gpui::{
     Action, Anchor, AnyWindowHandle, App, AppContext, AsyncWindowContext, Bounds, ClickEvent,
-    Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Rems, Render, SharedString, Size,
-    StatefulInteractiveElement, Styled, Subscription, TextStyle, TitlebarOptions, WeakEntity,
-    Window, WindowBounds, WindowOptions, actions, px, size,
+    Context, DismissEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Point, Rems, Render, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
+    TextStyle, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, actions, anchored,
+    deferred, px, size,
 };
 use http_client::{AsyncBody, HttpClient, Method};
 use project::{Project, ProjectPath};
@@ -55,6 +56,16 @@ pub struct AddAsDataSource {
     /// Absolute path of the SQLite file to add.
     #[serde(default)]
     pub abs_path: Option<String>,
+}
+
+/// Removes a data source from `.zed/databases.json` by name.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteDataSource {
+    /// Name of the data source (connection) to remove.
+    #[serde(default)]
+    pub name: String,
 }
 
 /// Opens (adds if needed) a SQLite file as a data source and expands it in
@@ -3303,6 +3314,35 @@ fn save_data_sources(root: &Path, sources: &[DataSource]) -> std::result::Result
     }
     config.insert("connections".to_string(), Value::Array(connections));
     write_config_object(&path, &config)
+}
+
+/// Removes the connection named `name` from a `connections` JSON array,
+/// preserving every other entry verbatim. Returns whether anything was removed.
+fn remove_connection(connections: &mut Vec<Value>, name: &str) -> bool {
+    let name = name.trim();
+    let before = connections.len();
+    connections.retain(|entry| entry.get("name").and_then(Value::as_str) != Some(name));
+    connections.len() != before
+}
+
+/// Deletes a data source from `.zed/databases.json`, keeping all other
+/// connections and top-level config keys untouched.
+fn delete_data_source(root: &Path, name: &str) -> std::result::Result<bool, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("data source name is required".to_string());
+    }
+    let path = root.join(".zed/databases.json");
+    let mut config = load_config_object(&path)?;
+    let mut connections = match config.remove("connections") {
+        Some(Value::Array(connections)) => connections,
+        Some(_) => return Err("connections in databases.json is not an array".to_string()),
+        None => Vec::new(),
+    };
+    let removed = remove_connection(&mut connections, name);
+    config.insert("connections".to_string(), Value::Array(connections));
+    write_config_object(&path, &config)?;
+    Ok(removed)
 }
 
 fn load_data_sources(root: &Path) -> Vec<DataSource> {
@@ -7281,8 +7321,16 @@ pub struct PhpPanel {
     test_active_file: Option<String>,
     form: Option<FormState>,
     server_menu_open: bool,
+    db_context_menu: Option<DbContextMenu>,
     saved_message: Option<String>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Context menu deployed from a Databases tab connection root row.
+struct DbContextMenu {
+    menu: Entity<ContextMenu>,
+    position: Point<Pixels>,
+    _subscription: Subscription,
 }
 
 impl PhpPanel {
@@ -7386,6 +7434,44 @@ impl PhpPanel {
                     }
                 }
             });
+            workspace.register_action(|workspace, action: &DeleteDataSource, _, cx| {
+                let name = action.name.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+                let outcome = match delete_data_source(&root, &name) {
+                    Ok(true) => format!("data source removed '{name}'"),
+                    Ok(false) => format!("failed: data source '{name}' not found"),
+                    Err(message) => format!("failed: {message}"),
+                };
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.refresh(cx);
+                                panel.refresh_databases(cx);
+                                panel.saved_message = Some(outcome);
+                            })
+                            .log_err();
+                    }
+                }
+            });
             workspace.register_action(|workspace, action: &OpenSqliteDataSource, window, cx| {
                 let Some(abs_path) = action.abs_path.as_deref().map(str::trim) else {
                     return;
@@ -7462,6 +7548,7 @@ impl PhpPanel {
                     test_active_file: None,
                     form: None,
                     server_menu_open: false,
+                    db_context_menu: None,
                     saved_message: None,
                     _subscriptions: vec![subscription],
                 }
@@ -7756,6 +7843,37 @@ impl PhpPanel {
         self.remote_current_path
             .insert(server.clone(), remote_parent_path(&path));
         self.remote_selected_file = Some((server, path));
+        cx.notify();
+    }
+
+    fn deploy_db_context_menu(
+        &mut self,
+        name: String,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            menu.context(self.focus_handle.clone()).map(|menu| {
+                menu.action("Edit Data Source...", Box::new(OpenDataSourcesDialog))
+                    .separator()
+                    .action(
+                        "Delete Data Source",
+                        Box::new(DeleteDataSource { name: name.clone() }),
+                    )
+            })
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.db_context_menu.take();
+            cx.notify();
+        });
+        self.db_context_menu = Some(DbContextMenu {
+            menu: context_menu,
+            position,
+            _subscription: subscription,
+        });
         cx.notify();
     }
 
@@ -10741,14 +10859,21 @@ impl Render for PhpPanel {
                         .flex_none(),
                 );
             }
-            connection_row =
-                connection_row.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+            let menu_name = name.clone();
+            connection_row = connection_row
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.deploy_db_context_menu(menu_name.clone(), event.position, window, cx);
+                    }),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                     this.toggle_connection_expand(name.clone(), is_sqlite, root.clone(), cx);
                 }));
             database_rows.push(connection_row.into_any_element());
 
             database_rows.extend(schema_rows);
-
         }
 
         let mut collection_rows = Vec::new();
@@ -11296,6 +11421,14 @@ impl Render for PhpPanel {
                             database_rows
                         }),
                 )
+                .children(self.db_context_menu.as_ref().map(|context_menu| {
+                    deferred(
+                        anchored()
+                            .position(context_menu.position)
+                            .child(context_menu.menu.clone()),
+                    )
+                    .with_priority(3)
+                }))
                 .into_any_element(),
             PanelTab::Tests => v_flex()
                 .flex_1()
@@ -13408,6 +13541,101 @@ mod tests {
         assert_eq!(connections.len(), 2);
         assert_eq!(connections[0]["name"], json!("app"));
         assert_eq!(connections[1]["name"], json!("other"));
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn remove_connection_removes_only_named_entry() {
+        let mut connections = serde_json::json!([
+            {"name": "app", "driver": "sqlite", "path": "demo.sqlite"},
+            {
+                "name": "app-ro",
+                "driver": "sqlite",
+                "path": "demo.sqlite",
+                "options": {"busy_timeout": "5000", "custom_unknown": "kept"},
+                "ssh_tunnel": {"enabled": false, "host": "bastion.example.com"}
+            },
+            {"name": "pg", "driver": "postgres", "url": "postgres://app@localhost/app"}
+        ])
+        .as_array()
+        .cloned()
+        .expect("connections array");
+
+        assert!(remove_connection(&mut connections, "app-ro"));
+        assert_eq!(connections.len(), 2);
+        assert_eq!(connections[0]["name"], json!("app"));
+        assert_eq!(connections[1]["name"], json!("pg"));
+        // untouched entries keep unknown/nested fields verbatim
+        let mut untouched = serde_json::json!([
+            {"name": "app-ro", "options": {"custom_unknown": "kept"},
+             "ssh_tunnel": {"enabled": false, "host": "bastion.example.com"}}
+        ])
+        .as_array()
+        .cloned()
+        .expect("array");
+        remove_connection(&mut untouched, "missing");
+        assert_eq!(untouched[0]["options"]["custom_unknown"], json!("kept"));
+        assert_eq!(
+            untouched[0]["ssh_tunnel"]["host"],
+            json!("bastion.example.com")
+        );
+    }
+
+    #[test]
+    fn remove_connection_missing_name_is_noop() {
+        let original = serde_json::json!([
+            {"name": "app", "driver": "sqlite", "path": "demo.sqlite"},
+            {"name": "pg", "driver": "postgres", "url": "postgres://app@localhost/app"}
+        ]);
+        let mut connections = original.as_array().cloned().expect("array");
+
+        assert!(!remove_connection(&mut connections, "absent"));
+        assert_eq!(Value::Array(connections), original);
+    }
+
+    #[test]
+    fn delete_data_source_preserves_other_connections_and_top_level_keys() {
+        let root = temp_root("delete_data_source");
+        std::fs::create_dir_all(root.join(".zed")).expect("create .zed");
+        std::fs::write(
+            root.join(".zed/databases.json"),
+            r#"{
+                "version": 7,
+                "connections": [
+                    {"name":"app","driver":"sqlite","path":"demo.sqlite"},
+                    {"name":"demo2","driver":"sqlite","path":"demo.sqlite"},
+                    {"name":"app-ro","driver":"sqlite","path":"demo.sqlite","read_only":true,
+                     "options":{"busy_timeout":"5000","custom_unknown":"kept-but-ignored"},
+                     "ssh_tunnel":{"enabled":false,"host":"bastion.example.com","port":22}}
+                ]
+            }"#,
+        )
+        .expect("seed databases.json");
+
+        assert!(delete_data_source(&root, "demo2").expect("delete"));
+        let config = read_json(&root.join(".zed/databases.json")).expect("parse databases.json");
+        assert_eq!(config["version"], json!(7));
+        let connections = config["connections"].as_array().expect("connections array");
+        assert_eq!(connections.len(), 2);
+        assert_eq!(connections[0]["name"], json!("app"));
+        assert_eq!(connections[1]["name"], json!("app-ro"));
+        assert_eq!(connections[1]["read_only"], json!(true));
+        assert_eq!(
+            connections[1]["options"]["custom_unknown"],
+            json!("kept-but-ignored")
+        );
+        assert_eq!(
+            connections[1]["ssh_tunnel"]["host"],
+            json!("bastion.example.com")
+        );
+        assert_eq!(connections[1]["ssh_tunnel"]["port"], json!(22));
+
+        // Deleting a name that is not there leaves the file semantically unchanged.
+        let before = read_json(&root.join(".zed/databases.json")).expect("parse");
+        assert!(!delete_data_source(&root, "absent").expect("no-op"));
+        let after = read_json(&root.join(".zed/databases.json")).expect("parse");
+        assert_eq!(before, after);
 
         std::fs::remove_dir_all(&root).expect("clean temporary project root");
     }
