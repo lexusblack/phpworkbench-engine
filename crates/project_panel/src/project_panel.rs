@@ -1156,7 +1156,8 @@ impl ProjectPanel {
             let is_svg = !is_dir && SvgPreviewView::is_svg_path(file_name);
 
             // "Add as Data Source" targets SQLite files picked in the project tree.
-            let is_sqlite_file = !is_dir && php_panel::is_sqlite_file_name(&file_name.to_string_lossy());
+            let is_sqlite_file =
+                !is_dir && php_panel::is_sqlite_file_name(&file_name.to_string_lossy());
             let sqlite_file_abs_path = if is_sqlite_file {
                 let abs_path = worktree.abs_path().join(entry.path.as_ref());
                 Some(abs_path.to_string_lossy().replace('\\', "/"))
@@ -2063,8 +2064,29 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((_, entry)) = self.selected_entry(cx) {
+        if let Some((worktree, entry)) = self.selected_entry(cx) {
             if entry.is_file() {
+                let file_name = entry
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string()
+                    .replace('\\', "/");
+                if php_panel::is_sqlite_file_name(&file_name) && split_direction.is_none() {
+                    let abs_path = worktree
+                        .abs_path()
+                        .join(entry.path.as_ref())
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    window.dispatch_action(
+                        Box::new(php_panel::OpenSqliteDataSource {
+                            abs_path: Some(abs_path),
+                        }),
+                        cx,
+                    );
+                    cx.notify();
+                    return;
+                }
                 if split_direction.is_some() {
                     self.split_entry(entry.id, allow_preview, split_direction, cx);
                 } else {
@@ -6122,6 +6144,26 @@ impl ProjectPanel {
         let depth = details.depth;
         let worktree_id = details.worktree_id;
 
+        // phpworkbench: SQLite files picked in the project tree open as data
+        // sources (PhpStorm behavior), never as the binary editor — see the
+        // click handlers below.
+        let is_sqlite_file = !kind.is_dir() && php_panel::is_sqlite_file_name(&details.filename);
+        let sqlite_file_abs_path = if is_sqlite_file {
+            self.project
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .map(|worktree| {
+                    worktree
+                        .read(cx)
+                        .abs_path()
+                        .join(details.path.as_std_path())
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+        } else {
+            None
+        };
+
         let bg_color = if is_marked {
             item_colors.marked
         } else {
@@ -6473,7 +6515,8 @@ impl ProjectPanel {
                     cx.propagate();
                 }),
             )
-            .on_click(
+            .on_click({
+                let sqlite_file_abs_path = sqlite_file_abs_path.clone();
                 cx.listener(move |project_panel, event: &gpui::ClickEvent, window, cx| {
                     if event.is_right_click() || show_editor {
                         return;
@@ -6580,22 +6623,62 @@ impl ProjectPanel {
                         let preview_tabs_enabled =
                             PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
                         let click_count = event.click_count();
+
+                        // phpworkbench: SQLite files picked in the project tree
+                        // never open as the binary editor. A single click only
+                        // selects the row; a double click adds the file as a data
+                        // source and connects it right away, like PhpStorm.
+                        if is_sqlite_file {
+                            let selected = SelectedEntry {
+                                worktree_id,
+                                entry_id,
+                            };
+                            project_panel.selection = Some(selected);
+                            project_panel.marked_entries.clear();
+                            project_panel.marked_entries.push(selected);
+                            if click_count > 1
+                                && let Some(abs_path) = sqlite_file_abs_path.clone()
+                            {
+                                window.dispatch_action(
+                                    Box::new(php_panel::OpenSqliteDataSource {
+                                        abs_path: Some(abs_path),
+                                    }),
+                                    cx,
+                                );
+                            }
+                            cx.notify();
+                            return;
+                        }
+
                         let focus_opened_item = click_count > 1;
                         let allow_preview = preview_tabs_enabled && click_count == 1;
                         project_panel.open_entry(entry_id, focus_opened_item, allow_preview, cx);
                     }
-                }),
-            )
-            .on_aux_click(
-                cx.listener(move |project_panel, event: &gpui::ClickEvent, _, cx| {
+                })
+            })
+            .on_aux_click(cx.listener(
+                move |project_panel, event: &gpui::ClickEvent, window, cx| {
                     if !event.is_middle_click() || show_editor || !kind.is_file() {
                         return;
                     }
 
-                    project_panel.open_entry(entry_id, true, false, cx);
+                    // phpworkbench: opening a SQLite file connects it as a data
+                    // source instead of showing the binary editor.
+                    if is_sqlite_file {
+                        if let Some(abs_path) = sqlite_file_abs_path.clone() {
+                            window.dispatch_action(
+                                Box::new(php_panel::OpenSqliteDataSource {
+                                    abs_path: Some(abs_path),
+                                }),
+                                cx,
+                            );
+                        }
+                    } else {
+                        project_panel.open_entry(entry_id, true, false, cx);
+                    }
                     cx.stop_propagation();
-                }),
-            )
+                },
+            ))
             .child(
                 ListItem::new(id)
                     .indent_level(depth)

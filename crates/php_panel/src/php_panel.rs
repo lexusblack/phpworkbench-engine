@@ -8,13 +8,15 @@ use anyhow::Result;
 use editor::{Editor, EditorElement, EditorEvent, EditorStyle, actions as editor_actions};
 use file_icons::FileIcons;
 use gpui::{
-    Action, Anchor, AnyWindowHandle, App, AppContext, AsyncWindowContext, ClickEvent, Context,
-    ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, TextStyle, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
-    actions, px, size,
+    Action, Anchor, AnyWindowHandle, App, AppContext, AsyncWindowContext, Bounds, ClickEvent,
+    Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Rems, Render, SharedString, Size,
+    StatefulInteractiveElement, Styled, Subscription, TextStyle, TitlebarOptions, WeakEntity,
+    Window, WindowBounds, WindowOptions, actions, px, size,
 };
+use http_client::{AsyncBody, HttpClient, Method};
 use project::{Project, ProjectPath};
+use reqwest_client::ReqwestClient;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -27,6 +29,10 @@ use util::ResultExt as _;
 
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{OpenOptions, Panel, StatusItemView, Workspace};
+
+mod table_view;
+
+use table_view::{DatabaseTableView, TableTabTarget};
 
 actions!(
     php_panel,
@@ -51,13 +57,47 @@ pub struct AddAsDataSource {
     pub abs_path: Option<String>,
 }
 
+/// Opens (adds if needed) a SQLite file as a data source and expands it in
+/// the Databases tab, like double-clicking a SQLite file in PhpStorm.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct OpenSqliteDataSource {
+    /// Absolute path of the SQLite file to open.
+    #[serde(default)]
+    pub abs_path: Option<String>,
+}
+
+/// Returns the name of an existing data source whose configured file path
+/// matches `path` (worktree-relative, slash-normalized).
+fn find_data_source_by_path(connections: &[DataSource], path: &str) -> Option<String> {
+    let path = path.trim().replace('\\', "/");
+    connections.iter().find_map(|source| {
+        if source.path.trim().replace('\\', "/") == path {
+            Some(source.name.clone())
+        } else {
+            None
+        }
+    })
+}
+
+/// Ensures the SQLite file is configured as a data source and returns its name.
+/// An existing connection with the same path is reused instead of duplicated.
+fn ensure_sqlite_data_source(root: &Path, rel_path: &str) -> std::result::Result<String, String> {
+    let sources = load_data_sources(root);
+    if let Some(name) = find_data_source_by_path(&sources, rel_path) {
+        return Ok(name);
+    }
+    upsert_sqlite_data_source(root, rel_path)
+}
+
 fn next_tab(active: PanelTab, offset: isize) -> PanelTab {
-    let len = PanelTab::ALL.len() as isize;
-    let index = PanelTab::ALL
+    let len = PanelTab::VISIBLE.len() as isize;
+    let index = PanelTab::VISIBLE
         .iter()
         .position(|tab| *tab == active)
         .unwrap_or(0) as isize;
-    PanelTab::ALL[((index + offset).rem_euclid(len)) as usize]
+    PanelTab::VISIBLE[((index + offset).rem_euclid(len)) as usize]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -77,6 +117,10 @@ impl PanelTab {
         PanelTab::Http,
         PanelTab::Collections,
     ];
+
+    /// Tabs shown in the panel tab bar; hidden tabs stay reachable in code
+    /// but are not rendered or cycled through.
+    const VISIBLE: [PanelTab; 3] = [PanelTab::Remote, PanelTab::Databases, PanelTab::Http];
 
     fn label(self) -> &'static str {
         match self {
@@ -672,6 +716,17 @@ impl DeploymentDialog {
         dialog.bind_validation_editor(web_url_editor, cx, |server, text| {
             server.web_url = if text.is_empty() { None } else { Some(text) };
         });
+        let mut last_bounds: Option<(f32, f32)> = None;
+        dialog
+            ._subscriptions
+            .push(cx.observe_window_bounds(window, move |_, window, _| {
+                let bounds = window.bounds();
+                let current = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+                if last_bounds != Some(current) {
+                    last_bounds = Some(current);
+                    save_dialog_size("deployment", bounds);
+                }
+            }));
         dialog.seed_from_disk(window, cx);
         dialog
     }
@@ -971,8 +1026,7 @@ impl DeploymentDialog {
             .name
             .trim_end_matches(|ch: char| ch.is_ascii_digit())
             .to_string();
-        let (name, next_number) =
-            deploy_copy_name(&self.servers, &base, self.next_number);
+        let (name, next_number) = deploy_copy_name(&self.servers, &base, self.next_number);
         copy.name = name;
         self.next_number = next_number;
         self.servers.insert(index + 1, copy);
@@ -1120,6 +1174,7 @@ impl DeploymentDialog {
         let mut rows: Vec<AnyElement> = Vec::new();
         rows.push(
             dialog_toggle_row("deploy-advanced-passive", passive, "Passive mode", cx)
+                .w_full()
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.toggle_advanced_flag(|server| &mut server.passive_mode, cx);
                 }))
@@ -1132,6 +1187,7 @@ impl DeploymentDialog {
                 "Show and process hidden files",
                 cx,
             )
+            .w_full()
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                 this.toggle_advanced_flag(|server| &mut server.show_hidden, cx);
             }))
@@ -1199,7 +1255,7 @@ impl DeploymentDialog {
                     ))
                     .child(
                         Label::new("seconds")
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted),
                     ),
                 cx,
@@ -1639,6 +1695,9 @@ fn dialog_editor_element(editor: &Entity<Editor>, cx: &App) -> AnyElement {
     EditorElement::new(editor, style).into_any_element()
 }
 
+/// Single text size for the whole panel UI (PhpStorm-like: one size everywhere).
+pub(crate) const PANEL_TEXT_REMS: Rems = Rems(1.0);
+
 const DIALOG_LABEL_WIDTH: Pixels = px(148.);
 const DIALOG_ROW_HEIGHT: Pixels = px(29.);
 const DIALOG_CONTROL_HEIGHT: Pixels = px(26.);
@@ -1646,7 +1705,7 @@ const DIALOG_CONTROL_INDENT: Pixels = px(164.);
 
 fn dialog_label(label: impl Into<SharedString>) -> Label {
     Label::new(label)
-        .size(LabelSize::Custom(rems(1.0)))
+        .size(LabelSize::Custom(PANEL_TEXT_REMS))
         .color(Color::Muted)
 }
 
@@ -1695,7 +1754,7 @@ fn dialog_editor(
         .border_color(if focused {
             colors.border_focused
         } else {
-            colors.border_variant
+            colors.border
         })
         .rounded_xs()
         .px_2()
@@ -1722,7 +1781,7 @@ fn dialog_static(text: impl Into<SharedString>, color: Color) -> AnyElement {
         .py_0p5()
         .child(
             Label::new(text)
-                .size(LabelSize::Custom(rems(1.0)))
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(color)
                 .truncate(),
         )
@@ -1737,7 +1796,7 @@ fn dialog_section_header(text: &'static str) -> AnyElement {
         .py_2()
         .child(
             Label::new(text)
-                .size(LabelSize::Custom(rems(1.0)))
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(Color::Muted),
         )
         .into_any_element()
@@ -1749,7 +1808,7 @@ fn dialog_toggle_row(
     label: impl Into<SharedString>,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
-    dialog_toggle_with(id, checked, label, None, cx).w_full()
+    dialog_toggle_with(id, checked, label, None, cx)
 }
 
 fn dialog_toggle_row_with(
@@ -1759,7 +1818,7 @@ fn dialog_toggle_row_with(
     trailing: impl IntoElement,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
-    dialog_toggle_with(id, checked, label, Some(trailing.into_any_element()), cx).w_full()
+    dialog_toggle_with(id, checked, label, Some(trailing.into_any_element()), cx)
 }
 
 fn dialog_toggle_with(
@@ -1769,8 +1828,10 @@ fn dialog_toggle_with(
     trailing: Option<AnyElement>,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
+    let element_id = id.into();
+    let id_shared: SharedString = format!("{:?}", element_id.clone()).into();
     h_flex()
-        .id(id)
+        .id(element_id)
         .flex_none()
         .items_center()
         .gap_1()
@@ -1780,13 +1841,32 @@ fn dialog_toggle_with(
         .cursor_pointer()
         .hover(|style| style.bg(cx.theme().colors().element_hover))
         .child(
-            Label::new(if checked { "[x]" } else { "[ ]" })
-                .size(LabelSize::Custom(rems(1.0)))
-                .color(if checked { Color::Accent } else { Color::Muted }),
+            div()
+                .id(SharedString::from(format!("{id_shared}-box")))
+                .flex_none()
+                .size(px(14.))
+                .rounded_xs()
+                .border_1()
+                .border_color(if checked {
+                    cx.theme().colors().border_focused
+                } else {
+                    cx.theme().colors().border_variant
+                })
+                .when(checked, |this| {
+                    this.bg(cx.theme().colors().element_active)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                }),
         )
         .child(
             Label::new(label)
-                .size(LabelSize::Custom(rems(1.0)))
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(if checked {
                     Color::Default
                 } else {
@@ -1821,8 +1901,8 @@ fn dialog_button(
         }
     }
     button
-        .label_size(LabelSize::Custom(rems(0.93)))
-        .size(ButtonSize::Default)
+        .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+        .size(ButtonSize::Medium)
         .truncate(true)
 }
 
@@ -1835,7 +1915,7 @@ fn dialog_badge(chip: impl Into<SharedString>, color: Color, cx: &App) -> gpui::
         .bg(cx.theme().colors().element_hover)
         .child(
             Label::new(format!("{} ", chip))
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(color),
         )
         .into_any_element()
@@ -1855,7 +1935,7 @@ impl Render for DeploymentDialog {
                 dialog_editor("deploy-name-editor", &self.name_editor, None, window, cx)
             } else {
                 Label::new(server.name.clone())
-                    .size(LabelSize::Custom(rems(0.93)))
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .color(if !server.visible {
                         Color::Muted
                     } else {
@@ -1912,7 +1992,7 @@ impl Render for DeploymentDialog {
                     })
                     .child(
                         Label::new(tab.label())
-                            .size(LabelSize::Custom(rems(1.0)))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(if selected {
                                 Color::Default
                             } else {
@@ -1944,7 +2024,7 @@ impl Render for DeploymentDialog {
             ))
             .child(
                 Label::new(deploy_type_display_name(&protocol))
-                    .size(LabelSize::Custom(rems(1.0)))
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .truncate(),
             )
             .child(div().flex_1().min_w_0())
@@ -2048,7 +2128,7 @@ impl Render for DeploymentDialog {
                                     .hover(|style| style.bg(cx.theme().colors().element_hover))
                                     .child(
                                         Label::new(config.name.clone())
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(if is_active {
                                                 Color::Accent
                                             } else {
@@ -2058,7 +2138,7 @@ impl Render for DeploymentDialog {
                                     )
                                     .child(
                                         Label::new(ssh_user_host_text(config))
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted)
                                             .truncate(),
                                     )
@@ -2083,7 +2163,7 @@ impl Render for DeploymentDialog {
                                 .hover(|style| style.bg(cx.theme().colors().element_hover))
                                 .child(
                                     Label::new("Add new configuration...")
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                         .color(Color::Muted),
                                 )
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -2306,7 +2386,7 @@ impl Render for DeploymentDialog {
                             .child(test_button)
                             .child(
                                 Label::new(text.clone())
-                                    .size(LabelSize::Small)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(*color)
                                     .flex_1()
                                     .truncate(),
@@ -2342,7 +2422,7 @@ impl Render for DeploymentDialog {
                         Button::new("deploy-rsync-settings", "Rsync Settings")
                             .style(ButtonStyle::Subtle)
                             .color(Color::Accent)
-                            .label_size(LabelSize::Small)
+                            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .tooltip(Tooltip::text("rsync uses ssh defaults")),
                     )
                     .into_any_element(),
@@ -2352,6 +2432,7 @@ impl Render for DeploymentDialog {
                     "Use sudo to run SFTP server",
                     cx,
                 )
+                .w_full()
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.toggle_sudo(cx);
                 }))
@@ -2378,7 +2459,7 @@ impl Render for DeploymentDialog {
                     .py_0p5()
                     .child(
                         Label::new(format!("⚠ {warning}"))
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Warning)
                             .truncate(),
                     )
@@ -2399,6 +2480,7 @@ impl Render for DeploymentDialog {
                             "Visible only for this project",
                             cx,
                         )
+                        .w_full()
                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                             this.toggle_visible(cx);
                         }))
@@ -2431,7 +2513,7 @@ impl Render for DeploymentDialog {
                                     ))
                                     .child(
                                         Label::new(*label)
-                                            .size(LabelSize::Custom(rems(1.0)))
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(if is_current {
                                                 Color::Accent
                                             } else {
@@ -2486,7 +2568,7 @@ impl Render for DeploymentDialog {
                                     } else {
                                         "▸ Advanced"
                                     })
-                                    .size(LabelSize::Custom(rems(1.0)))
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(Color::Default),
                                 )
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -2569,7 +2651,7 @@ impl Render for DeploymentDialog {
                 .py_1()
                 .child(
                     Label::new(text.clone())
-                        .size(LabelSize::Custom(rems(1.0)))
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(*color)
                         .truncate(),
                 )
@@ -2601,7 +2683,7 @@ impl Render for DeploymentDialog {
                     .py_2()
                     .child(
                         Label::new("Deployment")
-                            .size(LabelSize::Custom(rems(1.0)))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Default),
                     )
                     .child(
@@ -2699,12 +2781,12 @@ impl Render for DeploymentDialog {
                                     .gap_0p5()
                                     .child(
                                         Label::new("Problems")
-                                            .size(LabelSize::Custom(rems(1.0)))
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted),
                                     )
                                     .children(selected_warnings.iter().map(|warning| {
                                         Label::new(format!("⚠ {warning}"))
-                                            .size(LabelSize::Custom(rems(1.0)))
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Warning)
                                             .into_any_element()
                                     })),
@@ -2836,7 +2918,7 @@ pub fn open_deployment_window(root: PathBuf, cx: &mut App) {
         cx.global_mut::<DeployDialogWindow>().0 = None;
     }
 
-    let window_bounds = WindowBounds::centered(size(px(660.), px(470.)), cx);
+    let window_bounds = dialog_bounds("deployment", size(px(660.), px(470.)), cx);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -3718,6 +3800,70 @@ fn upsert_sqlite_data_source(root: &Path, rel_path: &str) -> std::result::Result
     Ok(name)
 }
 
+fn open_sqlite_data_source(
+    workspace: &Workspace,
+    abs_path: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let project = workspace.project().read(cx);
+    let mut target = None;
+    for worktree in project.visible_worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let worktree_root = worktree.abs_path();
+        let Ok(relative) = Path::new(abs_path).strip_prefix(&*worktree_root) else {
+            continue;
+        };
+        if !relative.as_os_str().is_empty() {
+            target = Some((worktree_root.to_path_buf(), relative.to_path_buf()));
+            break;
+        }
+    }
+    let Some((root, relative)) = target else {
+        if cx.has_global::<DeployShared>() {
+            if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.saved_message =
+                            Some(format!("failed: '{abs_path}' is not in any project folder"));
+                    })
+                    .log_err();
+            }
+        }
+        return;
+    };
+    let rel_path = relative.to_string_lossy().replace('\\', "/");
+    match ensure_sqlite_data_source(&root, &rel_path) {
+        Ok(name) => {
+            if cx.has_global::<DeployShared>() {
+                if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.refresh(cx);
+                            panel.select_tab(PanelTab::Databases, cx);
+                            panel.saved_message = None;
+                            panel.expand_database_connection(&name, root.clone(), cx);
+                        })
+                        .log_err();
+                }
+            }
+        }
+        Err(message) => {
+            if cx.has_global::<DeployShared>() {
+                if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.saved_message = Some(format!("failed: {message}"));
+                            cx.notify();
+                        })
+                        .log_err();
+                }
+            }
+        }
+    }
+    let _ = window;
+}
+
 fn add_data_source_from_sqlite_file(
     workspace: &Workspace,
     abs_path: &str,
@@ -3776,6 +3922,7 @@ pub struct DataSourcesDialog {
     driver_menu_open: bool,
     ssh_configs: Vec<SshEntry>,
     advanced_rows: Vec<(Entity<Editor>, Entity<Editor>)>,
+    _bounds_subscription: Option<Subscription>,
 }
 
 impl Focusable for DataSourcesDialog {
@@ -3807,7 +3954,18 @@ impl DataSourcesDialog {
             driver_menu_open: false,
             ssh_configs: Vec::new(),
             advanced_rows: Vec::new(),
+            _bounds_subscription: None,
         };
+        let mut last_bounds: Option<(f32, f32)> = None;
+        dialog._bounds_subscription =
+            Some(cx.observe_window_bounds(window, move |_, window, _| {
+                let bounds = window.bounds();
+                let current = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+                if last_bounds != Some(current) {
+                    last_bounds = Some(current);
+                    save_dialog_size("data_sources", bounds);
+                }
+            }));
         dialog.seed_from_disk(window, cx);
         dialog
     }
@@ -4341,6 +4499,7 @@ pub struct SshConfigsDialog {
     password_editor: Entity<Editor>,
     key_path_editor: Entity<Editor>,
     keep_alive_editor: Entity<Editor>,
+    _bounds_subscription: Option<Subscription>,
 }
 
 impl Focusable for SshConfigsDialog {
@@ -4371,7 +4530,18 @@ impl SshConfigsDialog {
             password_editor,
             key_path_editor: cx.new(|cx| Editor::single_line(window, cx)),
             keep_alive_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            _bounds_subscription: None,
         };
+        let mut last_bounds: Option<(f32, f32)> = None;
+        dialog._bounds_subscription =
+            Some(cx.observe_window_bounds(window, move |_, window, _| {
+                let bounds = window.bounds();
+                let current = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+                if last_bounds != Some(current) {
+                    last_bounds = Some(current);
+                    save_dialog_size("ssh", bounds);
+                }
+            }));
         dialog.seed_from_disk(window, cx);
         dialog
     }
@@ -4655,7 +4825,7 @@ impl Render for SshConfigsDialog {
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
                     .child(
                         Label::new(config.name.clone())
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(if is_selected {
                                 Color::Accent
                             } else {
@@ -4806,7 +4976,7 @@ impl Render for SshConfigsDialog {
                     ))
                     .child(
                         Label::new("seconds")
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted),
                     ),
                 cx,
@@ -4911,7 +5081,7 @@ impl Render for SshConfigsDialog {
                     .py_1()
                     .child(
                         Label::new(text)
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(color)
                             .truncate(),
                     )
@@ -4934,7 +5104,7 @@ impl Render for SshConfigsDialog {
                             .child(test_button)
                             .children(test_message.as_ref().map(|(text, color)| {
                                 Label::new(text.clone())
-                                    .size(LabelSize::Small)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(*color)
                                     .flex_1()
                                     .truncate()
@@ -5088,7 +5258,7 @@ pub fn open_ssh_configs_window(root: PathBuf, cx: &mut App) {
         cx.global_mut::<SshConfigDialogWindow>().0 = None;
     }
 
-    let window_bounds = WindowBounds::centered(size(px(700.), px(480.)), cx);
+    let window_bounds = dialog_bounds("ssh", size(px(700.), px(480.)), cx);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -5132,6 +5302,7 @@ pub struct RootPickerDialog {
     selected: Option<String>,
     query_editor: Entity<Editor>,
     seq: u64,
+    _bounds_subscription: Option<Subscription>,
 }
 
 impl Focusable for RootPickerDialog {
@@ -5149,7 +5320,18 @@ impl RootPickerDialog {
             selected: None,
             query_editor: cx.new(|cx| Editor::single_line(window, cx)),
             seq: 0,
+            _bounds_subscription: None,
         };
+        let mut last_bounds: Option<(f32, f32)> = None;
+        dialog._bounds_subscription =
+            Some(cx.observe_window_bounds(window, move |_, window, _| {
+                let bounds = window.bounds();
+                let current = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+                if last_bounds != Some(current) {
+                    last_bounds = Some(current);
+                    save_dialog_size("root_picker", bounds);
+                }
+            }));
         dialog.expanded.insert(".".to_string());
         dialog.load_dir(".".to_string(), cx);
         dialog
@@ -5320,12 +5502,12 @@ impl Render for RootPickerDialog {
                     } else {
                         "▸"
                     })
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .color(Color::Muted),
                 )
                 .child(
                     Label::new(self.root_label())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Default)
                         .truncate(),
                 )
@@ -5347,7 +5529,7 @@ impl Render for RootPickerDialog {
                                 .py_1()
                                 .child(
                                     Label::new("empty directory")
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                         .color(Color::Muted),
                                 )
                                 .into_any_element(),
@@ -5360,7 +5542,7 @@ impl Render for RootPickerDialog {
                         .py_1()
                         .child(
                             Label::new(message)
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .color(Color::Error)
                                 .truncate(),
                         )
@@ -5374,7 +5556,7 @@ impl Render for RootPickerDialog {
                     .py_1()
                     .child(
                         Label::new("loading…")
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted),
                     )
                     .into_any_element(),
@@ -5395,7 +5577,7 @@ impl Render for RootPickerDialog {
                     .py_2()
                     .child(
                         Label::new("Search:")
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted),
                     )
                     .child(
@@ -5405,7 +5587,7 @@ impl Render for RootPickerDialog {
                             .min_w_0()
                             .bg(colors.editor_background)
                             .border_1()
-                            .border_color(colors.border_variant)
+                            .border_color(colors.border)
                             .rounded_sm()
                             .px_1()
                             .py_0p5()
@@ -5430,22 +5612,17 @@ impl Render for RootPickerDialog {
                     .px_3()
                     .py_2()
                     .child(
-                        Button::new("rp-cancel", "Cancel")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Subtle)
+                        dialog_button("rp-cancel", "Cancel", DialogButtonVariant::Secondary)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.cancel(window, cx);
                             })),
                     )
                     .child(
-                        Button::new("rp-ok", "OK")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        dialog_button("rp-ok", "OK", DialogButtonVariant::Primary).on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.confirm(window, cx);
-                            })),
+                            }),
+                        ),
                     ),
             )
     }
@@ -5509,7 +5686,7 @@ impl RootPickerDialog {
                             .w(px(14.))
                             .child(
                                 Label::new(if expanded { "▾" } else { "▸" })
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(Color::Muted),
                             )
                             .hover(|style| style.bg(colors.element_hover))
@@ -5535,7 +5712,7 @@ impl RootPickerDialog {
             }
             item = item.child(
                 Label::new(entry.name.clone())
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .color(if selected {
                         Color::Accent
                     } else {
@@ -5607,7 +5784,7 @@ pub fn open_root_picker_window(
         }
         cx.global_mut::<RootPickerWindow>().0 = None;
     }
-    let window_bounds = WindowBounds::centered(size(px(560.), px(520.)), cx);
+    let window_bounds = dialog_bounds("root_picker", size(px(560.), px(520.)), cx);
     let request = RootPickerRequest {
         root,
         server,
@@ -5656,7 +5833,7 @@ pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
         cx.global_mut::<DataSourcesDialogWindow>().0 = None;
     }
 
-    let window_bounds = WindowBounds::centered(size(px(760.), px(720.)), cx);
+    let window_bounds = dialog_bounds("data_sources", size(px(760.), px(720.)), cx);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -5723,7 +5900,7 @@ impl Render for DataSourcesDialog {
                     ))
                     .child(
                         Label::new(source.name.clone())
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(if is_selected {
                                 Color::Accent
                             } else {
@@ -5752,7 +5929,7 @@ impl Render for DataSourcesDialog {
                     .py_0p5()
                     .child(
                         Label::new(problem.clone())
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Error)
                             .truncate(),
                     )
@@ -5775,7 +5952,7 @@ impl Render for DataSourcesDialog {
                     })
                     .child(
                         Label::new(tab.label())
-                            .size(LabelSize::Custom(rems(1.0)))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(if selected {
                                 Color::Default
                             } else {
@@ -5819,12 +5996,12 @@ impl Render for DataSourcesDialog {
                         ))
                         .child(
                             Label::new(driver_display_name(&driver))
-                                .size(LabelSize::Small)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .truncate(),
                         )
                         .child(
                             Label::new(driver_support_hint(&driver))
-                                .size(LabelSize::Small)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .color(Color::Muted),
                         )
                         .child(div().flex_1().min_w_0())
@@ -5861,7 +6038,7 @@ impl Render for DataSourcesDialog {
                                 ))
                                 .child(
                                     Label::new(driver_display_name(menu_driver))
-                                        .size(LabelSize::Small)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                         .color(if is_current {
                                             Color::Accent
                                         } else {
@@ -5907,7 +6084,7 @@ impl Render for DataSourcesDialog {
                         } else {
                             sqlite_path
                         })
-                        .size(LabelSize::Small)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Muted)
                         .truncate(),
                     ));
@@ -5947,7 +6124,7 @@ impl Render for DataSourcesDialog {
                     } else {
                         "User & Password"
                     })
-                    .size(LabelSize::Small)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .color(Color::Muted),
                 ));
                 for field in rest {
@@ -5977,7 +6154,7 @@ impl Render for DataSourcesDialog {
                                     ))
                                     .child(
                                         Label::new(masked)
-                                            .size(LabelSize::Small)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted),
                                     ),
                             )
@@ -6043,6 +6220,7 @@ impl Render for DataSourcesDialog {
                 let mut rows = Vec::new();
                 rows.push(
                     dialog_toggle_row("ds-ssh-toggle", ssh_enabled, "Use SSH tunnel", cx)
+                        .w_full()
                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                             this.toggle_ssh(cx);
                         }))
@@ -6115,7 +6293,7 @@ impl Render for DataSourcesDialog {
                                     .hover(|style| style.bg(cx.theme().colors().element_hover))
                                     .child(
                                         Label::new(config.name.clone())
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(if is_active {
                                                 Color::Accent
                                             } else {
@@ -6125,7 +6303,7 @@ impl Render for DataSourcesDialog {
                                     )
                                     .child(
                                         Label::new(ssh_user_host_text(config))
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted)
                                             .truncate(),
                                     )
@@ -6150,7 +6328,7 @@ impl Render for DataSourcesDialog {
                                 .hover(|style| style.bg(cx.theme().colors().element_hover))
                                 .child(
                                     Label::new("Add new configuration...")
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                         .color(Color::Muted),
                                 )
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -6196,7 +6374,7 @@ impl Render for DataSourcesDialog {
                         )
                         .child(
                             Label::new("auto")
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .color(Color::Muted),
                         )
                         .into_any_element(),
@@ -6212,7 +6390,7 @@ impl Render for DataSourcesDialog {
                             .py_0p5()
                             .child(
                                 Label::new("press refresh to load schemas")
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(Color::Muted),
                             )
                             .into_any_element(),
@@ -6223,7 +6401,7 @@ impl Render for DataSourcesDialog {
                             .py_0p5()
                             .child(
                                 Label::new("loading…")
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(Color::Muted),
                             )
                             .into_any_element(),
@@ -6234,7 +6412,7 @@ impl Render for DataSourcesDialog {
                             .py_0p5()
                             .child(
                                 Label::new(error.clone())
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(Color::Error)
                                     .truncate(),
                             )
@@ -6348,7 +6526,7 @@ impl Render for DataSourcesDialog {
                 .py_1()
                 .child(
                     Label::new(text.clone())
-                        .size(LabelSize::Small)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(*color)
                         .truncate(),
                 )
@@ -6392,7 +6570,7 @@ impl Render for DataSourcesDialog {
                                             )
                                             .child(
                                                 Label::new("Data Sources")
-                                                    .size(LabelSize::Small)
+                                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                                     .color(Color::Default),
                                             ),
                                     )
@@ -6449,7 +6627,7 @@ impl Render for DataSourcesDialog {
                                     .py_1()
                                     .child(
                                         Label::new("Problems")
-                                            .size(LabelSize::Custom(rems(1.0)))
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted),
                                     )
                                     .children(problem_rows),
@@ -6471,7 +6649,7 @@ impl Render for DataSourcesDialog {
                                     .border_color(colors.border)
                                     .child(
                                         Label::new("Name:")
-                                            .size(LabelSize::Small)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted),
                                     )
                                     .child(dialog_editor(
@@ -6483,7 +6661,7 @@ impl Render for DataSourcesDialog {
                                     ))
                                     .child(
                                         Label::new("Color")
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted),
                                     ),
                             )
@@ -6525,7 +6703,7 @@ impl Render for DataSourcesDialog {
                             .child(test_button)
                             .children(test_message.as_ref().map(|(text, color)| {
                                 Label::new(text.clone())
-                                    .size(LabelSize::Small)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(*color)
                                     .flex_1()
                                     .truncate()
@@ -6578,10 +6756,10 @@ const DATABASE_DRIVERS: [&str; 8] = [
 ];
 
 #[derive(Clone)]
-struct DatabaseColumn {
-    name: String,
-    column_type: String,
-    primary_key: bool,
+pub(crate) struct DatabaseColumn {
+    pub(crate) name: String,
+    pub(crate) column_type: String,
+    pub(crate) primary_key: bool,
 }
 
 #[derive(Clone)]
@@ -6648,6 +6826,15 @@ enum HttpStatus {
     Running,
     Status(u16),
     Failed(String),
+    Response(HttpProbeResponse),
+}
+
+#[derive(Clone)]
+struct HttpProbeResponse {
+    status: u16,
+    time_ms: u64,
+    headers: Vec<(String, String)>,
+    body: String,
 }
 
 enum TestListStatus {
@@ -7021,16 +7208,31 @@ fn parse_test_run(stdout: &str) -> std::result::Result<TestRunResult, String> {
     })
 }
 
-fn first_non_empty_line<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+pub(crate) fn first_non_empty_line<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
     lines
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(str::to_string)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpBodyMode {
+    Raw,
+    Form,
+}
+
+struct HttpBuilderEditors {
+    url: Entity<Editor>,
+    headers: Entity<Editor>,
+    body: Entity<Editor>,
+    form_pairs: Vec<(Entity<Editor>, Entity<Editor>)>,
+}
+
 pub struct PhpPanel {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    /// Open table-data tabs so clicking the same table focuses the tab again.
+    open_table_views: Vec<(String, String, WeakEntity<DatabaseTableView>)>,
     project: Entity<Project>,
     active_tab: PanelTab,
     http_requests: Vec<HttpRequest>,
@@ -7047,9 +7249,7 @@ pub struct PhpPanel {
     sync_status: HashMap<String, SyncStatus>,
     database_status: HashMap<String, DatabaseStatus>,
     database_check_status: HashMap<String, SyncStatus>,
-    table_status: HashMap<(String, String), TableStatus>,
     query_status: HashMap<String, TableStatus>,
-    expanded_tables: HashSet<(String, String)>,
     db_expanded_conns: HashSet<String>,
     db_expanded_views: HashSet<String>,
     db_expanded_names: HashSet<String>,
@@ -7057,6 +7257,11 @@ pub struct PhpPanel {
     database_views_status: HashMap<String, DatabaseStatus>,
     db_menu_open: bool,
     http_status: HashMap<String, HttpStatus>,
+    http_builder: Option<HttpBuilderEditors>,
+    http_method: String,
+    http_body_mode: HttpBodyMode,
+    http_builder_response: Option<HttpProbeResponse>,
+    http_builder_busy: bool,
     test_list_status: TestListStatus,
     test_files: Vec<String>,
     test_run: Option<TestRunState>,
@@ -7168,6 +7373,18 @@ impl PhpPanel {
                     }
                 }
             });
+            workspace.register_action(|workspace, action: &OpenSqliteDataSource, window, cx| {
+                let Some(abs_path) = action.abs_path.as_deref().map(str::trim) else {
+                    return;
+                };
+                if abs_path.is_empty() {
+                    return;
+                }
+                // Like PhpStorm: the Databases tool window comes to the
+                // front right away, so the connection is immediately visible.
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+                open_sqlite_data_source(workspace, abs_path, window, cx);
+            });
         })
         .detach();
     }
@@ -7208,13 +7425,12 @@ impl PhpPanel {
                     remote_dir_entries: HashMap::new(),
                     remote_expanded_paths: HashSet::new(),
                     remote_status: HashMap::new(),
+                    open_table_views: Vec::new(),
                     databases: Vec::new(),
                     sync_status: HashMap::new(),
                     database_status: HashMap::new(),
                     database_check_status: HashMap::new(),
-                    table_status: HashMap::new(),
                     query_status: HashMap::new(),
-                    expanded_tables: HashSet::new(),
                     db_expanded_conns: HashSet::new(),
                     db_expanded_views: HashSet::new(),
                     db_expanded_names: HashSet::new(),
@@ -7222,6 +7438,11 @@ impl PhpPanel {
                     database_views_status: HashMap::new(),
                     db_menu_open: false,
                     http_status: HashMap::new(),
+                    http_builder: None,
+                    http_method: "GET".to_string(),
+                    http_body_mode: HttpBodyMode::Raw,
+                    http_builder_response: None,
+                    http_builder_busy: false,
                     test_list_status: TestListStatus::Unloaded,
                     test_files: Vec::new(),
                     test_run: None,
@@ -7526,8 +7747,6 @@ impl PhpPanel {
         self.database_check_status.clear();
         self.database_views_status.clear();
         self.db_names_status.clear();
-        self.table_status.clear();
-        self.expanded_tables.clear();
         self.db_expanded_conns.clear();
         self.db_expanded_views.clear();
         self.db_expanded_names.clear();
@@ -7768,7 +7987,7 @@ impl PhpPanel {
             if let Some((text, color)) = end_slot {
                 item = item.end_slot(
                     Label::new(text)
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(color)
                         .truncate(),
                 );
@@ -8343,6 +8562,28 @@ impl PhpPanel {
         .detach();
     }
 
+    /// Expands a database connection in the Databases tab and loads its schema,
+    /// switching the panel to the Databases tab (PhpStorm-like "open database").
+    pub fn expand_database_connection(
+        &mut self,
+        name: &str,
+        root: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_tab(PanelTab::Databases, cx);
+        if self.db_expanded_conns.contains(name) {
+            return;
+        }
+        self.db_expanded_conns.insert(name.to_string());
+        if !matches!(
+            self.database_status.get(name),
+            Some(DatabaseStatus::Loaded(_))
+        ) {
+            self.load_database_schema(name.to_string(), root, cx);
+        }
+        cx.notify();
+    }
+
     fn toggle_connection_expand(
         &mut self,
         name: String,
@@ -8493,77 +8734,56 @@ impl PhpPanel {
         .detach();
     }
 
-    fn toggle_table_preview(
+    /// Opens a table (or view) as a data tab in the editor area, like
+    /// double-clicking a table node in PhpStorm.
+    fn open_table_tab(
         &mut self,
         connection: String,
         table: String,
         root: PathBuf,
+        columns: Vec<DatabaseColumn>,
+        editable_candidate: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key = (connection.clone(), table.clone());
-        if self.expanded_tables.contains(&key) {
-            self.expanded_tables.remove(&key);
-            cx.notify();
-            return;
-        }
-
-        self.expanded_tables.insert(key.clone());
-        if matches!(self.table_status.get(&key), Some(TableStatus::Loading)) {
-            cx.notify();
-            return;
-        }
-        self.load_table_preview(connection, table, root, cx);
-    }
-
-    fn load_table_preview(
-        &mut self,
-        connection: String,
-        table: String,
-        root: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
-        let key = (connection.clone(), table.clone());
-        self.table_status.insert(key.clone(), TableStatus::Loading);
-        cx.notify();
-
-        let sql = format!("select * from \"{}\" limit 20", table.replace('"', "\"\""));
-        let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-db")
-                .arg("query")
-                .arg(&connection)
-                .arg(&sql)
-                .arg("--json")
-                .current_dir(&root)
-                .output();
-
-            match output {
-                Ok(output) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    parse_table_rows(&stdout)
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
-                        .unwrap_or_else(|| "query command failed".to_string()))
-                }
-                Err(error) => Err(error.to_string()),
-            }
-        });
-
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                let status = match result {
-                    Ok(rows) => TableStatus::Loaded(rows),
-                    Err(message) => TableStatus::Failed(message),
-                };
-                this.table_status.insert(key, status);
-                cx.notify();
+        // Reuse an already open tab for the same table, like PhpStorm.
+        self.open_table_views
+            .retain(|(_, _, view)| view.upgrade().is_some());
+        let existing = self
+            .open_table_views
+            .iter()
+            .find(|(open_connection, open_table, _)| {
+                open_connection == &connection && open_table == &table
             })
-            .log_err();
-        })
-        .detach();
+            .and_then(|(_, _, view)| view.upgrade());
+        if let Some(view) = existing {
+            self.workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.activate_item(&view, true, true, window, cx);
+                })
+                .ok();
+            return;
+        }
+        let view = DatabaseTableView::open(
+            TableTabTarget {
+                connection: connection.clone(),
+                table: table.clone(),
+                root,
+                columns,
+                editable_candidate,
+            },
+            cx,
+        );
+        self.open_table_views
+            .push((connection, table, view.downgrade()));
+        self.workspace
+            .update_in(cx, |workspace, window, cx| {
+                let pane = workspace.active_pane();
+                pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(view), true, true, None, window, cx);
+                });
+            })
+            .ok();
     }
 
     fn run_sql_query(
@@ -8615,6 +8835,58 @@ impl PhpPanel {
             .log_err();
         })
         .detach();
+    }
+}
+
+const DIALOG_SIZE_MIN_WIDTH: f32 = 480.;
+const DIALOG_SIZE_MIN_HEIGHT: f32 = 360.;
+
+/// Path of the user-resizable dialog sizes store
+fn dialog_sizes_path() -> PathBuf {
+    paths::data_dir()
+        .join("phpworkbench")
+        .join("dialog_sizes.json")
+}
+
+/// Window bounds for a tool dialog: last user-resized size if persisted, else centered default.
+fn dialog_bounds(key: &str, default: Size<Pixels>, cx: &App) -> WindowBounds {
+    let saved = read_json(&dialog_sizes_path())
+        .and_then(|value| value.get(key).cloned())
+        .and_then(|value| {
+            let width = value.get("width")?.as_f64()? as f32;
+            let height = value.get("height")?.as_f64()? as f32;
+            Some((width, height))
+        })
+        .filter(|(width, height)| {
+            *width >= DIALOG_SIZE_MIN_WIDTH && *height >= DIALOG_SIZE_MIN_HEIGHT
+        });
+    match saved {
+        Some((width, height)) => {
+            WindowBounds::Windowed(Bounds::centered(None, size(px(width), px(height)), cx))
+        }
+        None => WindowBounds::centered(default, cx),
+    }
+}
+
+fn save_dialog_size(key: &str, bounds: Bounds<Pixels>) {
+    let width = bounds.size.width.as_f32();
+    let height = bounds.size.height.as_f32();
+    if width < DIALOG_SIZE_MIN_WIDTH || height < DIALOG_SIZE_MIN_HEIGHT {
+        return;
+    }
+    let path = dialog_sizes_path();
+    let mut sizes = read_json(&path)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    sizes.insert(
+        key.to_string(),
+        serde_json::json!({ "width": width, "height": height }),
+    );
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(contents) = serde_json::to_string_pretty(&sizes) {
+        let _ = std::fs::write(&path, contents);
     }
 }
 
@@ -9507,7 +9779,9 @@ fn parse_database_names(stdout: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn parse_table_rows(stdout: &str) -> Result<Vec<serde_json::Map<String, Value>>, String> {
+pub(crate) fn parse_table_rows(
+    stdout: &str,
+) -> Result<Vec<serde_json::Map<String, Value>>, String> {
     let value: Value = serde_json::from_str(stdout).map_err(|_| {
         first_non_empty_line(stdout.lines()).unwrap_or_else(|| "invalid query JSON".to_string())
     })?;
@@ -9534,7 +9808,7 @@ fn query_columns(rows: &[serde_json::Map<String, Value>]) -> Vec<DatabaseColumn>
     columns
 }
 
-fn display_value(value: &Value) -> String {
+pub(crate) fn display_value(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Null => "NULL".to_string(),
@@ -9577,11 +9851,23 @@ fn render_table_grid(
         .w_full()
         .flex_none()
         .items_center()
-        .gap_2()
-        .px_2()
-        .py_1()
+        .bg(cx.theme().colors().editor_background)
         .border_b_1()
         .border_color(cx.theme().colors().border)
+        .child(
+            div()
+                .w(px(44.))
+                .flex_none()
+                .px_2()
+                .border_r_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Label::new("#")
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .color(Color::Muted)
+                        .buffer_font(cx),
+                ),
+        )
         .children(headers.iter().zip(widths.iter()).map(|(header, width)| {
             div()
                 .w(*width)
@@ -9589,7 +9875,7 @@ fn render_table_grid(
                 .overflow_hidden()
                 .child(
                     Label::new(header.clone())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .weight(gpui::FontWeight::BOLD)
                         .color(Color::Muted)
                         .buffer_font(cx)
@@ -9603,23 +9889,37 @@ fn render_table_grid(
         .children(preview_rows.iter().enumerate().map(|(row_index, row)| {
             h_flex()
                 .w_full()
+                .flex_none()
                 .items_center()
-                .gap_2()
-                .px_2()
-                .py_1()
                 .when(row_index % 2 == 1, |this| {
                     this.bg(cx.theme().colors().element_background)
                 })
                 .hover(|style| style.bg(cx.theme().colors().element_hover))
+                .child(
+                    div()
+                        .w(px(44.))
+                        .flex_none()
+                        .h_full()
+                        .px_2()
+                        .border_r_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(
+                            Label::new(format!("{}", row_index + 1))
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .color(Color::Muted)
+                                .buffer_font(cx),
+                        ),
+                )
                 .children(headers.iter().zip(widths.iter()).map(|(header, width)| {
                     let value = row.get(header).map(display_value).unwrap_or_default();
                     div()
                         .w(*width)
                         .flex_none()
                         .overflow_hidden()
+                        .px_2()
                         .child(
                             Label::new(value)
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .buffer_font(cx)
                                 .truncate(),
                         )
@@ -9632,10 +9932,8 @@ fn render_table_grid(
         .id(id.to_string())
         .w_full()
         .flex_none()
-        .max_h(relative(0.55))
-        .overflow_y_scroll()
-        .border_t_1()
-        .border_color(cx.theme().colors().border)
+        .border_b_1()
+        .border_color(cx.theme().colors().border_variant)
         .child(
             h_flex()
                 .w_full()
@@ -9645,13 +9943,13 @@ fn render_table_grid(
                 .py_1()
                 .child(
                     Label::new(table_name.to_string())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .weight(gpui::FontWeight::BOLD)
                         .truncate(),
                 )
                 .child(
                     Label::new(format!("· {} rows", rows.len()))
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Muted),
                 ),
         )
@@ -9736,7 +10034,7 @@ impl Panel for PhpPanel {
 }
 
 impl Render for PhpPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh(cx);
 
         let selected_remote = self.current_remote_server().cloned();
@@ -9799,7 +10097,7 @@ impl Render for PhpPanel {
                         |this, name| {
                             this.child(
                                 Label::new(name)
-                                    .size(LabelSize::Small)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                     .color(Color::Default)
                                     .truncate(),
                             )
@@ -9808,7 +10106,7 @@ impl Render for PhpPanel {
                     .when(picker.is_none(), |this| {
                         this.child(
                             Label::new("no server")
-                                .size(LabelSize::Small)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .color(Color::Muted)
                                 .truncate(),
                         )
@@ -9911,7 +10209,7 @@ impl Render for PhpPanel {
                         .child(remote_protocol_badge(&badge, cx))
                         .child(
                             Label::new(server.name.clone())
-                                .size(LabelSize::Small)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .color(if is_active {
                                     Color::Accent
                                 } else {
@@ -9937,7 +10235,7 @@ impl Render for PhpPanel {
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
                     .child(
                         Label::new("<no default server>")
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -10001,7 +10299,7 @@ impl Render for PhpPanel {
                 None => Color::Muted,
             };
             let status_label = Label::new(line)
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(status_color)
                 .truncate()
                 .into_any_element();
@@ -10011,7 +10309,7 @@ impl Render for PhpPanel {
             {
                 Some(RemoteStatus::Failed(message)) => Some(
                     Label::new(message.clone())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Error)
                         .truncate()
                         .into_any_element(),
@@ -10058,14 +10356,14 @@ impl Render for PhpPanel {
             if index > 0 {
                 crumb_children.push(
                     Label::new("/")
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Muted)
                         .into_any_element(),
                 );
             }
             crumb_children.push(
                 Label::new(part.clone())
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .color(if index + 1 == crumb_parts.len() {
                         Color::Default
                     } else {
@@ -10135,13 +10433,13 @@ impl Render for PhpPanel {
                     ))
                     .child(
                         Label::new(server.name.clone())
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Default)
                             .flex_none(),
                     )
                     .child(
                         Label::new(host_part.clone())
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted)
                             .truncate(),
                     )
@@ -10165,7 +10463,7 @@ impl Render for PhpPanel {
                         .py_1()
                         .child(
                             Label::new(message)
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .color(color)
                                 .truncate(),
                         )
@@ -10191,95 +10489,89 @@ impl Render for PhpPanel {
                                     .indent_level(1)
                                     .child(
                                         Label::new("no tables")
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted),
                                     )
                                     .into_any_element(),
                             );
                         }
                         for (table_index, table) in tables.iter().enumerate() {
-                            let table_key = (database.name.clone(), table.name.clone());
-                            let preview_status = self.table_status.get(&table_key);
-
-                            let table_expanded = self.expanded_tables.contains(&table_key);
                             let connection_name = database.name.clone();
                             let table_name = table.name.clone();
                             let table_root = database.root.clone();
+                            let table_columns = table.columns.clone();
+                            let table_editable = database.driver.as_deref() == Some("sqlite");
 
-                            let mut table_item =
+                            schema_rows.push(
                                 ListItem::new(format!("database-table-{index}-{table_index}"))
                                     .indent_level(1)
-                                    .toggle(table_expanded)
                                     .child(
-                                        Label::new(format!(
-                                            "{} ({} columns)",
-                                            table.name,
-                                            table.columns.len()
-                                        ))
-                                        .truncate(),
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Icon::new(IconName::Table)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(table.name.clone())
+                                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                                    .truncate(),
+                                            ),
                                     )
                                     .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, _window, cx| {
-                                            this.toggle_table_preview(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.open_table_tab(
                                                 connection_name.clone(),
                                                 table_name.clone(),
                                                 table_root.clone(),
+                                                table_columns.clone(),
+                                                table_editable,
+                                                window,
                                                 cx,
                                             );
                                         },
-                                    ));
-                            if let Some(status) = preview_status {
-                                let (status_text, color) = match status {
-                                    TableStatus::Loading => ("loading…".to_string(), Color::Muted),
-                                    TableStatus::Loaded(rows) => (
-                                        format!(
-                                            "{} {}",
-                                            rows.len(),
-                                            if rows.len() == 1 { "row" } else { "rows" }
-                                        ),
-                                        Color::Default,
-                                    ),
-                                    TableStatus::Failed(message) => (message.clone(), Color::Error),
-                                };
-                                table_item = table_item.end_slot(
-                                    Label::new(status_text)
-                                        .size(LabelSize::XSmall)
-                                        .color(color)
-                                        .truncate(),
-                                );
-                            }
-                            schema_rows.push(table_item.into_any_element());
-
-                            if table_expanded {
-                                if let Some(TableStatus::Loaded(rows)) = preview_status {
-                                    database_grids.push(render_table_grid(
-                                        &format!("database-grid-{index}-{table_index}"),
-                                        &table.name,
-                                        &table.columns,
-                                        rows,
-                                        cx,
-                                    ));
-                                }
-                            }
+                                    ))
+                                    .into_any_element(),
+                            );
 
                             for (column_index, column) in table.columns.iter().enumerate() {
-                                let text = format!(
-                                    "{} · {}{}",
-                                    column.name,
-                                    column.column_type,
-                                    if column.primary_key { " [pk]" } else { "" },
-                                );
+                                let type_text = column.column_type.clone();
+                                let column_label = h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Icon::new(if column.primary_key {
+                                            IconName::BoltFilled
+                                        } else {
+                                            IconName::Circle
+                                        })
+                                        .size(IconSize::XSmall)
+                                        .color(
+                                            if column.primary_key {
+                                                Color::Warning
+                                            } else {
+                                                Color::Muted
+                                            },
+                                        ),
+                                    )
+                                    .child(
+                                        Label::new(column.name.clone())
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Default)
+                                            .truncate(),
+                                    )
+                                    .child(
+                                        Label::new(type_text)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    );
                                 schema_rows.push(
                                     ListItem::new(format!(
                                         "database-column-{index}-{table_index}-{column_index}"
                                     ))
                                     .indent_level(2)
-                                    .child(
-                                        Label::new(text)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                            .truncate(),
-                                    )
+                                    .child(column_label)
                                     .into_any_element(),
                                 );
                             }
@@ -10291,7 +10583,7 @@ impl Render for PhpPanel {
                                 .indent_level(1)
                                 .child(
                                     Label::new("loading schema…")
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                         .color(Color::Muted),
                                 )
                                 .into_any_element(),
@@ -10303,7 +10595,7 @@ impl Render for PhpPanel {
                                 .indent_level(1)
                                 .child(
                                     Label::new(message.clone())
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                         .color(Color::Error)
                                         .truncate(),
                                 )
@@ -10329,12 +10621,12 @@ impl Render for PhpPanel {
                                     .gap_1()
                                     .child(
                                         Label::new("Views")
-                                            .size(LabelSize::Small)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Default),
                                     )
                                     .child(
                                         Label::new(format!("({})", views.len()))
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted),
                                     ),
                             )
@@ -10350,61 +10642,42 @@ impl Render for PhpPanel {
                     );
                     if views_open {
                         for (view_index, view) in views.iter().enumerate() {
-                            let view_key = (database.name.clone(), view.name.clone());
                             let view_connection = database.name.clone();
                             let view_name = view.name.clone();
                             let view_root = database.root.clone();
-                            let view_open = self.expanded_tables.contains(&view_key);
-                            let mut view_item =
+                            let view_columns = view.columns.clone();
+                            schema_rows.push(
                                 ListItem::new(format!("database-view-{index}-{view_index}"))
                                     .indent_level(2)
-                                    .toggle(view_open)
-                                    .child(Label::new(view.name.clone()).truncate())
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Icon::new(IconName::Table)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(view.name.clone())
+                                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                                    .truncate(),
+                                            ),
+                                    )
                                     .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, _window, cx| {
-                                            this.toggle_table_preview(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.open_table_tab(
                                                 view_connection.clone(),
                                                 view_name.clone(),
                                                 view_root.clone(),
+                                                view_columns.clone(),
+                                                false,
+                                                window,
                                                 cx,
                                             );
                                         },
-                                    ));
-                            if let Some(status) = self.table_status.get(&view_key) {
-                                let (status_text, color) = match status {
-                                    TableStatus::Loading => ("loading…".to_string(), Color::Muted),
-                                    TableStatus::Loaded(rows) => (
-                                        format!(
-                                            "{} {}",
-                                            rows.len(),
-                                            if rows.len() == 1 { "row" } else { "rows" }
-                                        ),
-                                        Color::Default,
-                                    ),
-                                    TableStatus::Failed(message) => (message.clone(), Color::Error),
-                                };
-                                view_item = view_item.end_slot(
-                                    Label::new(status_text)
-                                        .size(LabelSize::XSmall)
-                                        .color(color)
-                                        .truncate(),
-                                );
-                            }
-                            schema_rows.push(view_item.into_any_element());
-
-                            if view_open {
-                                if let Some(TableStatus::Loaded(rows)) =
-                                    self.table_status.get(&view_key)
-                                {
-                                    database_grids.push(render_table_grid(
-                                        &format!("database-view-grid-{index}-{view_index}"),
-                                        &view.name,
-                                        &view.columns,
-                                        rows,
-                                        cx,
-                                    ));
-                                }
-                            }
+                                    ))
+                                    .into_any_element(),
+                            );
                         }
                     }
                 }
@@ -10426,12 +10699,12 @@ impl Render for PhpPanel {
                                     .gap_1()
                                     .child(
                                         Label::new("Databases")
-                                            .size(LabelSize::Small)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Default),
                                     )
                                     .child(
                                         Label::new(names_count)
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted),
                                     ),
                             )
@@ -10452,7 +10725,7 @@ impl Render for PhpPanel {
                                         .indent_level(2)
                                         .child(
                                             Label::new("connecting…")
-                                                .size(LabelSize::XSmall)
+                                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                                 .color(Color::Muted),
                                         )
                                         .into_any_element(),
@@ -10464,7 +10737,7 @@ impl Render for PhpPanel {
                                         .indent_level(2)
                                         .child(
                                             Label::new("no databases")
-                                                .size(LabelSize::XSmall)
+                                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                                 .color(Color::Muted),
                                         )
                                         .into_any_element(),
@@ -10487,7 +10760,7 @@ impl Render for PhpPanel {
                                                 )
                                                 .child(
                                                     Label::new(db_name.clone())
-                                                        .size(LabelSize::Small),
+                                                        .size(LabelSize::Custom(PANEL_TEXT_REMS)),
                                                 ),
                                         )
                                         .into_any_element(),
@@ -10500,7 +10773,7 @@ impl Render for PhpPanel {
                                         .indent_level(2)
                                         .child(
                                             Label::new(message.clone())
-                                                .size(LabelSize::XSmall)
+                                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                                 .color(Color::Error)
                                                 .truncate(),
                                         )
@@ -10574,16 +10847,21 @@ impl Render for PhpPanel {
                         .color(Color::Muted),
                     ),
                 )
+                .child(
+                    Icon::new(IconName::DatabaseZap)
+                        .size(IconSize::XSmall)
+                        .color(Color::Accent),
+                )
                 .child(driver_badge(driver, driver_badge_color(driver), cx))
                 .child(
                     Label::new(database.name.clone())
-                        .size(LabelSize::Small)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Default)
                         .flex_none(),
                 )
                 .child(
                     Label::new(format!("({})", paren))
-                        .size(LabelSize::Small)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Muted)
                         .truncate(),
                 )
@@ -10591,7 +10869,7 @@ impl Render for PhpPanel {
             if let Some((status_text, color)) = status {
                 connection_row = connection_row.child(
                     Label::new(status_text)
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(color)
                         .truncate()
                         .flex_none(),
@@ -10630,7 +10908,7 @@ impl Render for PhpPanel {
                     .py_1()
                     .child(
                         Label::new(collection.name.clone())
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted)
                             .truncate(),
                     )
@@ -10658,6 +10936,19 @@ impl Render for PhpPanel {
                     }
                     HttpStatus::Status(code) => (format!("HTTP {code}"), Color::Error),
                     HttpStatus::Failed(message) => (message.clone(), Color::Error),
+                    HttpStatus::Response(response) => {
+                        if (200..400).contains(&response.status) {
+                            (
+                                format!("HTTP {} · {} ms", response.status, response.time_ms),
+                                Color::Success,
+                            )
+                        } else {
+                            (
+                                format!("HTTP {} · {} ms", response.status, response.time_ms),
+                                Color::Error,
+                            )
+                        }
+                    }
                 });
 
                 let mut item = ListItem::new(("collection-request", collection_row_index))
@@ -10668,7 +10959,7 @@ impl Render for PhpPanel {
                 if let Some((status_text, color)) = status {
                     item = item.end_slot(
                         Label::new(status_text)
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(color)
                             .truncate(),
                     );
@@ -10703,6 +10994,19 @@ impl Render for PhpPanel {
                     }
                     HttpStatus::Status(code) => (format!("HTTP {code}"), Color::Error),
                     HttpStatus::Failed(message) => (message.clone(), Color::Error),
+                    HttpStatus::Response(response) => {
+                        if (200..400).contains(&response.status) {
+                            (
+                                format!("HTTP {} · {} ms", response.status, response.time_ms),
+                                Color::Success,
+                            )
+                        } else {
+                            (
+                                format!("HTTP {} · {} ms", response.status, response.time_ms),
+                                Color::Error,
+                            )
+                        }
+                    }
                 });
 
                 let mut item = ListItem::new(("http-request", index))
@@ -10713,7 +11017,7 @@ impl Render for PhpPanel {
                 if let Some((status_text, color)) = status {
                     item = item.end_slot(
                         Label::new(status_text)
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(color)
                             .truncate(),
                     );
@@ -10747,7 +11051,7 @@ impl Render for PhpPanel {
             .child(
                 Button::new("tests-run-all", "Run all")
                     .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .style(ButtonStyle::Subtle)
                     .disabled(tests_running)
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -10757,7 +11061,7 @@ impl Render for PhpPanel {
             .child(
                 Button::new("tests-refresh", "Refresh")
                     .size(ButtonSize::Compact)
-                    .label_size(LabelSize::XSmall)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .style(ButtonStyle::Subtle)
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.refresh_tests(cx);
@@ -10765,7 +11069,7 @@ impl Render for PhpPanel {
             )
             .child(
                 Label::new(tests_summary_text)
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .color(tests_summary_color)
                     .truncate()
                     .flex_1(),
@@ -10819,7 +11123,7 @@ impl Render for PhpPanel {
             if let Some((status_text, color)) = status {
                 item = item.end_slot(
                     Label::new(status_text)
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(color)
                         .truncate(),
                 );
@@ -10837,7 +11141,11 @@ impl Render for PhpPanel {
                 h_flex()
                     .px_3()
                     .py_1()
-                    .child(Label::new(message).size(LabelSize::Small).color(color))
+                    .child(
+                        Label::new(message)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(color),
+                    )
                     .into_any_element(),
             );
         }
@@ -10849,7 +11157,7 @@ impl Render for PhpPanel {
                     .py_1()
                     .child(
                         Label::new("running…")
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted),
                     )
                     .into_any_element(),
@@ -10860,7 +11168,7 @@ impl Render for PhpPanel {
                     .py_1()
                     .child(
                         Label::new(message.clone())
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Error)
                             .truncate(),
                     )
@@ -10877,7 +11185,7 @@ impl Render for PhpPanel {
                         .items_start()
                         .child(
                             Label::new(case.status.label())
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .color(case.status.color())
                                 .flex_none(),
                         )
@@ -10887,14 +11195,14 @@ impl Render for PhpPanel {
                                 .min_w_0()
                                 .child(
                                     Label::new(format!("{}::{}", case.class, case.name))
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                         .color(case.status.color())
                                         .truncate(),
                                 )
                                 .when(!case.message.is_empty(), |this| {
                                     this.child(
                                         Label::new(case.message.clone())
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                             .color(Color::Muted)
                                             .truncate(),
                                     )
@@ -10922,7 +11230,7 @@ impl Render for PhpPanel {
                     Some(TestRunState::Failed(_)) => "Results · failed".to_string(),
                     None => "Results".to_string(),
                 })
-                .size(LabelSize::Small)
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(Color::Muted),
             );
 
@@ -10988,7 +11296,7 @@ impl Render for PhpPanel {
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
                     .child(
                         Label::new("Data Sources and Drivers...")
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Accent),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -11007,7 +11315,7 @@ impl Render for PhpPanel {
                     .py_0p5()
                     .child(
                         Label::new("Full Support")
-                            .size(LabelSize::XSmall)
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted),
                     )
                     .into_any_element(),
@@ -11032,7 +11340,7 @@ impl Render for PhpPanel {
                         ))
                         .child(
                             Label::new(driver_display_name(driver))
-                                .size(LabelSize::Small)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                                 .color(Color::Default)
                                 .truncate(),
                         )
@@ -11079,7 +11387,7 @@ impl Render for PhpPanel {
                 .border_color(cx.theme().colors().border)
                 .child(
                     Label::new(message)
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(color)
                         .truncate(),
                 )
@@ -11131,7 +11439,20 @@ impl Render for PhpPanel {
                             database_rows
                         }),
                 )
-                .children(database_grids)
+                .when(!database_grids.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .id("php-database-editor")
+                            .w_full()
+                            .flex_shrink_0()
+                            .h(relative(0.45))
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border)
+                            .bg(cx.theme().colors().editor_background)
+                            .overflow_y_scroll()
+                            .children(database_grids),
+                    )
+                })
                 .into_any_element(),
             PanelTab::Tests => v_flex()
                 .flex_1()
@@ -11167,17 +11488,24 @@ impl Render for PhpPanel {
                     collection_rows
                 })
                 .into_any_element(),
-            PanelTab::Http => div()
-                .id("php-http-scroll")
+            PanelTab::Http => v_flex()
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .overflow_y_scroll()
-                .children(if http_rows.is_empty() {
-                    vec![empty_row("not configured")]
-                } else {
-                    http_rows
-                })
+                .child(self.render_http_builder(window, cx))
+                .child(
+                    div()
+                        .id("php-http-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_y_scroll()
+                        .children(if http_rows.is_empty() {
+                            vec![empty_row("not configured")]
+                        } else {
+                            http_rows
+                        }),
+                )
                 .into_any_element(),
         };
 
@@ -11198,8 +11526,8 @@ impl Render for PhpPanel {
                     && !modifiers.function
                 {
                     if let Ok(index) = event.keystroke.key.parse::<usize>() {
-                        if (1..=PanelTab::ALL.len()).contains(&index) {
-                            this.select_tab(PanelTab::ALL[index - 1], cx);
+                        if (1..=PanelTab::VISIBLE.len()).contains(&index) {
+                            this.select_tab(PanelTab::VISIBLE[index - 1], cx);
                             return;
                         }
                     }
@@ -11217,6 +11545,558 @@ impl Render for PhpPanel {
             .child(content)
     }
 }
+
+impl PhpPanel {
+    fn ensure_http_editors(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> &HttpBuilderEditors {
+        if self.http_builder.is_none() {
+            let url = cx.new(|cx| Editor::single_line(window, cx));
+            let headers = cx.new(|cx| Editor::auto_height(2, 6, window, cx));
+            let body = cx.new(|cx| Editor::auto_height(3, 12, window, cx));
+
+            let url_sub = cx.subscribe(&url, |this: &mut Self, editor, event, cx| {
+                if matches!(event, EditorEvent::BufferEdited) {
+                    let _ = editor.read(cx).text(cx);
+                    this.http_builder_response = None;
+                    cx.notify();
+                }
+            });
+            let headers_sub = cx.subscribe(&headers, |this: &mut Self, _editor, event, cx| {
+                if matches!(event, EditorEvent::BufferEdited) {
+                    this.http_builder_response = None;
+                    cx.notify();
+                }
+            });
+            let body_sub = cx.subscribe(&body, |this: &mut Self, _editor, event, cx| {
+                if matches!(event, EditorEvent::BufferEdited) {
+                    this.http_builder_response = None;
+                    cx.notify();
+                }
+            });
+            self._subscriptions.push(url_sub);
+            self._subscriptions.push(headers_sub);
+            self._subscriptions.push(body_sub);
+            let form_pair = (
+                cx.new(|cx| Editor::single_line(window, cx)),
+                cx.new(|cx| Editor::single_line(window, cx)),
+            );
+            self.http_builder = Some(HttpBuilderEditors {
+                url,
+                headers,
+                body,
+                form_pairs: vec![form_pair],
+            });
+        }
+        self.http_builder.as_ref().expect("http editors")
+    }
+
+    fn http_editor_text(editor: &Entity<Editor>, cx: &Context<Self>) -> String {
+        editor.read(cx).text(cx)
+    }
+
+    fn render_http_builder(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.ensure_http_editors(window, cx);
+        let colors = cx.theme().colors();
+        let editors = self.http_builder.as_ref().expect("http editors");
+        let url_editor = editors.url.clone();
+        let headers_editor = editors.headers.clone();
+        let body_editor = editors.body.clone();
+
+        let busy = self.http_builder_busy;
+        let method = self.http_method.clone();
+
+        let headers_text = Self::http_editor_text(&headers_editor, cx);
+        let headers_count = headers_text
+            .lines()
+            .filter(|line| {
+                line.split_once(':')
+                    .map(|(name, _)| !name.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .count();
+        let headers_hint = if headers_count == 0 {
+            "no headers".to_string()
+        } else {
+            format!("{headers_count} header(s)")
+        };
+        let body_text = Self::http_editor_text(&body_editor, cx);
+        let body_hint = if body_text.trim().is_empty() {
+            "no body".to_string()
+        } else {
+            format!("{} bytes", body_text.len())
+        };
+
+        // --- method dropdown ---
+        let panel = cx.entity().downgrade();
+        let trigger = Button::new("http-method-trigger", method.clone())
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+            .style(ButtonStyle::Subtle);
+        let method_menu = PopoverMenu::new("http-method-menu")
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                let active = method.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for candidate in HTTP_METHODS.iter() {
+                        let chosen = candidate.to_string();
+                        let menu_panel = panel.clone();
+                        let is_active = active == chosen;
+                        menu = menu.item(
+                            ui::ContextMenuEntry::new(chosen.clone())
+                                .toggleable(ui::IconPosition::Start, is_active)
+                                .handler(move |_window: &mut Window, cx: &mut App| {
+                                    if let Some(panel) = menu_panel.upgrade() {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.http_method = chosen.clone();
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        );
+                    }
+                    menu
+                }))
+            })
+            .anchor(Anchor::BottomLeft)
+            .trigger(trigger);
+
+        // --- url input ---
+        let url_input = div()
+            .id("http-url-box")
+            .flex_1()
+            .min_w_0()
+            .h(px(26.))
+            .flex()
+            .items_center()
+            .px_2()
+            .rounded_xs()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .cursor_text()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(dialog_editor_element(&url_editor, cx)),
+            );
+
+        let send_label = if busy { "Sending…" } else { "Send" };
+        let send_button = dialog_button("http-send", send_label, DialogButtonVariant::Primary)
+            .disabled(busy)
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.send_http_builder(window, cx);
+            }));
+
+        let mut rows = Vec::new();
+        rows.push(
+            h_flex()
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(colors.border)
+                .child(method_menu)
+                .child(url_input)
+                .child(send_button)
+                .into_any_element(),
+        );
+
+        rows.push(
+            div()
+                .id("http-headers-block")
+                .w_full()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(colors.border)
+                .child(
+                    h_flex().w_full().items_center().gap_2().child(
+                        Label::new(format!("Headers · {headers_hint}"))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(
+                    div()
+                        .id("http-headers-editor")
+                        .w_full()
+                        .mt_1()
+                        .rounded_xs()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.editor_background)
+                        .px_2()
+                        .py_1()
+                        .cursor_text()
+                        .child(dialog_editor_element(&headers_editor, cx)),
+                )
+                .into_any_element(),
+        );
+
+        let raw_active = self.http_body_mode == HttpBodyMode::Raw;
+        let form_active = !raw_active;
+
+        let mut body_header = h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(
+                Label::new(format!("Body · {body_hint}"))
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .color(Color::Muted),
+            )
+            .child(
+                Button::new("http-body-mode-raw", "raw")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(if raw_active {
+                        ButtonStyle::Filled
+                    } else {
+                        ButtonStyle::Subtle
+                    })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.http_body_mode = HttpBodyMode::Raw;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("http-body-mode-form", "form")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(if form_active {
+                        ButtonStyle::Filled
+                    } else {
+                        ButtonStyle::Subtle
+                    })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.http_body_mode = HttpBodyMode::Form;
+                        cx.notify();
+                    })),
+            );
+
+        let body_area: AnyElement = if raw_active {
+            div()
+                .id("http-body-editor")
+                .w_full()
+                .mt_1()
+                .rounded_xs()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.editor_background)
+                .px_2()
+                .py_1()
+                .cursor_text()
+                .child(dialog_editor_element(&body_editor, cx))
+                .into_any_element()
+        } else {
+            let mut form_col = v_flex().id("http-form-body").w_full().mt_1().gap_1();
+            let pairs = editors.form_pairs.clone();
+            for (index, (name_editor, value_editor)) in pairs.iter().enumerate() {
+                let pair_index = index;
+                form_col = form_col.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(24.))
+                                .rounded_xs()
+                                .border_1()
+                                .border_color(colors.border_variant)
+                                .bg(colors.editor_background)
+                                .px_2()
+                                .cursor_text()
+                                .child(dialog_editor_element(name_editor, cx)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(24.))
+                                .rounded_xs()
+                                .border_1()
+                                .border_color(colors.border_variant)
+                                .bg(colors.editor_background)
+                                .px_2()
+                                .cursor_text()
+                                .child(dialog_editor_element(value_editor, cx)),
+                        )
+                        .child(
+                            IconButton::new(("http-form-remove", pair_index), IconName::Close)
+                                .size(ButtonSize::Compact)
+                                .shape(IconButtonShape::Square)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                    if let Some(editors) = this.http_builder.as_mut() {
+                                        if editors.form_pairs.len() > 1 {
+                                            editors.form_pairs.remove(pair_index);
+                                            cx.notify();
+                                        }
+                                    }
+                                })),
+                        ),
+                );
+            }
+            form_col = form_col.child(
+                Button::new("http-form-add", "＋ field")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        if let Some(editors) = this.http_builder.as_mut() {
+                            let pair = (
+                                cx.new(|cx| Editor::single_line(window, cx)),
+                                cx.new(|cx| Editor::single_line(window, cx)),
+                            );
+                            editors.form_pairs.push(pair);
+                            cx.notify();
+                        }
+                    })),
+            );
+            form_col.into_any_element()
+        };
+
+        body_header = body_header.when(!form_active, |this| this);
+        rows.push(
+            div()
+                .id("http-body-block")
+                .w_full()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(colors.border)
+                .child(body_header)
+                .child(body_area)
+                .into_any_element(),
+        );
+
+        if let Some(response) = self.http_builder_response.clone() {
+            let status_color = if (200..400).contains(&response.status) {
+                Color::Success
+            } else {
+                Color::Error
+            };
+            let content_type = response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| "no content-type".to_string());
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(
+                        Label::new(format!(
+                            "HTTP {} · {} ms",
+                            response.status, response.time_ms
+                        ))
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .color(status_color),
+                    )
+                    .child(
+                        Label::new(format!("{content_type} · {} bytes", response.body.len()))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .into_any_element(),
+            );
+            rows.push(
+                div()
+                    .id("http-builder-response")
+                    .w_full()
+                    .flex_shrink_0()
+                    .max_h(px(240.))
+                    .overflow_y_scroll()
+                    .bg(colors.editor_background)
+                    .px_2()
+                    .py_1()
+                    .child(
+                        Label::new(response.body.clone())
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Default),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .id("http-builder")
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(colors.border)
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn send_http_builder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.http_builder_busy {
+            return;
+        }
+        let method_text = self.http_method.clone();
+        self.ensure_http_editors(window, cx);
+        let editors = self.http_builder.as_ref().expect("http editors");
+        let url = Self::http_editor_text(&editors.url, cx).trim().to_string();
+        if url.is_empty() {
+            self.saved_message = Some("failed: URL is empty".to_string());
+            cx.notify();
+            return;
+        }
+        let method = match Method::from_bytes(method_text.as_bytes()) {
+            Ok(method) => method,
+            Err(_) => {
+                self.saved_message = Some(format!("failed: bad method {method_text}"));
+                cx.notify();
+                return;
+            }
+        };
+        let headers = Self::http_editor_text(&editors.headers, cx)
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some((name.to_string(), value.trim().to_string()))
+            })
+            .collect::<Vec<_>>();
+        let body = if self.http_body_mode == HttpBodyMode::Form {
+            let pairs = editors
+                .form_pairs
+                .iter()
+                .filter_map(|(name, value)| {
+                    let name = Self::http_editor_text(name, cx).trim().to_string();
+                    let value = Self::http_editor_text(value, cx);
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((name, value))
+                    }
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(
+                &pairs
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), Value::String(value.clone())))
+                    .collect::<std::collections::BTreeMap<&str, Value>>(),
+            )
+            .unwrap_or_else(|_| "{}".to_string())
+        } else {
+            Self::http_editor_text(&editors.body, cx)
+        };
+
+        let mut headers = headers;
+        if self.http_body_mode == HttpBodyMode::Form
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
+            headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        }
+
+        self.http_builder_busy = true;
+        self.http_builder_response = None;
+        cx.notify();
+
+        let client: std::sync::Arc<dyn HttpClient> = std::sync::Arc::new(ReqwestClient::new());
+
+        let task = cx.background_spawn(async move {
+            let mut request = http_client::Request::builder().method(method).uri(&url);
+            for (name, value) in headers.iter() {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let body = if body.trim().is_empty() {
+                AsyncBody::empty()
+            } else {
+                AsyncBody::from(body.into_bytes())
+            };
+            let request = match request.body(body) {
+                Ok(request) => request,
+                Err(error) => return Err(format!("{error}")),
+            };
+            let started = std::time::Instant::now();
+            let response = match client.send(request).await {
+                Ok(response) => response,
+                Err(error) => return Err(format!("{error}")),
+            };
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let body_bytes = {
+                use futures::AsyncReadExt as _;
+                let mut body = response.into_body();
+                let mut bytes = Vec::new();
+                if let Err(error) = body.read_to_end(&mut bytes).await {
+                    return Err(format!("failed to read response body: {error}"));
+                }
+                bytes
+            };
+            let time_ms = started.elapsed().as_millis() as u64;
+            let body = String::from_utf8_lossy(&body_bytes).to_string();
+            Ok(HttpProbeResponse {
+                status,
+                time_ms,
+                headers,
+                body,
+            })
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.http_builder_busy = false;
+                match result {
+                    Ok(response) => {
+                        let status = response.status;
+                        this.http_builder_response = Some(response);
+                        this.saved_message = if (200..400).contains(&status) {
+                            Some(format!("request finished: HTTP {status}"))
+                        } else {
+                            Some(format!("failed: HTTP {status}"))
+                        };
+                    }
+                    Err(message) => {
+                        this.saved_message = Some(format!("failed: {message}"));
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+}
+
+const HTTP_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
 fn select_tab_cyclically(
     window: &mut Window,
@@ -11245,7 +12125,7 @@ fn render_tab_bar(active: PanelTab, cx: &Context<PhpPanel>) -> gpui::AnyElement 
         .flex_none()
         .border_b_1()
         .border_color(cx.theme().colors().border)
-        .children(PanelTab::ALL.into_iter().map(|tab| {
+        .children(PanelTab::VISIBLE.into_iter().map(|tab| {
             let selected = tab == active;
             h_flex()
                 .id(("php-panel-tab", tab as usize))
@@ -11259,7 +12139,7 @@ fn render_tab_bar(active: PanelTab, cx: &Context<PhpPanel>) -> gpui::AnyElement 
                 })
                 .child(
                     Label::new(tab.label())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(if selected {
                             Color::Default
                         } else {
@@ -11287,7 +12167,7 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
             .py_1()
             .child(
                 Label::new(title)
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .color(Color::Muted),
             )
             .into_any_element(),
@@ -11310,7 +12190,9 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
         } else {
             value
         };
-        let value_label = Label::new(display).size(LabelSize::Small).truncate();
+        let value_label = Label::new(display)
+            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+            .truncate();
         let value_label = if empty && placeholder.is_some() {
             value_label.color(Color::Placeholder)
         } else if active {
@@ -11327,7 +12209,7 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
                 .gap_2()
                 .child(
                     Label::new(format!("{label}:"))
-                        .size(LabelSize::Small)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Muted)
                         .flex_none(),
                 )
@@ -11346,7 +12228,7 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
             .py_1()
             .child(
                 Label::new(footer)
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .color(Color::Muted),
             )
             .into_any_element(),
@@ -11358,7 +12240,7 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
                 .py_1()
                 .child(
                     Label::new(message.clone())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Error),
                 )
                 .into_any_element(),
@@ -11376,7 +12258,7 @@ fn remote_protocol_badge(protocol: &str, cx: &App) -> gpui::AnyElement {
         .bg(cx.theme().colors().element_hover)
         .child(
             Label::new(format!("{} ", protocol))
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(Color::Muted),
         )
         .into_any_element()
@@ -11400,7 +12282,7 @@ fn empty_row(message: &'static str) -> gpui::AnyElement {
         .py_1()
         .child(
             Label::new(message)
-                .size(LabelSize::Small)
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(Color::Muted),
         )
         .into_any_element()
@@ -11435,7 +12317,7 @@ impl Render for DeployServerIndicator {
             active.unwrap_or_else(|| "no server".to_string()),
         )
         .size(ButtonSize::Compact)
-        .label_size(LabelSize::Small)
+        .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
         .tooltip(Tooltip::text("Deployment server"));
 
         PopoverMenu::new("deploy-server-menu")
@@ -12197,14 +13079,16 @@ mod tests {
 
     #[test]
     fn first_tab_is_remote_and_cycling_wraps() {
-        assert_eq!(PanelTab::ALL.first(), Some(&PanelTab::Remote));
-        assert_eq!(PanelTab::ALL.len(), 5);
+        assert_eq!(PanelTab::VISIBLE.first(), Some(&PanelTab::Remote));
+        assert_eq!(PanelTab::VISIBLE.len(), 3);
+        assert!(!PanelTab::VISIBLE.contains(&PanelTab::Tests));
+        assert!(!PanelTab::VISIBLE.contains(&PanelTab::Collections));
         assert_eq!(next_tab(PanelTab::Remote, 1), PanelTab::Databases);
-        assert_eq!(next_tab(PanelTab::Remote, -1), PanelTab::Collections);
-        assert_eq!(next_tab(PanelTab::Collections, 1), PanelTab::Remote);
-        assert_eq!(next_tab(PanelTab::Collections, -1), PanelTab::Http);
-        for tab in PanelTab::ALL {
-            assert_eq!(next_tab(tab, 5), tab);
+        assert_eq!(next_tab(PanelTab::Remote, -1), PanelTab::Http);
+        assert_eq!(next_tab(PanelTab::Http, 1), PanelTab::Remote);
+        assert_eq!(next_tab(PanelTab::Databases, -1), PanelTab::Remote);
+        for tab in PanelTab::VISIBLE {
+            assert_eq!(next_tab(tab, 3), tab);
         }
     }
 
@@ -12655,6 +13539,36 @@ mod tests {
         let second = &connections[2];
         assert_eq!(second["name"], json!("demo.sqlite (2)"));
         assert_eq!(second["path"], json!("data/demo.sqlite"));
+
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn find_data_source_by_path_reuses_existing_connection() {
+        let root = temp_root("sqlite_data_source_reuse");
+        std::fs::create_dir_all(root.join(".zed")).expect("create .zed");
+        std::fs::write(
+            root.join(".zed/databases.json"),
+            r#"{"connections":[{"name":"app","driver":"sqlite","path":"demo.sqlite"},{"name":"other","driver":"sqlite","path":"other.sqlite"}]}"#,
+        )
+        .expect("seed databases.json");
+
+        let sources = load_data_sources(&root);
+        assert_eq!(
+            find_data_source_by_path(&sources, "demo.sqlite").as_deref(),
+            Some("app")
+        );
+        assert_eq!(find_data_source_by_path(&sources, "missing.sqlite"), None);
+
+        // Opening the same file must reuse "app" and leave the file untouched.
+        let name = ensure_sqlite_data_source(&root, "demo.sqlite").expect("reuse");
+        assert_eq!(name, "app");
+
+        let config = read_json(&root.join(".zed/databases.json")).expect("parse databases.json");
+        let connections = config["connections"].as_array().expect("connections array");
+        assert_eq!(connections.len(), 2);
+        assert_eq!(connections[0]["name"], json!("app"));
+        assert_eq!(connections[1]["name"], json!("other"));
 
         std::fs::remove_dir_all(&root).expect("clean temporary project root");
     }
@@ -13329,6 +14243,4 @@ mod tests {
         );
         std::fs::remove_dir_all(&root).expect("clean temporary project root");
     }
-
-
 }
