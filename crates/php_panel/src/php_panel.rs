@@ -388,6 +388,19 @@ struct DatabaseEntry {
     user: Option<String>,
     host: Option<String>,
     root: PathBuf,
+    read_only: bool,
+}
+
+/// Label shown on a table tab: the sqlite file name when known, else the
+/// configured connection name.
+fn database_connection_label(database: &DatabaseEntry) -> String {
+    if database.driver.as_deref() == Some("sqlite")
+        && let Some(target) = database.target.as_deref()
+        && let Some(name) = Path::new(target).file_name()
+    {
+        return name.to_string_lossy().into_owned();
+    }
+    database.name.clone()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7232,7 +7245,7 @@ pub struct PhpPanel {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     /// Open table-data tabs so clicking the same table focuses the tab again.
-    open_table_views: Vec<(String, String, WeakEntity<DatabaseTableView>)>,
+    open_table_views: HashMap<String, WeakEntity<DatabaseTableView>>,
     project: Entity<Project>,
     active_tab: PanelTab,
     http_requests: Vec<HttpRequest>,
@@ -7425,7 +7438,7 @@ impl PhpPanel {
                     remote_dir_entries: HashMap::new(),
                     remote_expanded_paths: HashSet::new(),
                     remote_status: HashMap::new(),
-                    open_table_views: Vec::new(),
+                    open_table_views: HashMap::new(),
                     databases: Vec::new(),
                     sync_status: HashMap::new(),
                     database_status: HashMap::new(),
@@ -7531,6 +7544,10 @@ impl PhpPanel {
                         databases.push(DatabaseEntry {
                             name,
                             driver: string_field(connection, "driver"),
+                            read_only: connection
+                                .get("read_only")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
                             target: string_field(connection, "path")
                                 .or_else(|| string_field(connection, "url"))
                                 .or_else(|| {
@@ -8739,24 +8756,24 @@ impl PhpPanel {
     fn open_table_tab(
         &mut self,
         connection: String,
+        connection_label: String,
         table: String,
         root: PathBuf,
         columns: Vec<DatabaseColumn>,
         editable_candidate: bool,
-        window: &mut Window,
+        read_only: bool,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Reuse an already open tab for the same table, like PhpStorm.
         self.open_table_views
-            .retain(|(_, _, view)| view.upgrade().is_some());
-        let existing = self
+            .retain(|_, view| view.upgrade().is_some());
+        let key = table_view::table_tab_key(&connection, &table);
+        if let Some(view) = self
             .open_table_views
-            .iter()
-            .find(|(open_connection, open_table, _)| {
-                open_connection == &connection && open_table == &table
-            })
-            .and_then(|(_, _, view)| view.upgrade());
-        if let Some(view) = existing {
+            .get(&key)
+            .and_then(WeakEntity::upgrade)
+        {
             self.workspace
                 .update_in(cx, |workspace, window, cx| {
                     workspace.activate_item(&view, true, true, window, cx);
@@ -8767,15 +8784,16 @@ impl PhpPanel {
         let view = DatabaseTableView::open(
             TableTabTarget {
                 connection: connection.clone(),
+                connection_label,
                 table: table.clone(),
                 root,
                 columns,
                 editable_candidate,
+                read_only,
             },
             cx,
         );
-        self.open_table_views
-            .push((connection, table, view.downgrade()));
+        self.open_table_views.insert(key, view.downgrade());
         self.workspace
             .update_in(cx, |workspace, window, cx| {
                 let pane = workspace.active_pane();
@@ -9791,171 +9809,12 @@ pub(crate) fn parse_table_rows(
     Ok(rows.iter().filter_map(Value::as_object).cloned().collect())
 }
 
-fn query_columns(rows: &[serde_json::Map<String, Value>]) -> Vec<DatabaseColumn> {
-    let mut seen = HashSet::new();
-    let mut columns = Vec::new();
-    for row in rows {
-        for name in row.keys() {
-            if seen.insert(name.clone()) {
-                columns.push(DatabaseColumn {
-                    name: name.clone(),
-                    column_type: String::new(),
-                    primary_key: false,
-                });
-            }
-        }
-    }
-    columns
-}
-
 pub(crate) fn display_value(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Null => "NULL".to_string(),
         other => other.to_string(),
     }
-}
-
-fn render_table_grid(
-    id: &str,
-    table_name: &str,
-    columns: &[DatabaseColumn],
-    rows: &[serde_json::Map<String, Value>],
-    cx: &Context<PhpPanel>,
-) -> AnyElement {
-    let preview_rows = rows.iter().take(20).collect::<Vec<_>>();
-    let mut headers = columns
-        .iter()
-        .map(|column| column.name.clone())
-        .collect::<Vec<_>>();
-    if headers.is_empty() {
-        if let Some(first) = preview_rows.first() {
-            headers.extend(first.keys().cloned());
-        }
-    }
-
-    let widths = headers
-        .iter()
-        .map(|header| {
-            let mut longest = header.chars().count();
-            for row in &preview_rows {
-                if let Some(value) = row.get(header) {
-                    longest = longest.max(display_value(value).chars().count());
-                }
-            }
-            px(longest.clamp(8, 30) as f32 * 7.0 + 12.0)
-        })
-        .collect::<Vec<_>>();
-
-    let header_row = h_flex()
-        .w_full()
-        .flex_none()
-        .items_center()
-        .bg(cx.theme().colors().editor_background)
-        .border_b_1()
-        .border_color(cx.theme().colors().border)
-        .child(
-            div()
-                .w(px(44.))
-                .flex_none()
-                .px_2()
-                .border_r_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    Label::new("#")
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .color(Color::Muted)
-                        .buffer_font(cx),
-                ),
-        )
-        .children(headers.iter().zip(widths.iter()).map(|(header, width)| {
-            div()
-                .w(*width)
-                .flex_none()
-                .overflow_hidden()
-                .child(
-                    Label::new(header.clone())
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .weight(gpui::FontWeight::BOLD)
-                        .color(Color::Muted)
-                        .buffer_font(cx)
-                        .truncate(),
-                )
-                .into_any_element()
-        }));
-
-    let body = v_flex()
-        .w_full()
-        .children(preview_rows.iter().enumerate().map(|(row_index, row)| {
-            h_flex()
-                .w_full()
-                .flex_none()
-                .items_center()
-                .when(row_index % 2 == 1, |this| {
-                    this.bg(cx.theme().colors().element_background)
-                })
-                .hover(|style| style.bg(cx.theme().colors().element_hover))
-                .child(
-                    div()
-                        .w(px(44.))
-                        .flex_none()
-                        .h_full()
-                        .px_2()
-                        .border_r_1()
-                        .border_color(cx.theme().colors().border_variant)
-                        .child(
-                            Label::new(format!("{}", row_index + 1))
-                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                .color(Color::Muted)
-                                .buffer_font(cx),
-                        ),
-                )
-                .children(headers.iter().zip(widths.iter()).map(|(header, width)| {
-                    let value = row.get(header).map(display_value).unwrap_or_default();
-                    div()
-                        .w(*width)
-                        .flex_none()
-                        .overflow_hidden()
-                        .px_2()
-                        .child(
-                            Label::new(value)
-                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                .buffer_font(cx)
-                                .truncate(),
-                        )
-                        .into_any_element()
-                }))
-                .into_any_element()
-        }));
-
-    v_flex()
-        .id(id.to_string())
-        .w_full()
-        .flex_none()
-        .border_b_1()
-        .border_color(cx.theme().colors().border_variant)
-        .child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .child(
-                    Label::new(table_name.to_string())
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .weight(gpui::FontWeight::BOLD)
-                        .truncate(),
-                )
-                .child(
-                    Label::new(format!("· {} rows", rows.len()))
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .color(Color::Muted),
-                ),
-        )
-        .child(header_row)
-        .child(body)
-        .into_any_element()
 }
 
 fn format_size(size: u64) -> String {
@@ -10475,7 +10334,6 @@ impl Render for PhpPanel {
         }
 
         let mut database_rows = Vec::new();
-        let mut database_grids = Vec::new();
         for (index, database) in self.databases.iter().enumerate() {
             let expanded = self.db_expanded_conns.contains(&database.name);
 
@@ -10496,6 +10354,8 @@ impl Render for PhpPanel {
                             );
                         }
                         for (table_index, table) in tables.iter().enumerate() {
+                            let table_read_only = database.read_only;
+                            let table_label = database_connection_label(database);
                             let connection_name = database.name.clone();
                             let table_name = table.name.clone();
                             let table_root = database.root.clone();
@@ -10523,10 +10383,12 @@ impl Render for PhpPanel {
                                         move |this, _: &ClickEvent, window, cx| {
                                             this.open_table_tab(
                                                 connection_name.clone(),
+                                                table_label.clone(),
                                                 table_name.clone(),
                                                 table_root.clone(),
                                                 table_columns.clone(),
                                                 table_editable,
+                                                table_read_only,
                                                 window,
                                                 cx,
                                             );
@@ -10642,6 +10504,8 @@ impl Render for PhpPanel {
                     );
                     if views_open {
                         for (view_index, view) in views.iter().enumerate() {
+                            let view_read_only = database.read_only;
+                            let view_label = database_connection_label(database);
                             let view_connection = database.name.clone();
                             let view_name = view.name.clone();
                             let view_root = database.root.clone();
@@ -10667,10 +10531,12 @@ impl Render for PhpPanel {
                                         move |this, _: &ClickEvent, window, cx| {
                                             this.open_table_tab(
                                                 view_connection.clone(),
+                                                view_label.clone(),
                                                 view_name.clone(),
                                                 view_root.clone(),
                                                 view_columns.clone(),
                                                 false,
+                                                view_read_only,
                                                 window,
                                                 cx,
                                             );
@@ -10883,15 +10749,6 @@ impl Render for PhpPanel {
 
             database_rows.extend(schema_rows);
 
-            if let Some(TableStatus::Loaded(rows)) = self.query_status.get(&database.name) {
-                database_grids.push(render_table_grid(
-                    &format!("database-query-grid-{index}"),
-                    "query",
-                    &query_columns(rows),
-                    rows,
-                    cx,
-                ));
-            }
         }
 
         let mut collection_rows = Vec::new();
@@ -11439,20 +11296,6 @@ impl Render for PhpPanel {
                             database_rows
                         }),
                 )
-                .when(!database_grids.is_empty(), |this| {
-                    this.child(
-                        v_flex()
-                            .id("php-database-editor")
-                            .w_full()
-                            .flex_shrink_0()
-                            .h(relative(0.45))
-                            .border_t_1()
-                            .border_color(cx.theme().colors().border)
-                            .bg(cx.theme().colors().editor_background)
-                            .overflow_y_scroll()
-                            .children(database_grids),
-                    )
-                })
                 .into_any_element(),
             PanelTab::Tests => v_flex()
                 .flex_1()
@@ -12430,24 +12273,6 @@ mod tests {
     }
 
     #[test]
-    fn query_columns_unions_keys_in_row_order() {
-        let rows = vec![
-            json!({"id": 1, "email": "a@example.test"}),
-            json!({"email": "b@example.test", "name": "B"}),
-        ];
-        let rows = rows
-            .into_iter()
-            .filter_map(|row| row.as_object().cloned())
-            .collect::<Vec<_>>();
-        let columns = query_columns(&rows);
-        let names = columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["id", "email", "name"]);
-    }
-
-    #[test]
     fn form_key_sequence_matches_typing_model() {
         let mut database = FormState::new(FormKind::Database);
         assert_eq!(database.fields.len(), 5);
@@ -13022,7 +12847,21 @@ mod tests {
             user: None,
             host: None,
             root: PathBuf::from("/tmp"),
+            read_only: false,
         }
+    }
+
+    #[test]
+    fn database_connection_label_prefers_sqlite_file_name() {
+        let mut entry = connection_entry("app");
+        entry.driver = Some("sqlite".to_string());
+        entry.target = Some("data/demo.sqlite".to_string());
+        assert_eq!(database_connection_label(&entry), "demo.sqlite");
+
+        let mut pg = connection_entry("pg");
+        pg.driver = Some("postgres".to_string());
+        pg.target = Some("postgres://app@localhost/app".to_string());
+        assert_eq!(database_connection_label(&pg), "pg");
     }
 
     #[test]
