@@ -8887,23 +8887,36 @@ impl PhpPanel {
         columns: Vec<DatabaseColumn>,
         editable_candidate: bool,
         read_only: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Reuse an already open tab for the same table, like PhpStorm.
         self.open_table_views
             .retain(|_, view| view.upgrade().is_some());
         let key = table_view::table_tab_key(&connection, &table);
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.saved_message = Some(format!(
+                "failed: cannot open `{connection}/{table}` — workspace unavailable"
+            ));
+            cx.notify();
+            return;
+        };
         if let Some(view) = self
             .open_table_views
             .get(&key)
             .and_then(WeakEntity::upgrade)
         {
-            self.workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.activate_item(&view, true, true, window, cx);
-                })
-                .ok();
+            let activated = workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&view, true, true, window, cx)
+            });
+            if !activated {
+                self.saved_message = Some(format!(
+                    "failed: cannot open `{connection}/{table}` — tab not found"
+                ));
+            } else {
+                self.saved_message = None;
+            }
+            cx.notify();
             return;
         }
         let view = DatabaseTableView::open(
@@ -8919,14 +8932,11 @@ impl PhpPanel {
             cx,
         );
         self.open_table_views.insert(key, view.downgrade());
-        self.workspace
-            .update_in(cx, |workspace, window, cx| {
-                let pane = workspace.active_pane();
-                pane.update(cx, |pane, cx| {
-                    pane.add_item(Box::new(view), true, true, None, window, cx);
-                });
-            })
-            .ok();
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
+        self.saved_message = None;
+        cx.notify();
     }
 
     fn run_sql_query(
