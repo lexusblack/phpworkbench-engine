@@ -6517,6 +6517,7 @@ impl ProjectPanel {
             )
             .on_click({
                 let sqlite_file_abs_path = sqlite_file_abs_path.clone();
+                let click_filename = file_name.clone();
                 cx.listener(move |project_panel, event: &gpui::ClickEvent, window, cx| {
                     if event.is_right_click() || show_editor {
                         return;
@@ -6623,6 +6624,12 @@ impl ProjectPanel {
                         let preview_tabs_enabled =
                             PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
                         let click_count = event.click_count();
+                        log::info!(
+                            "phpwb-click: file='{}' sqlite={}, click_count={}",
+                            click_filename,
+                            is_sqlite_file,
+                            click_count
+                        );
 
                         // phpworkbench: SQLite files picked in the project tree
                         // never open as the binary editor. A single click only

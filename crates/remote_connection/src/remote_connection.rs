@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
+use crate::remote_server_release::{download_remote_server_release, get_remote_server_release_url};
 use anyhow::Result;
 use askpass::EncryptedPassword;
-use auto_update::AutoUpdater;
 use futures::{FutureExt as _, channel::oneshot, select};
 use gpui::{
     AnyWindowHandle, App, AsyncApp, DismissEvent, Entity, EventEmitter, Focusable, FontFeatures,
@@ -494,7 +494,7 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
     ) -> Task<anyhow::Result<PathBuf>> {
         let this = self.clone();
         cx.spawn(async move |cx| {
-            AutoUpdater::download_remote_server_release(
+            download_remote_server_release(
                 release_channel,
                 version.clone(),
                 platform.os.as_str(),
@@ -525,7 +525,7 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
         cx: &mut AsyncApp,
     ) -> Task<Result<Option<String>>> {
         cx.spawn(async move |cx| {
-            AutoUpdater::get_remote_server_release_url(
+            get_remote_server_release_url(
                 release_channel,
                 version,
                 platform.os.as_str(),
@@ -633,7 +633,7 @@ pub fn connect_reusing_pool(
 /// Delegate for remote connections that reuse an existing pooled
 /// connection. Password prompts are not expected (the SSH transport
 /// is already established), but server binary downloads are supported
-/// via [`AutoUpdater`].
+/// via the local remote-server release helper.
 struct BackgroundRemoteClientDelegate;
 
 impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
@@ -660,7 +660,7 @@ impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
         cx: &mut AsyncApp,
     ) -> Task<anyhow::Result<PathBuf>> {
         cx.spawn(async move |cx| {
-            AutoUpdater::download_remote_server_release(
+            download_remote_server_release(
                 release_channel,
                 version.clone(),
                 platform.os.as_str(),
@@ -691,7 +691,7 @@ impl remote::RemoteClientDelegate for BackgroundRemoteClientDelegate {
         cx: &mut AsyncApp,
     ) -> Task<Result<Option<String>>> {
         cx.spawn(async move |cx| {
-            AutoUpdater::get_remote_server_release_url(
+            get_remote_server_release_url(
                 release_channel,
                 version,
                 platform.os.as_str(),
@@ -740,6 +740,8 @@ pub fn connect(
 }
 
 use anyhow::Context as _;
+
+mod remote_server_release;
 
 #[cfg(test)]
 mod tests {

@@ -2548,6 +2548,15 @@ impl Workspace {
                 dock.finish_restoration();
             });
         }
+
+        // PhpStorm-like default: the project files must always be visible on
+        // the left. If the restored left dock has no active panel (e.g. the
+        // workspace was saved without one), activate the project panel.
+        self.left_dock.update(cx, |dock, cx| {
+            if dock.active_panel().is_none() {
+                dock.activate_panel_by_name("Project Panel", cx);
+            }
+        });
     }
 
     /// Returns which dock currently has focus, or `None` if focus is in the

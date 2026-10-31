@@ -1702,7 +1702,7 @@ fn dialog_text_style(cx: &App) -> TextStyle {
         font_family: font.family.clone(),
         font_features: font.features.clone(),
         font_fallbacks: font.fallbacks.clone(),
-        font_size: rems(1.0).into(),
+        font_size: rems(0.825).into(),
         font_weight: font.weight,
         line_height: relative(1.3),
         ..TextStyle::default()
@@ -1719,8 +1719,9 @@ fn dialog_editor_element(editor: &Entity<Editor>, cx: &App) -> AnyElement {
     EditorElement::new(editor, style).into_any_element()
 }
 
-/// Single text size for the whole panel UI (PhpStorm-like: one size everywhere).
-pub(crate) const PANEL_TEXT_REMS: Rems = Rems(1.0);
+/// Single text size for the whole panel UI: matches the core Zed UI scale
+/// (`text_ui` = 0.825rem ≈ 13.2px), so panel text and app chrome agree.
+pub(crate) const PANEL_TEXT_REMS: Rems = Rems(0.825);
 
 const DIALOG_LABEL_WIDTH: Pixels = px(148.);
 const DIALOG_ROW_HEIGHT: Pixels = px(29.);
@@ -3885,6 +3886,11 @@ fn open_sqlite_data_source(
         }
         return;
     };
+    log::info!(
+        "phpwb-action: sqlite target resolved: root={:?} rel={:?}",
+        root.display(),
+        relative.to_string_lossy()
+    );
     let rel_path = relative.to_string_lossy().replace('\\', "/");
     match ensure_sqlite_data_source(&root, &rel_path) {
         Ok(name) => {
@@ -7473,6 +7479,7 @@ impl PhpPanel {
                 }
             });
             workspace.register_action(|workspace, action: &OpenSqliteDataSource, window, cx| {
+                log::info!("phpwb-action: OpenSqliteDataSource fired: {:?}", action.abs_path);
                 let Some(abs_path) = action.abs_path.as_deref().map(str::trim) else {
                     return;
                 };

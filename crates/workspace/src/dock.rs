@@ -892,6 +892,16 @@ impl Dock {
         self.restoration = DockRestoreState::Finished;
     }
 
+    /// Activates the panel with the given persistent name, if present.
+    pub fn activate_panel_by_name(&mut self, name: &str, cx: &App) -> bool {
+        if let Some(index) = self.panel_index_for_persistent_name(name, cx) {
+            self.active_panel_index = Some(index);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn remove_panel<T: Panel>(
         &mut self,
         panel: &Entity<T>,

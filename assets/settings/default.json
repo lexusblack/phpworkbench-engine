@@ -873,6 +873,8 @@
   // Can be a combination of "left", "right" and "bottom".
   "resize_all_panels_in_dock": ["left"],
   "project_panel": {
+    // Which dock to show the panel in
+    "dock": "left",
     // Whether to show the project panel button in the status bar
     "button": true,
     // Whether to hide the gitignore entries in the project panel.
@@ -1001,6 +1003,8 @@
     },
   },
   "outline_panel": {
+    // Which dock to show the panel in
+    "dock": "left",
     // Whether to show the outline panel button in the status bar
     "button": true,
     // Default width of the outline panel.
@@ -1075,6 +1079,8 @@
     "default_width": 240,
   },
   "git_panel": {
+    // Which dock to show the panel in
+    "dock": "left",
     // Whether to show the git panel button in the status bar.
     "button": true,
     // Where to dock the git panel. Can be 'left' or 'right'.
@@ -1157,6 +1163,8 @@
     "commit_editor": "expanded",
   },
   "agent": {
+    // Which dock to show the agent panel in
+    "dock": "right",
     // Whether the inline assistant should use streaming tools, when available
     "inline_assistant_use_streaming_tools": true,
     // Whether to include project rules files (AGENTS.md, CLAUDE.md, .rules, etc.)
@@ -1721,7 +1729,7 @@
   "disable_ai": false,
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
-  "auto_update": true,
+  "auto_update": false,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:

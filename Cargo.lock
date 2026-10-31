@@ -185,7 +185,6 @@ name = "activity_indicator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "auto_update",
  "editor",
  "extension_host",
  "fs",
@@ -1364,73 +1363,6 @@ dependencies = [
  "serde",
  "serde_json",
  "topological-sort",
-]
-
-[[package]]
-name = "auto_update"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "client",
- "clock",
- "ctor",
- "db",
- "futures 0.3.34",
- "futures-lite 2.6.1",
- "gpui",
- "http_client",
- "log",
- "parking_lot",
- "paths",
- "release_channel",
- "semver",
- "serde",
- "serde_json",
- "settings",
- "smol",
- "tempfile",
- "util",
- "which",
- "workspace",
- "zlog",
-]
-
-[[package]]
-name = "auto_update_helper"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "log",
- "scopeguard",
- "simplelog",
- "tempfile",
- "windows 0.62.2",
- "windows_resources",
-]
-
-[[package]]
-name = "auto_update_ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "auto_update",
- "client",
- "db",
- "editor",
- "gpui",
- "markdown_preview",
- "project",
- "release_channel",
- "semver",
- "serde",
- "serde_json",
- "settings",
- "smol",
- "telemetry",
- "ui",
- "util",
- "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -13332,6 +13264,7 @@ dependencies = [
  "futures 0.3.34",
  "gpui",
  "http_client",
+ "log",
  "menu",
  "paths",
  "project",
@@ -14963,17 +14896,24 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "askpass",
- "auto_update",
+ "client",
  "editor",
  "futures 0.3.34",
+ "futures-lite 2.6.1",
  "gpui",
+ "http_client",
  "log",
  "markdown",
  "menu",
+ "paths",
  "release_channel",
  "remote",
  "semver",
+ "serde",
+ "serde_json",
  "settings",
+ "smol",
+ "tempfile",
  "theme",
  "theme_settings",
  "ui",
@@ -18352,7 +18292,6 @@ dependencies = [
  "agent_settings",
  "anyhow",
  "arrayvec",
- "auto_update",
  "call",
  "channel",
  "chrono",
@@ -22414,8 +22353,6 @@ dependencies = [
  "askpass",
  "assets",
  "audio",
- "auto_update",
- "auto_update_ui",
  "breadcrumbs",
  "call",
  "call_hierarchy",
