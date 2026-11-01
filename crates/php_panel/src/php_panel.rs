@@ -783,6 +783,22 @@ impl DeploymentDialog {
     fn seed_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.servers = load_deploy_servers(&self.root);
         self.ssh_configs = load_ssh_configs(&self.root);
+        let project_root = self.root.to_string_lossy().to_string();
+        for server in self.servers.iter_mut() {
+            let fill = match server.local_root.as_deref() {
+                None => true,
+                Some(value) => value.trim().is_empty() || value.trim() == ".",
+            };
+            if fill {
+                server.local_root = Some(project_root.clone());
+            }
+            if server.remote_root.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                server.remote_root = Some("/".to_string());
+            }
+        }
+        if self.servers.is_empty() {
+            dialog_add_server(&mut self.servers, &self.root, &mut self.next_number);
+        }
         let names = self
             .servers
             .iter()
@@ -810,6 +826,11 @@ impl DeploymentDialog {
             self.panel = cx.global::<DeployShared>().panel.clone();
         }
         self.update_next_number();
+        if let Some(server) = self.selected.and_then(|index| self.servers.get(index)) {
+            self.protocol = deploy_type_canonical(server.protocol.as_deref().unwrap_or("local"))
+                .unwrap_or("local")
+                .to_string();
+        }
         self.load_editors(window, cx);
         self.schedule_validate(cx);
         cx.notify();
@@ -9432,6 +9453,11 @@ fn local_base_display(local_base: &Option<PathBuf>, root: &Path) -> String {
 }
 
 fn blank_server(root: PathBuf) -> RemoteServer {
+    let local_root = if root.as_os_str().is_empty() {
+        None
+    } else {
+        Some(root.to_string_lossy().to_string())
+    };
     RemoteServer {
         name: String::new(),
         protocol: Some("local".to_string()),
@@ -9441,8 +9467,8 @@ fn blank_server(root: PathBuf) -> RemoteServer {
         password: None,
         password_session: false,
         ssh_config: None,
-        remote_root: None,
-        local_root: None,
+        remote_root: Some("/".to_string()),
+        local_root,
         web_url: None,
         excluded: Vec::new(),
         upload_on_save: false,
