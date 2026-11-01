@@ -7,7 +7,10 @@
 //! (`INSERT`) and deleted (`DELETE`). Views, read-only connections and
 //! non-SQLite drivers open read-only.
 
-use crate::{DatabaseColumn, PANEL_TEXT_REMS, display_value, first_non_empty_line, parse_table_rows};
+use crate::{
+    DatabaseColumn, PANEL_TEXT_REMS, dialog_text_style, display_value, first_non_empty_line,
+    parse_table_rows,
+};
 use editor::{Editor, EditorElement, EditorEvent, EditorStyle, actions as editor_actions};
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
@@ -1084,6 +1087,7 @@ fn cell_editor_element(editor: &Entity<Editor>, cx: &App) -> AnyElement {
     let style = EditorStyle {
         background: cx.theme().colors().editor_background,
         local_player: cx.theme().players().local(),
+        text: dialog_text_style(cx),
         ..EditorStyle::default()
     };
     div()
