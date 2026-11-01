@@ -7007,6 +7007,22 @@ impl Repository {
         });
     }
 
+    /// Schedules a fresh status scan so the next repository snapshot reflects
+    /// on-disk changes that were made outside of Zed.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let scan_updates_tx =
+            self.git_store()
+                .and_then(|git_store| match &git_store.read(cx).state {
+                    GitStoreState::Local { downstream, .. } => {
+                        Some(downstream.as_ref().map(|downstream| downstream.updates_tx.clone()))
+                    }
+                    _ => None,
+                });
+        if let Some(updates_tx) = scan_updates_tx {
+            self.schedule_scan(updates_tx, cx);
+        }
+    }
+
     pub fn cached_status(&self) -> impl '_ + Iterator<Item = StatusEntry> {
         self.snapshot.status()
     }
@@ -8988,6 +9004,22 @@ impl Repository {
                 }
             },
         )
+    }
+
+    /// Returns commits reachable from HEAD but not from its upstream, newest
+    /// first, capped at `limit`.
+    pub fn upstream_commits(
+        &mut self,
+        limit: usize,
+    ) -> oneshot::Receiver<anyhow::Result<Vec<git::repository::CommitSummary>>> {
+        self.send_job("upstream commits", None, move |git_repo, _cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.upstream_commits(limit).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { .. }) => Ok(Vec::new()),
+            }
+        })
     }
 
     fn spawn_set_index_text_job(

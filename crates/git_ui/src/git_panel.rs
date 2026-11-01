@@ -13,7 +13,9 @@ use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
 use crate::unstaged_diff::UnstagedDiff;
-use crate::{branch_picker, picker_prompt, render_remote_button};
+use crate::{
+    branch_picker, phpstorm, picker_prompt, push_dialog::PushDialog, render_remote_button,
+};
 use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
 };
@@ -159,6 +161,12 @@ actions!(
         ViewUnstagedChanges,
         /// View staged changes
         ViewStagedChanges,
+        /// Stages the selected file and focuses the commit message editor.
+        CommitFile,
+        /// Moves the selected files to the trash.
+        DeleteFile,
+        /// Rescans the repository status.
+        Refresh,
         /// Activates the Changes tab.
         ActivateChangesTab,
         /// Activates the History tab.
@@ -295,6 +303,30 @@ impl Render for StashMessageModal {
                     .child(Headline::new(self.kind.title()).size(HeadlineSize::XSmall)),
             )
             .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
+
+/// Maps a stable [`phpstorm::MenuItemSpec`] action id to the real GPUI action
+/// dispatched by the changed-file context menu.
+fn action_for_entry_menu_item(action_id: &str) -> Option<Box<dyn Action>> {
+    use phpstorm::entry_menu_action as ids;
+
+    match action_id {
+        ids::COMMIT_FILE => Some(CommitFile.boxed_clone()),
+        ids::ROLLBACK => Some(RestoreFile::default().boxed_clone()),
+        ids::SHOW_DIFF => Some(menu::Confirm.boxed_clone()),
+        ids::SHOW_DIFF_NEW_TAB => Some(menu::SecondaryConfirm.boxed_clone()),
+        ids::JUMP_TO_SOURCE => Some(ViewFile.boxed_clone()),
+        ids::COPY_PATH => Some(CopyPath.boxed_clone()),
+        ids::DELETE => Some(DeleteFile.boxed_clone()),
+        ids::ADD_TO_VCS => Some(git::StageFile.boxed_clone()),
+        ids::ADD_TO_GITIGNORE => Some(git::AddToGitignore.boxed_clone()),
+        ids::REFRESH => Some(Refresh.boxed_clone()),
+        ids::BRANCHES => Some(zed_actions::git::Branch.boxed_clone()),
+        ids::FETCH => Some(git::Fetch.boxed_clone()),
+        ids::PUSH => Some(crate::push_dialog::OpenPushDialog.boxed_clone()),
+        ids::PULL => Some(git::Pull.boxed_clone()),
+        _ => None,
     }
 }
 
@@ -2665,6 +2697,66 @@ impl GitPanel {
                 })
                 .log_err();
         }
+    }
+
+    fn commit_file(&mut self, _: &CommitFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.stage_selected(&git::StageFile, window, cx);
+        self.focus_editor(&FocusEditor, window, cx);
+    }
+
+    fn delete_files(&mut self, _: &DeleteFile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.active_repository.as_ref() else {
+            return;
+        };
+        let project_paths = self
+            .effective_status_entries()
+            .iter()
+            .filter_map(|entry| {
+                repository
+                    .read(cx)
+                    .repo_path_to_project_path(&entry.repo_path, cx)
+            })
+            .collect::<Vec<_>>();
+        if project_paths.is_empty() {
+            return;
+        }
+
+        let names = project_paths
+            .iter()
+            .filter_map(|path| path.path.file_name().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prompt = format!("Delete {names}?");
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &prompt,
+            Some("The file will be moved to the trash."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return anyhow::Ok(());
+            }
+
+            this.update_in(cx, |this, _window, cx| {
+                this.project.update(cx, |project, cx| {
+                    for path in project_paths {
+                        project.trash_file(path, cx);
+                    }
+                });
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn refresh_repository(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        repository.update(cx, |repository, cx| repository.refresh(cx));
     }
 
     fn view_file_history(
@@ -6731,10 +6823,113 @@ impl GitPanel {
                 .child(
                     h_flex()
                         .gap_1()
+                        .child(self.render_sync_toolbar_buttons(cx))
                         .child(self.render_view_options_menu("view_options_menu"))
                         .child(self.render_git_changes_actions_button(cx)),
                 ),
         )
+    }
+
+    fn render_sync_toolbar_buttons(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(repository) = self.active_repository.clone() else {
+            return div().into_any_element();
+        };
+        let (ahead, behind) = {
+            let repository = repository.read(cx);
+            let Some(branch) = repository.branch.as_ref() else {
+                return div().into_any_element();
+            };
+            let status = match branch.upstream.as_ref().map(|upstream| &upstream.tracking) {
+                Some(UpstreamTracking::Tracked(status)) => Some(*status),
+                Some(UpstreamTracking::Gone) | None => None,
+            };
+            (
+                status.map_or(0, |status| status.ahead),
+                status.map_or(0, |status| status.behind),
+            )
+        };
+
+        let counter = |label: String, color: Color| {
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(color)
+                .into_any_element()
+        };
+
+        let update = ButtonLike::new("phpstorm-toolbar-update")
+            .layer(ElevationIndex::ModalSurface)
+            .size(ButtonSize::Compact)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::ArrowDown).size(IconSize::XSmall))
+                    .child(Label::new("Update").size(LabelSize::Small))
+                    .when(behind > 0, |this| {
+                        this.child(counter(format!("↓{behind}"), Color::Info))
+                    }),
+            )
+            .tooltip(Tooltip::for_action_title_in(
+                "Update Project (git pull)",
+                &git::Pull,
+                &self.focus_handle,
+            ))
+            .on_click(|_, window, cx| {
+                window.dispatch_action(git::Pull.boxed_clone(), cx);
+            });
+
+        let commit = ButtonLike::new("phpstorm-toolbar-commit")
+            .layer(ElevationIndex::ModalSurface)
+            .size(ButtonSize::Compact)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::GitCommit).size(IconSize::XSmall))
+                    .child(Label::new("Commit").size(LabelSize::Small)),
+            )
+            .tooltip(Tooltip::for_action_title_in(
+                "Commit changes",
+                &git::Commit,
+                &self.focus_handle,
+            ))
+            .on_click(|_, window, cx| {
+                window.dispatch_action(git::Commit.boxed_clone(), cx);
+            });
+
+        let workspace = self.workspace.clone();
+        let repository_for_push = repository.clone();
+        let push = ButtonLike::new("phpstorm-toolbar-push")
+            .layer(ElevationIndex::ModalSurface)
+            .size(ButtonSize::Compact)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::ExpandUp).size(IconSize::XSmall))
+                    .child(Label::new("Push").size(LabelSize::Small))
+                    .when(ahead > 0, |this| {
+                        this.child(counter(format!("↑{ahead}"), Color::Success))
+                    }),
+            )
+            .tooltip(Tooltip::for_action_title_in(
+                "Push committed changes",
+                &git::Push,
+                &self.focus_handle,
+            ))
+            .on_click(move |_, window, cx| {
+                PushDialog::open(
+                    workspace.clone(),
+                    Some(repository_for_push.clone()),
+                    window,
+                    cx,
+                );
+            });
+
+        h_flex()
+            .gap_1()
+            .flex_shrink_0()
+            .child(update)
+            .child(commit)
+            .child(push)
+            .into_any_element()
     }
 
     pub(crate) fn render_remote_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -8341,110 +8536,36 @@ impl GitPanel {
 
     fn build_context_menu(
         &self,
-        will_unstage: bool,
-        all_created: bool,
-        all_deleted: bool,
-        file_count: usize,
-        target_kind: SelectionTargetKind,
+        state: phpstorm::EntryMenuState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ContextMenu> {
-        // It is possible for the `target_kind` to be `Multiple` but
-        // `file_count` to be 1, for example, in the case where a marked
-        // directory and its only single descendant are marked. In that case,
-        // even though there's two rows marked, there's a single file that is
-        // being affected.
-        // As such, we need to ensure we show the correct label, depending on
-        // the actual `file_count`.
-        let file_label = if file_count == 1 { "File" } else { "Files" };
-
-        let stage_title = match (target_kind, will_unstage) {
-            (SelectionTargetKind::Directory, true) => "Unstage Folder",
-            (SelectionTargetKind::Directory, false) => "Stage Folder",
-            (SelectionTargetKind::File, true) => "Unstage File",
-            (SelectionTargetKind::File, false) => "Stage File",
-            (SelectionTargetKind::Multiple, true) => &format!("Unstage {file_count} {file_label}"),
-            (SelectionTargetKind::Multiple, false) => &format!("Stage {file_count} {file_label}"),
-        };
-
-        let restore_title = match (target_kind, all_created, all_deleted) {
-            (SelectionTargetKind::Directory, true, _) => "Trash Folder",
-            (SelectionTargetKind::Directory, false, _) => "Discard Changes",
-            (SelectionTargetKind::File, true, _) => "Trash File",
-            (SelectionTargetKind::File, _, true) => "Restore File",
-            (SelectionTargetKind::File, _, _) => "Discard Changes",
-            (SelectionTargetKind::Multiple, true, _) => &format!("Trash {file_count} {file_label}"),
-            (SelectionTargetKind::Multiple, _, true) => {
-                &format!("Restore {file_count} {file_label}")
-            }
-            (SelectionTargetKind::Multiple, _, _) => {
-                &format!("Discard Changes to {file_count} {file_label}")
-            }
-        };
-        let is_bulk = matches!(target_kind, SelectionTargetKind::Multiple);
-        let is_file_or_bulk = !matches!(target_kind, SelectionTargetKind::Directory);
-        let has_tracked = !all_created;
-        let plural = file_count > 1;
-        let copy_path_title = if plural { "Copy Paths" } else { "Copy Path" };
-        let copy_relative_path_title = if plural {
-            "Copy Relative Paths"
-        } else {
-            "Copy Relative Path"
-        };
-        let open_file_diff_title = if plural {
-            "Open File Diffs"
-        } else {
-            "Open File Diff"
-        };
-        let view_file_title = if plural { "View Files" } else { "View File" };
-        let open_diff_title = if plural { "Open Diffs" } else { "Open Diff" };
-        let view_file_history_title = if plural {
-            "View File Histories"
-        } else {
-            "View File History"
-        };
+        let items = phpstorm::menu_items_for(state);
         ContextMenu::build(window, cx, |context_menu, _, _| {
-            context_menu
-                .context(self.focus_handle.clone())
-                .action(stage_title, ToggleStaged.boxed_clone())
-                .action(restore_title, RestoreFile::default().boxed_clone())
-                .separator()
-                .action("Unstaged Changes", ViewUnstagedChanges.boxed_clone())
-                .action("Staged Changes", ViewStagedChanges.boxed_clone())
-                .separator()
-                .action(copy_path_title, CopyPath.boxed_clone())
-                .action(copy_relative_path_title, CopyRelativePath.boxed_clone())
-                .separator()
-                .action_disabled_when(
-                    !all_created,
-                    if is_bulk && plural {
-                        "Add Files to .gitignore"
-                    } else {
-                        "Add to .gitignore"
-                    },
-                    git::AddToGitignore.boxed_clone(),
-                )
-                .action_disabled_when(
-                    !all_created,
-                    if is_bulk && plural {
-                        "Add Files to .git/info/exclude"
-                    } else {
-                        "Add to .git/info/exclude"
-                    },
-                    git::AddToGitInfoExclude.boxed_clone(),
-                )
-                .when(is_file_or_bulk, |context_menu| {
-                    context_menu
-                        .separator()
-                        .action(open_diff_title, menu::Confirm.boxed_clone())
-                        .action(open_file_diff_title, menu::SecondaryConfirm.boxed_clone())
-                        .action(view_file_title, ViewFile.boxed_clone())
-                })
-                .when(is_file_or_bulk && has_tracked, |context_menu| {
-                    context_menu
-                        .separator()
-                        .action(view_file_history_title, Box::new(git::FileHistory))
-                })
+            let mut menu = context_menu.context(self.focus_handle.clone());
+            let mut git_items = Vec::new();
+            for item in items {
+                if item.is_separator() {
+                    menu = menu.separator();
+                } else if item.action_id.starts_with(phpstorm::entry_menu_action::GIT_PREFIX) {
+                    git_items.push(item);
+                } else if let Some(action) = action_for_entry_menu_item(item.action_id) {
+                    menu = menu.action_disabled_when(!item.enabled, item.label, action);
+                }
+            }
+            if !git_items.is_empty() {
+                menu = menu.submenu("Git", move |submenu, _window, _cx| {
+                    let mut submenu = submenu;
+                    for item in &git_items {
+                        if let Some(action) = action_for_entry_menu_item(item.action_id) {
+                            submenu =
+                                submenu.action_disabled_when(!item.enabled, item.label, action);
+                        }
+                    }
+                    submenu
+                });
+            }
+            menu
         })
     }
 
@@ -8461,9 +8582,9 @@ impl GitPanel {
 
         self.selected_entry = Some(ix);
 
-        let Some(target_kind) = self.selection_target_kind() else {
+        if self.selection_target_kind().is_none() {
             return;
-        };
+        }
 
         let entries = self.effective_status_entries();
 
@@ -8471,20 +8592,16 @@ impl GitPanel {
             return;
         }
 
-        let all_created = entries.iter().all(|entry| entry.status.is_created());
-        let all_deleted = entries.iter().all(|entry| entry.status.is_deleted());
-        let will_unstage = self.should_unstage(target_kind, &entries, cx);
+        let state = phpstorm::EntryMenuState::for_entry(
+            entries
+                .iter()
+                .all(|entry| entry.staging.is_fully_staged()),
+            entries.iter().all(|entry| entry.status.is_created()),
+            entries.iter().all(|entry| entry.status.is_deleted()),
+        );
 
         self.set_context_menu(
-            self.build_context_menu(
-                will_unstage,
-                all_created,
-                all_deleted,
-                entries.len(),
-                target_kind,
-                window,
-                cx,
-            ),
+            self.build_context_menu(state, window, cx),
             position,
             None,
             window,
@@ -9356,6 +9473,8 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::revert_selected))
                     .on_action(cx.listener(Self::add_to_gitignore))
                     .on_action(cx.listener(Self::add_to_git_info_exclude))
+                    .on_action(cx.listener(Self::commit_file))
+                    .on_action(cx.listener(Self::delete_files))
                     .on_action(cx.listener(Self::clean_all))
                     .on_action(cx.listener(Self::generate_commit_message_action))
                     .on_action(cx.listener(Self::stash_all))
@@ -9383,6 +9502,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::copy_relative_path))
             .on_action(cx.listener(Self::view_unstaged_changes))
             .on_action(cx.listener(Self::view_staged_changes))
+            .on_action(cx.listener(Self::refresh_repository))
             .on_action(cx.listener(Self::focus_changes_list))
             .on_action(cx.listener(Self::focus_editor))
             .on_action(cx.listener(Self::expand_commit_editor))
@@ -16082,6 +16202,38 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_phpstorm_commit_file_stages_and_focuses_editor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project, _workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({
+                ".git": {},
+                "a.txt": "modified\n",
+            }),
+            &[("a.txt", StatusCode::Modified)],
+        )
+        .await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_entry = entry_index_for_repo_path(panel, &repo_path("a.txt"));
+            panel.commit_file(&CommitFile, window, cx);
+            assert!(
+                panel.commit_editor.read(cx).is_focused(window),
+                "Commit File... must focus the commit message editor",
+            );
+        });
+        settle_git_panel(&project, &panel, &mut cx).await;
+
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                staging_for(panel, &repo_path("a.txt")),
+                StageStatus::Staged,
+                "Commit File... must stage the selected file",
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_stage_and_unstage_actions_apply_to_marks(cx: &mut TestAppContext) {
         init_test(cx);
         let (_fs, project, panel, mut cx) = setup_flat_marks_fixture(cx).await;
@@ -16236,5 +16388,27 @@ mod tests {
                 "marks must not carry over to another repository",
             );
         });
+    }
+
+    #[test]
+    fn test_phpstorm_menu_actions_are_all_wired() {
+        for state in [
+            phpstorm::EntryMenuState::for_entry(false, false, false),
+            phpstorm::EntryMenuState::for_entry(true, false, false),
+            phpstorm::EntryMenuState::for_entry(false, true, false),
+            phpstorm::EntryMenuState::for_entry(false, false, true),
+        ] {
+            for item in phpstorm::menu_items_for(state) {
+                if item.is_separator() {
+                    continue;
+                }
+                assert!(
+                    action_for_entry_menu_item(item.action_id).is_some(),
+                    "menu entry {:?} ({}) is not wired to an action",
+                    item.label,
+                    item.action_id,
+                );
+            }
+        }
     }
 }

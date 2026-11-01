@@ -28,6 +28,8 @@ use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
 
 use crate::branch_picker;
+use crate::phpstorm;
+use crate::push_dialog::PushDialog;
 use git_ui_core::notifications::show_error_toast;
 
 actions!(
@@ -103,7 +105,10 @@ pub fn popover(
     };
 
     cx.new(|cx| {
-        let list = BranchList::new(workspace, repository, style, width, window, cx);
+        let mut list = BranchList::new(workspace, repository, style, width, window, cx);
+        if !modal_style {
+            list.show_phpstorm_actions = true;
+        }
         list.focus_handle(cx).focus(window, cx);
         list
     })
@@ -179,6 +184,7 @@ pub struct BranchList {
     picker_focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
     embedded: bool,
+    show_phpstorm_actions: bool,
 }
 
 impl BranchList {
@@ -375,6 +381,7 @@ impl BranchList {
             picker_focus_handle,
             _subscriptions: subscriptions,
             embedded,
+            show_phpstorm_actions: false,
         }
     }
 
@@ -475,6 +482,125 @@ impl BranchList {
             .is_deployed()
     }
 
+    fn phpstorm_action_row(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        label: &'static str,
+        shortcut: &'static str,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut BranchList, &mut Window, &mut Context<BranchList>) + 'static,
+    ) -> AnyElement {
+        h_flex()
+            .id(id)
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .justify_between()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|this| this.bg(cx.theme().colors().element_hover))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                    .child(Label::new(label).size(LabelSize::Small)),
+            )
+            .child(
+                Label::new(shortcut)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+            .into_any_element()
+    }
+
+    fn phpstorm_action_rows(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (workspace, repo) = {
+            let delegate = &self.picker.read(cx).delegate;
+            (delegate.workspace.clone(), delegate.repo.clone())
+        };
+
+        let update = self.phpstorm_action_row(
+            "phpstorm-update-project",
+            IconName::ArrowDown,
+            "Update Project...",
+            "⌘T",
+            cx,
+            |_this, window, cx| {
+                window.dispatch_action(git::Pull.boxed_clone(), cx);
+                cx.emit(DismissEvent);
+            },
+        );
+
+        let commit = self.phpstorm_action_row(
+            "phpstorm-commit",
+            IconName::GitCommit,
+            "Commit...",
+            "⌘K",
+            cx,
+            |_this, window, cx| {
+                window.dispatch_action(git::Commit.boxed_clone(), cx);
+                cx.emit(DismissEvent);
+            },
+        );
+
+        let push = self.phpstorm_action_row(
+            "phpstorm-push",
+            IconName::ExpandUp,
+            "Push...",
+            "⇧⌘K",
+            cx,
+            move |_this, window, cx| {
+                if let Some(repo) = repo.clone() {
+                    PushDialog::open(workspace.clone(), Some(repo), window, cx);
+                }
+                cx.emit(DismissEvent);
+            },
+        );
+
+        let new_branch_picker = self.picker.clone();
+        let new_branch = self.phpstorm_action_row(
+            "phpstorm-new-branch",
+            IconName::GitBranchPlus,
+            "New Branch...",
+            "",
+            cx,
+            move |this, window, cx| {
+                new_branch_picker.update(cx, |picker, cx| {
+                    picker.set_query("new-branch", window, cx);
+                    picker.select_query(window, cx);
+                });
+                this.picker.focus_handle(cx).focus(window, cx);
+            },
+        );
+
+        let checkout_revision = self.phpstorm_action_row(
+            "phpstorm-checkout-revision",
+            IconName::Hash,
+            "Checkout Tag or Revision...",
+            "",
+            cx,
+            |_this, window, cx| {
+                window.dispatch_action(git::ViewCommit.boxed_clone(), cx);
+            },
+        );
+
+        v_flex()
+            .w_full()
+            .px_1()
+            .pt_1()
+            .child(update)
+            .child(commit)
+            .child(push)
+            .child(div().px_1().py_1().child(Divider::horizontal()))
+            .child(new_branch)
+            .child(checkout_revision)
+            .child(div().px_1().py_1().child(Divider::horizontal()))
+            .into_any_element()
+    }
+
     pub(crate) fn cycle_branch_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let branch_filter = self.picker.read(cx).delegate.branch_filter.next();
         self.set_branch_filter(branch_filter, window, cx);
@@ -491,6 +617,9 @@ impl Focusable for BranchList {
 
 impl Render for BranchList {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let action_rows = self
+            .show_phpstorm_actions
+            .then(|| self.phpstorm_action_rows(cx));
         v_flex()
             .key_context("GitBranchSelector")
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
@@ -527,6 +656,7 @@ impl Render for BranchList {
                     menu_handle.toggle(window, cx);
                 }),
             )
+            .when_some(action_rows, |this, action_rows| this.child(action_rows))
             .child(self.picker.clone())
             .when(!self.embedded, |this| {
                 this.on_mouse_down_out({
@@ -979,13 +1109,10 @@ fn process_branches(branches: &Arc<[Branch]>, collapse_tracked_remotes: bool) ->
         branches.to_vec()
     };
 
-    result.sort_by_key(|branch| {
-        (
-            !branch.is_head,
-            branch
-                .most_recent_commit
-                .as_ref()
-                .map(|commit| 0 - commit.commit_timestamp),
+    result.sort_by(|left, right| {
+        phpstorm::compare_branch_display(
+            (left.name(), left.is_head, left.is_remote()),
+            (right.name(), right.is_head, right.is_remote()),
         )
     });
 
@@ -1673,6 +1800,14 @@ impl PickerDelegate for BranchListDelegate {
             .unwrap_or_else(|| (None, None, None, None));
 
         let is_head_branch = entry.as_branch().is_some_and(|branch| branch.is_head);
+        let upward_badges = entry
+            .as_branch()
+            .filter(|branch| !branch.is_remote())
+            .map(|branch| {
+                phpstorm::ahead_behind_badges(
+                    branch.upstream.as_ref().map(|upstream| upstream.tracking.clone()),
+                )
+            });
         let is_checked_branch = entry.as_branch().is_some_and(|branch| {
             if self.is_select_only() {
                 self.branch_selection_behavior
@@ -1814,7 +1949,7 @@ impl PickerDelegate for BranchListDelegate {
                     .child(
                         v_flex()
                             .id("info_container")
-                            .w_full()
+                            .flex_1()
                             .min_w_0()
                             .child(entry_title)
                             .child({
@@ -1934,7 +2069,35 @@ impl PickerDelegate for BranchListDelegate {
                                     })
                                 },
                             ),
-                    ),
+                    )
+                    .when_some(upward_badges, |this, badges| {
+                        this.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .when_some(badges.ahead, |this, ahead| {
+                                    this.child(
+                                        Label::new(ahead)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Success),
+                                    )
+                                })
+                                .when_some(badges.behind, |this, behind| {
+                                    this.child(
+                                        Label::new(behind)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Info),
+                                    )
+                                })
+                                .when_some(badges.note, |this, note| {
+                                    this.child(
+                                        Label::new(note)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                }),
+                        )
+                    }),
             )
             .when(
                 !self.is_select_only() && !is_new_items && !is_head_branch,
@@ -2359,6 +2522,7 @@ mod tests {
                         picker_focus_handle,
                         _subscriptions: vec![_subscription],
                         embedded: false,
+                        show_phpstorm_actions: false,
                     }
                 })
             })

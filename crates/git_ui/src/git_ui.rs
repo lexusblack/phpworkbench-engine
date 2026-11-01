@@ -51,7 +51,9 @@ pub mod git_picker;
 mod git_runtime_diagnostics;
 pub mod multi_diff_view;
 pub mod picker_prompt;
+pub mod phpstorm;
 pub mod project_diff;
+mod push_dialog;
 pub(crate) mod remote_output;
 pub mod repository_selector;
 pub mod solo_diff_view;
@@ -114,6 +116,12 @@ pub fn init(cx: &mut App) {
         branch_diff::BranchDiff::register(workspace, cx);
         CommitModal::register(workspace);
         git_panel::register(workspace);
+        workspace.register_action(
+            |workspace, _: &push_dialog::OpenPushDialog, window, cx| {
+                let repository = workspace.project().read(cx).active_repository(cx);
+                push_dialog::PushDialog::open(workspace.weak_handle(), repository, window, cx);
+            },
+        );
         repository_selector::register(workspace);
         git_picker::register(workspace);
 

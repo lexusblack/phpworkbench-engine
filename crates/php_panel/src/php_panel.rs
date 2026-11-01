@@ -5148,6 +5148,44 @@ fn next_data_source_name(base: &str, sources: &[DataSource]) -> String {
     name
 }
 
+fn unconfigured_data_source(root: &Path, sources: &[DataSource]) -> DataSource {
+    let mut source = DataSource::blank(root.to_path_buf());
+    source.driver.clear();
+    source.name = next_data_source_name("datasource", sources);
+    source
+}
+
+/// An empty project should still open with one selectable data source so the
+/// driver picker has a target (mirrors the deployment dialog's blank server).
+fn seed_data_sources_if_empty(
+    sources: &mut Vec<DataSource>,
+    selected: &mut Option<usize>,
+    root: &Path,
+) {
+    if sources.is_empty() {
+        let source = unconfigured_data_source(root, sources);
+        sources.push(source);
+    }
+    if selected.map_or(true, |index| index >= sources.len()) {
+        *selected = if sources.is_empty() { None } else { Some(0) };
+    }
+}
+
+fn resolve_selected_source(selected: Option<usize>, sources: &[DataSource]) -> Option<usize> {
+    match selected {
+        Some(index) if index < sources.len() => Some(index),
+        _ if sources.is_empty() => None,
+        _ => Some(0),
+    }
+}
+
+fn driver_picker_rows(current: &str) -> Vec<(&'static str, bool)> {
+    DATABASE_DRIVERS
+        .iter()
+        .map(|driver| (*driver, *driver == current))
+        .collect()
+}
+
 pub fn is_sqlite_file_name(path: &str) -> bool {
     matches!(
         Path::new(path)
@@ -5425,11 +5463,7 @@ impl DataSourcesDialog {
         self.openssh_hosts = load_openssh_hosts();
         self.restore_ssh_config_names();
         self.ssh_menu_open = false;
-        self.selected = if self.sources.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+        seed_data_sources_if_empty(&mut self.sources, &mut self.selected, &self.root);
         if cx.has_global::<DeployShared>() {
             self.panel = cx.global::<DeployShared>().panel.clone();
         }
@@ -5525,19 +5559,28 @@ impl DataSourcesDialog {
         }
     }
 
-    fn toggle_driver_menu(&mut self, cx: &mut Context<Self>) {
-        if self.selected.is_none() {
+    fn toggle_driver_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = resolve_selected_source(self.selected, &self.sources) else {
             return;
+        };
+        if self.selected != Some(index) {
+            self.selected = Some(index);
+            self.tab = DataSourceTab::General;
+            self.load_fields(window, cx);
         }
         self.driver_menu_open = !self.driver_menu_open;
         cx.notify();
     }
 
-    fn switch_driver(&mut self, driver: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_driver(&mut self, driver: String, window: &mut Window, cx: &mut Context<Self>) {
         self.driver_menu_open = false;
-        let Some(index) = self.selected else {
+        let Some(index) = resolve_selected_source(self.selected, &self.sources) else {
             return;
         };
+        if self.selected != Some(index) {
+            self.selected = Some(index);
+            self.load_fields(window, cx);
+        }
         self.apply_editors(cx);
         if let Some(source) = self.sources.get_mut(index) {
             if source.driver != driver {
@@ -7904,11 +7947,13 @@ impl Render for DataSourcesDialog {
                     .cursor_pointer()
                     .when(is_selected, |this| this.bg(colors.element_selected))
                     .hover(|style| style.bg(colors.element_hover))
-                    .child(driver_badge(
-                        driver_badge_short(&source.driver),
-                        driver_badge_color(&source.driver),
-                        cx,
-                    ))
+                    .when(!source.driver.is_empty(), |this| {
+                        this.child(driver_badge(
+                            driver_badge_short(&source.driver),
+                            driver_badge_color(&source.driver),
+                            cx,
+                        ))
+                    })
                     .child(
                         Label::new(source.name.clone())
                             .size(LabelSize::Custom(PANEL_TEXT_REMS))
@@ -8020,23 +8065,34 @@ impl Render for DataSourcesDialog {
                         .cursor_pointer()
                         .track_focus(&dialog_slot(&focus, DataSourceFocusSlot::Driver))
                         .focus(|style| style.bg(colors.element_hover))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                             if dialog_activation_key(event) {
                                 cx.stop_propagation();
-                                this.toggle_driver_menu(cx);
+                                this.toggle_driver_menu(window, cx);
                             }
                         }))
                         .hover(|style| style.bg(colors.element_hover))
-                        .child(driver_badge(
-                            driver_badge_short(&driver),
-                            driver_badge_color(&driver),
-                            cx,
-                        ))
-                        .child(
-                            Label::new(driver_display_name(&driver))
-                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                .truncate(),
-                        )
+                        .when(!driver.is_empty(), |this| {
+                            this.child(driver_badge(
+                                driver_badge_short(&driver),
+                                driver_badge_color(&driver),
+                                cx,
+                            ))
+                        })
+                        .when(driver.is_empty(), |this| {
+                            this.child(
+                                Label::new("Select driver")
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when(!driver.is_empty(), |this| {
+                            this.child(
+                                Label::new(driver_display_name(&driver))
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .truncate(),
+                            )
+                        })
                         .child(
                             Label::new(driver_support_hint(&driver))
                                 .size(LabelSize::Custom(PANEL_TEXT_REMS))
@@ -8048,15 +8104,16 @@ impl Render for DataSourcesDialog {
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
                         )
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.toggle_driver_menu(cx);
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.toggle_driver_menu(window, cx);
                         })),
                 ));
 
                 if self.driver_menu_open && selected_source.is_some() {
                     let mut menu_rows = Vec::new();
-                    for (menu_index, menu_driver) in DATABASE_DRIVERS.iter().enumerate() {
-                        let is_current = *menu_driver == driver;
+                    for (menu_index, (menu_driver, is_current)) in
+                        driver_picker_rows(&driver).into_iter().enumerate()
+                    {
                         menu_rows.push(
                             h_flex()
                                 .id(("ds-driver-row", menu_index))
@@ -8085,7 +8142,7 @@ impl Render for DataSourcesDialog {
                                         .truncate(),
                                 )
                                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.switch_driver(menu_driver.to_string(), window, cx);
+                                    this.select_driver(menu_driver.to_string(), window, cx);
                                 }))
                                 .into_any_element(),
                         );
@@ -16216,6 +16273,55 @@ Host web1
         );
 
         std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn empty_data_sources_seed_one_selected_blank_source() {
+        let root = PathBuf::from("/tmp");
+        let mut sources = Vec::new();
+        let mut selected = None;
+        seed_data_sources_if_empty(&mut sources, &mut selected, &root);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(selected, Some(0));
+        assert_eq!(sources[0].name, "datasource");
+        assert!(sources[0].driver.is_empty(), "seeded source must await a driver");
+        assert_eq!(sources[0].root, root);
+
+        // Re-seeding an already populated dialog must not add another source.
+        seed_data_sources_if_empty(&mut sources, &mut selected, &root);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(selected, Some(0));
+    }
+
+    #[test]
+    fn driver_picker_lists_all_drivers_for_blank_source() {
+        let rows = driver_picker_rows("");
+        assert_eq!(rows.len(), DATABASE_DRIVERS.len());
+        assert_eq!(rows.len(), 8);
+        assert!(rows.iter().all(|(_, is_current)| !is_current));
+        assert_eq!(
+            rows.iter().map(|(driver, _)| *driver).collect::<Vec<_>>(),
+            DATABASE_DRIVERS.to_vec()
+        );
+
+        let rows = driver_picker_rows("postgres");
+        assert_eq!(rows.iter().filter(|(_, is_current)| *is_current).count(), 1);
+        assert!(rows
+            .iter()
+            .any(|(driver, is_current)| *driver == "postgres" && *is_current));
+
+        let rows = driver_picker_rows("custom");
+        assert!(rows.iter().all(|(_, is_current)| !is_current));
+    }
+
+    #[test]
+    fn select_driver_falls_back_to_first_source() {
+        let sources = vec![DataSource::blank(PathBuf::from("/tmp"))];
+        assert_eq!(resolve_selected_source(None, &sources), Some(0));
+        assert_eq!(resolve_selected_source(Some(0), &sources), Some(0));
+        assert_eq!(resolve_selected_source(Some(7), &sources), Some(0));
+        assert_eq!(resolve_selected_source(None, &[]), None);
     }
 
     #[test]

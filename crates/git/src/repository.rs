@@ -853,6 +853,16 @@ pub trait GitRepository: Send + Sync {
 
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>>;
 
+    /// Returns commits reachable from HEAD but not from its upstream, newest
+    /// first, capped at `limit`.
+    ///
+    /// Backends that cannot answer this (such as the test fake) return an
+    /// empty list.
+    fn upstream_commits(&self, limit: usize) -> BoxFuture<'_, Result<Vec<CommitSummary>>> {
+        let _ = limit;
+        async move { Ok(Vec::new()) }.boxed()
+    }
+
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
@@ -2144,6 +2154,34 @@ impl GitRepository for RealGitRepository {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("git status failed: {stderr}");
                 }
+            })
+            .boxed()
+    }
+
+    fn upstream_commits(&self, limit: usize) -> BoxFuture<'_, Result<Vec<CommitSummary>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                if git
+                    .run(&["rev-parse", "--verify", "@{upstream}"])
+                    .await
+                    .is_err()
+                {
+                    return Ok(Vec::new());
+                }
+
+                let limit = limit.to_string();
+                let output = git
+                    .run(&[
+                        "log",
+                        "-n",
+                        limit.as_str(),
+                        "--format=%H%x1f%s%x1f%an%x1f%ct%x1f%P",
+                        "@{upstream}..HEAD",
+                        "--",
+                    ])
+                    .await?;
+                Ok(parse_upstream_commits(&output))
             })
             .boxed()
     }
@@ -4258,6 +4296,30 @@ fn format_branch_scan_error(output: &Output) -> String {
     } else {
         stderr
     }
+}
+
+fn parse_upstream_commits(output: &str) -> Vec<CommitSummary> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\x1f');
+            let sha = fields.next()?.trim();
+            if sha.is_empty() {
+                return None;
+            }
+            let subject = fields.next().unwrap_or_default();
+            let author_name = fields.next().unwrap_or_default();
+            let commit_timestamp = fields.next()?.parse::<i64>().ok()?;
+            let parents = fields.next().unwrap_or_default();
+            Some(CommitSummary {
+                sha: sha.into(),
+                subject: subject.into(),
+                commit_timestamp,
+                author_name: author_name.into(),
+                has_parent: parents.split_whitespace().next().is_some(),
+            })
+        })
+        .collect()
 }
 
 fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
