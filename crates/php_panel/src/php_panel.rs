@@ -417,9 +417,8 @@ fn database_connection_label(database: &DatabaseEntry) -> String {
     database.name.clone()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FormKind {
-    Database,
     Sql,
 }
 
@@ -440,26 +439,6 @@ enum FormKeyOutcome {
 }
 
 impl FormState {
-    fn new(kind: FormKind) -> Self {
-        let fields = match kind {
-            FormKind::Database => vec![
-                String::new(),
-                "sqlite".to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ],
-            FormKind::Sql => vec![String::new()],
-        };
-        Self {
-            kind,
-            fields,
-            active: 0,
-            message: None,
-            connection: None,
-        }
-    }
-
     fn sql(connection: String) -> Self {
         Self {
             kind: FormKind::Sql,
@@ -472,7 +451,6 @@ impl FormState {
 
     fn labels(&self) -> &'static [&'static str] {
         match self.kind {
-            FormKind::Database => &["name", "driver", "target", "user", "database"],
             FormKind::Sql => &["sql"],
         }
     }
@@ -5148,6 +5126,60 @@ fn next_data_source_name(base: &str, sources: &[DataSource]) -> String {
     name
 }
 
+/// A data source to create when the dialog is opened from the Create Data
+/// Source menu. Purely a seed for the editor; nothing is written to disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DataSourceSeed {
+    driver: &'static str,
+    path: Option<String>,
+}
+
+impl DataSourceSeed {
+    fn driver(driver: &'static str) -> Self {
+        Self { driver, path: None }
+    }
+
+    fn demo(demo: DemoDatabase) -> Self {
+        Self {
+            driver: demo.driver(),
+            path: match demo {
+                DemoDatabase::Sqlite => Some("demo.sqlite".to_string()),
+                DemoDatabase::Postgres | DemoDatabase::MySql => None,
+            },
+        }
+    }
+}
+
+/// PhpStorm-style numbered names derived from the driver identifier.
+fn create_data_source_name(driver: &str, sources: &[DataSource]) -> String {
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("{driver}{index}");
+        if !sources.iter().any(|source| source.name == candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn seeded_data_source(
+    driver: &str,
+    path: Option<&str>,
+    root: &Path,
+    sources: &[DataSource],
+) -> DataSource {
+    let mut source = DataSource::blank(root.to_path_buf());
+    source.driver = driver.to_string();
+    source.name = create_data_source_name(driver, sources);
+    if let Some(default_port) = driver_default_port(driver) {
+        source.port = default_port.to_string();
+    }
+    if driver == "sqlite" {
+        source.path = path.unwrap_or_default().to_string();
+    }
+    source
+}
+
 fn unconfigured_data_source(root: &Path, sources: &[DataSource]) -> DataSource {
     let mut source = DataSource::blank(root.to_path_buf());
     source.driver.clear();
@@ -5364,7 +5396,12 @@ impl Focusable for DataSourcesDialog {
 }
 
 impl DataSourcesDialog {
-    fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        root: PathBuf,
+        seed: Option<DataSourceSeed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut dialog = Self {
             root,
             sources: Vec::new(),
@@ -5404,6 +5441,7 @@ impl DataSourcesDialog {
                 }
             }));
         dialog.seed_from_disk(window, cx);
+        dialog.apply_open_seed(seed, window, cx);
         dialog
     }
 
@@ -5475,9 +5513,58 @@ impl DataSourcesDialog {
         cx.notify();
     }
 
-    fn resume_with_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn resume_with_root(
+        &mut self,
+        root: PathBuf,
+        seed: Option<DataSourceSeed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.root = root;
         self.seed_from_disk(window, cx);
+        self.apply_open_seed(seed, window, cx);
+    }
+
+    /// Applies a Create Data Source seed: picks the `General` tab, creates the
+    /// prefilled source, and focuses its name editor. Reuses the lone blank
+    /// placeholder so an empty project does not accumulate stray rows.
+    fn apply_open_seed(
+        &mut self,
+        seed: Option<DataSourceSeed>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(seed) = seed else {
+            return;
+        };
+        self.apply_editors(cx);
+        let source = seeded_data_source(
+            seed.driver,
+            seed.path.as_deref(),
+            &self.root,
+            &self.sources,
+        );
+        let reuse_placeholder = self.sources.len() == 1
+            && self.sources[0].driver.is_empty()
+            && self.sources[0].name == "datasource"
+            && self.sources[0].path.is_empty()
+            && self.sources[0].host.is_empty()
+            && self.sources[0].user.is_empty();
+        if reuse_placeholder {
+            self.sources[0] = source;
+            self.selected = Some(0);
+        } else {
+            self.sources.push(source);
+            self.selected = Some(self.sources.len() - 1);
+        }
+        self.tab = DataSourceTab::General;
+        self.message = None;
+        self.test_message = None;
+        self.schemas_state = SchemaListState::Idle;
+        self.load_fields(window, cx);
+        let handle = self.name_editor.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
     }
 
     fn load_fields(&mut self, window: &mut Window, cx: &mut App) {
@@ -7836,6 +7923,17 @@ pub fn open_root_picker_window(
 }
 
 pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
+    open_data_sources_window_seeded(root, None, cx);
+}
+
+/// Opens the Data Sources dialog and, when `seed` is set, pre-creates a data
+/// source with that driver (used by the Create Data Source menu). The seed
+/// only populates the editor; it is persisted by Apply/OK, never here.
+fn open_data_sources_window_seeded(
+    root: PathBuf,
+    seed: Option<DataSourceSeed>,
+    cx: &mut App,
+) {
     register_dialog_key_bindings(cx, "DataSourceDialog");
     if !cx.has_global::<DataSourcesDialogWindow>() {
         cx.set_global(DataSourcesDialogWindow(None));
@@ -7843,7 +7941,7 @@ pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
     let existing = cx.global::<DataSourcesDialogWindow>().0;
     if let Some(handle) = existing.and_then(|any| any.downcast::<DataSourcesDialog>()) {
         let resumed = handle.update(cx, |dialog, window, cx| {
-            dialog.resume_with_root(root.clone(), window, cx);
+            dialog.resume_with_root(root.clone(), seed.clone(), window, cx);
             window.activate_window();
             cx.notify();
         });
@@ -7853,7 +7951,7 @@ pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
         cx.global_mut::<DataSourcesDialogWindow>().0 = None;
     }
 
-    let window_bounds = dialog_bounds("data_sources", size(px(760.), px(720.)), cx);
+    let window_bounds = dialog_bounds("data_sources", size(px(760.), px(640.)), cx);
     let handle = cx
         .open_window(
             WindowOptions {
@@ -7866,7 +7964,8 @@ pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
             },
             |window, cx| {
                 window.set_window_title("Data Sources and Drivers");
-                let view = cx.new(|cx| DataSourcesDialog::new(root.clone(), window, cx));
+                let view =
+                    cx.new(|cx| DataSourcesDialog::new(root.clone(), seed.clone(), window, cx));
                 window.activate_window();
                 view.focus_handle(cx).focus(window, cx);
                 view
@@ -8277,6 +8376,7 @@ impl Render for DataSourcesDialog {
                 v_flex()
                     .id("ds-tab-general")
                     .w_full()
+                    .gap_2()
                     .children(rows)
                     .into_any_element()
             }
@@ -8848,7 +8948,7 @@ impl Render for DataSourcesDialog {
                                     .items_center()
                                     .gap_2()
                                     .px_2()
-                                    .py_1()
+                                    .py_2()
                                     .border_b_1()
                                     .border_color(colors.border)
                                     .child(
@@ -8862,12 +8962,7 @@ impl Render for DataSourcesDialog {
                                         None,
                                         window,
                                         cx,
-                                    ))
-                                    .child(
-                                        Label::new("Color")
-                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                            .color(Color::Muted),
-                                    ),
+                                    )),
                             )
                             .child(
                                 h_flex()
@@ -9018,6 +9113,111 @@ const DATABASE_DRIVERS: [&str; 8] = [
     "mongodb",
     "redis",
 ];
+
+/// Driver order for the Databases "+" Create Data Source menu (PhpStorm order).
+const CREATE_DATA_SOURCE_DRIVERS: [&str; 8] = [
+    "postgres",
+    "mysql",
+    "sqlserver",
+    "mariadb",
+    "sqlite",
+    "oracle",
+    "mongodb",
+    "redis",
+];
+
+/// One of the bundled demo database rows in the Create Data Source menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoDatabase {
+    Postgres,
+    MySql,
+    Sqlite,
+}
+
+impl DemoDatabase {
+    const ALL: [DemoDatabase; 3] = [Self::Postgres, Self::MySql, Self::Sqlite];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "Demo PostgreSQL",
+            Self::MySql => "Demo MySQL",
+            Self::Sqlite => "Demo SQLite",
+        }
+    }
+
+    fn driver(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::MySql => "mysql",
+            Self::Sqlite => "sqlite",
+        }
+    }
+
+    /// Demo rows never fabricate a connection: PostgreSQL/MySQL need a local
+    /// server, and SQLite only works when `demo.sqlite` already exists.
+    fn enabled(self, sqlite_demo_exists: bool) -> bool {
+        matches!(self, Self::Sqlite) && sqlite_demo_exists
+    }
+
+    fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Postgres | Self::MySql => Some("requires a local server"),
+            Self::Sqlite => Some("demo.sqlite not found in project"),
+        }
+    }
+}
+
+/// An actionable row in the Create Data Source menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreateDataSourceAction {
+    Driver(&'static str),
+    AllDataSources,
+    Demo(DemoDatabase),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CreateDataSourceMenuRow {
+    action: CreateDataSourceAction,
+    enabled: bool,
+}
+
+/// Pure model for the Databases "+" menu: driver rows in PhpStorm order, then
+/// All Data Sources, then the demo section.
+fn create_data_source_menu(sqlite_demo_exists: bool) -> Vec<CreateDataSourceMenuRow> {
+    let mut rows = Vec::new();
+    for driver in CREATE_DATA_SOURCE_DRIVERS {
+        rows.push(CreateDataSourceMenuRow {
+            action: CreateDataSourceAction::Driver(driver),
+            enabled: true,
+        });
+    }
+    rows.push(CreateDataSourceMenuRow {
+        action: CreateDataSourceAction::AllDataSources,
+        enabled: true,
+    });
+    for demo in DemoDatabase::ALL {
+        rows.push(CreateDataSourceMenuRow {
+            action: CreateDataSourceAction::Demo(demo),
+            enabled: demo.enabled(sqlite_demo_exists),
+        });
+    }
+    rows
+}
+
+/// PhpStorm-style display names for the Create Data Source menu.
+fn create_data_source_driver_label(driver: &str) -> &'static str {
+    match driver {
+        "postgres" => "PostgreSQL",
+        "mysql" => "MySQL",
+        "sqlserver" => "Microsoft SQL Server",
+        "mariadb" => "MariaDB",
+        "sqlite" => "SQLite",
+        "oracle" => "Oracle",
+        "mongodb" => "MongoDB",
+        "redis" => "Redis",
+        _ => "Unknown",
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DatabaseColumn {
@@ -9512,7 +9712,6 @@ pub struct PhpPanel {
     databases: Vec<DatabaseEntry>,
     sync_status: HashMap<String, SyncStatus>,
     database_status: HashMap<String, DatabaseStatus>,
-    database_check_status: HashMap<String, SyncStatus>,
     query_status: HashMap<String, TableStatus>,
     db_expanded_conns: HashSet<String>,
     db_expanded_views: HashSet<String>,
@@ -9740,7 +9939,6 @@ impl PhpPanel {
                     databases: Vec::new(),
                     sync_status: HashMap::new(),
                     database_status: HashMap::new(),
-                    database_check_status: HashMap::new(),
                     query_status: HashMap::new(),
                     db_expanded_conns: HashSet::new(),
                     db_expanded_views: HashSet::new(),
@@ -10091,7 +10289,6 @@ impl PhpPanel {
 
     fn refresh_databases(&mut self, cx: &mut Context<Self>) {
         self.database_status.clear();
-        self.database_check_status.clear();
         self.database_views_status.clear();
         self.db_names_status.clear();
         self.db_expanded_conns.clear();
@@ -10603,13 +10800,6 @@ impl PhpPanel {
             .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
     }
 
-    fn open_form(&mut self, kind: FormKind, window: &mut Window, cx: &mut Context<Self>) {
-        self.form = Some(FormState::new(kind));
-        self.saved_message = None;
-        window.focus(&self.focus_handle, cx);
-        cx.notify();
-    }
-
     fn open_sql_form(&mut self, connection: String, window: &mut Window, cx: &mut Context<Self>) {
         self.form = Some(FormState::sql(connection));
         self.saved_message = None;
@@ -10637,7 +10827,6 @@ impl PhpPanel {
         let Some(form) = self.form.as_ref() else {
             return;
         };
-        let kind = form.kind;
         let fields = form.fields.clone();
         let connection = form.connection.clone();
         let Some(root) = self.worktree_root(cx) else {
@@ -10648,51 +10837,24 @@ impl PhpPanel {
             return;
         };
 
-        if kind == FormKind::Sql {
-            let sql = form_field(&fields, 0);
-            if sql.is_empty() {
-                if let Some(form) = self.form.as_mut() {
-                    form.message = Some("sql is empty".to_string());
-                }
-                cx.notify();
-                return;
+        let sql = form_field(&fields, 0);
+        if sql.is_empty() {
+            if let Some(form) = self.form.as_mut() {
+                form.message = Some("sql is empty".to_string());
             }
-            let Some(connection) = connection else {
-                if let Some(form) = self.form.as_mut() {
-                    form.message = Some("no connection".to_string());
-                }
-                cx.notify();
-                return;
-            };
-            self.form = None;
-            self.run_sql_query(connection, sql, root, cx);
             cx.notify();
             return;
         }
-
-        if kind == FormKind::Sql {
+        let Some(connection) = connection else {
+            if let Some(form) = self.form.as_mut() {
+                form.message = Some("no connection".to_string());
+            }
+            cx.notify();
             return;
-        }
-        let saved = save_database_config(&root, &fields);
-
-        match saved {
-            Ok(name) => {
-                self.form = None;
-                self.saved_message = Some("saved".to_string());
-                self.refresh(cx);
-                match kind {
-                    FormKind::Database => self.run_database_check(name, root, cx),
-                    FormKind::Sql => {}
-                }
-                cx.notify();
-            }
-            Err(message) => {
-                if let Some(form) = self.form.as_mut() {
-                    form.message = Some(message);
-                }
-                cx.notify();
-            }
-        }
+        };
+        self.form = None;
+        self.run_sql_query(connection, sql, root, cx);
+        cx.notify();
     }
 
     fn clear_active_server(&mut self, cx: &mut Context<Self>) {
@@ -10838,33 +11000,6 @@ impl PhpPanel {
         .detach();
     }
 
-    fn run_database_check(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
-        self.database_check_status
-            .insert(name.clone(), SyncStatus::Syncing);
-        cx.notify();
-
-        let task_name = name.clone();
-        let task = cx.background_spawn(async move {
-            let mut command = util::command::new_command("php-db");
-            command.arg("check").arg(&task_name).current_dir(&root);
-            command_result(command.output().await, "check failed")
-        });
-
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                let status = match result {
-                    Ok(()) => SyncStatus::Ok,
-                    Err(message) => SyncStatus::Failed(message),
-                };
-                this.database_check_status.insert(name, status);
-                cx.notify();
-            })
-            .log_err();
-        })
-        .detach();
-    }
-
     fn load_database_schema(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
         self.database_status
             .insert(name.clone(), DatabaseStatus::Loading);
@@ -10973,23 +11108,6 @@ impl PhpPanel {
 
     fn toggle_db_menu(&mut self, cx: &mut Context<Self>) {
         self.db_menu_open = !self.db_menu_open;
-        cx.notify();
-    }
-
-    fn open_database_form(
-        &mut self,
-        driver: Option<&str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_form(FormKind::Database, window, cx);
-        if let Some(driver) = driver {
-            if let Some(form) = self.form.as_mut() {
-                form.fields[1] = driver.to_string();
-                form.fields[0] = next_connection_name(driver, &self.databases);
-            }
-        }
-        self.db_menu_open = false;
         cx.notify();
     }
 
@@ -11855,67 +11973,6 @@ fn save_server_config(root: &Path, fields: &[String]) -> std::result::Result<Str
     Ok(name)
 }
 
-fn save_database_config(root: &Path, fields: &[String]) -> std::result::Result<String, String> {
-    let name = form_field(fields, 0);
-    if name.is_empty() {
-        return Err("name is required".to_string());
-    }
-    let driver = form_field(fields, 1).to_ascii_lowercase();
-    if !DATABASE_DRIVERS.contains(&driver.as_str()) {
-        return Err(format!(
-            "driver must be one of {}",
-            DATABASE_DRIVERS.join(", ")
-        ));
-    }
-    let target = form_field(fields, 2);
-    let user = form_field(fields, 3);
-    let database = form_field(fields, 4);
-
-    let path = root.join(".zed/databases.json");
-    let mut config = load_config_object(&path)?;
-    let mut connections = match config.remove("connections") {
-        Some(Value::Array(connections)) => connections,
-        Some(_) => return Err("connections in databases.json is not an array".to_string()),
-        None => Vec::new(),
-    };
-
-    upsert_config_entry(&mut connections, &name, |connection| {
-        for key in ["driver", "path", "url", "host", "port", "user", "database"] {
-            connection.remove(key);
-        }
-        connection.insert("driver".to_string(), Value::String(driver.clone()));
-        if !target.is_empty() {
-            if driver == "sqlite" {
-                connection.insert("path".to_string(), Value::String(target.clone()));
-            } else if target.contains("://") {
-                connection.insert("url".to_string(), Value::String(target.clone()));
-            } else if let Some((host, port)) = target.rsplit_once(':') {
-                match port.parse::<u16>() {
-                    Ok(port) => {
-                        connection.insert("host".to_string(), Value::String(host.to_string()));
-                        connection.insert("port".to_string(), Value::Number(port.into()));
-                    }
-                    Err(_) => {
-                        connection.insert("host".to_string(), Value::String(target.clone()));
-                    }
-                }
-            } else {
-                connection.insert("host".to_string(), Value::String(target.clone()));
-            }
-        }
-        if !user.is_empty() {
-            connection.insert("user".to_string(), Value::String(user.clone()));
-        }
-        if !database.is_empty() {
-            connection.insert("database".to_string(), Value::String(database.clone()));
-        }
-    });
-
-    config.insert("connections".to_string(), Value::Array(connections));
-    write_config_object(&path, &config)?;
-    Ok(name)
-}
-
 fn command_result(
     output: std::io::Result<std::process::Output>,
     fallback: &str,
@@ -11941,16 +11998,6 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 
 fn display_field(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("-")
-}
-
-fn next_connection_name(base: &str, existing: &[DatabaseEntry]) -> String {
-    let mut name = base.to_string();
-    let mut index = 0usize;
-    while existing.iter().any(|entry| entry.name == name) {
-        index += 1;
-        name = format!("{base} ({index})");
-    }
-    name
 }
 
 fn driver_badge_short(driver: &str) -> &'static str {
@@ -13006,28 +13053,19 @@ impl Render for PhpPanel {
             let root = database.root.clone();
             let is_sqlite = driver == "sqlite";
             let status = self
-                .database_check_status
+                .database_status
                 .get(&database.name)
                 .map(|status| match status {
-                    SyncStatus::Syncing => ("checking…".to_string(), Color::Muted),
-                    SyncStatus::Ok => ("ok".to_string(), Color::Success),
-                    SyncStatus::Failed(message) => (message.clone(), Color::Error),
-                })
-                .or_else(|| {
-                    self.database_status
-                        .get(&database.name)
-                        .map(|status| match status {
-                            DatabaseStatus::Loading => ("loading…".to_string(), Color::Muted),
-                            DatabaseStatus::Loaded(tables) => (
-                                format!(
-                                    "{} {}",
-                                    tables.len(),
-                                    if tables.len() == 1 { "table" } else { "tables" }
-                                ),
-                                Color::Default,
-                            ),
-                            DatabaseStatus::Failed(message) => (message.clone(), Color::Error),
-                        })
+                    DatabaseStatus::Loading => ("loading…".to_string(), Color::Muted),
+                    DatabaseStatus::Loaded(tables) => (
+                        format!(
+                            "{} {}",
+                            tables.len(),
+                            if tables.len() == 1 { "table" } else { "tables" }
+                        ),
+                        Color::Default,
+                    ),
+                    DatabaseStatus::Failed(message) => (message.clone(), Color::Error),
                 })
                 .or_else(|| {
                     self.query_status
@@ -13493,71 +13531,177 @@ impl Render for PhpPanel {
             );
 
         let database_driver_menu = if self.db_menu_open {
-            let mut menu_rows = Vec::new();
-            menu_rows.push(
-                h_flex()
-                    .id("db-menu-datasource")
-                    .w_full()
-                    .flex_none()
-                    .px_2()
-                    .py_0p5()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .child(
-                        Label::new("Data Sources and Drivers...")
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .color(Color::Accent),
-                    )
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.db_menu_open = false;
-                        if let Some(root) = this.worktree_root(cx) {
-                            open_data_sources_window(root, cx);
-                        }
-                    }))
-                    .into_any_element(),
-            );
+            let root = self.worktree_root(cx);
+            let sqlite_demo_exists = root
+                .as_ref()
+                .map(|root| root.join("demo.sqlite").is_file())
+                .unwrap_or(false);
+            let mut menu_rows: Vec<gpui::AnyElement> = Vec::new();
             menu_rows.push(
                 h_flex()
                     .w_full()
                     .flex_none()
                     .px_2()
-                    .py_0p5()
+                    .pt_1()
+                    .pb_0p5()
                     .child(
-                        Label::new("Full Support")
+                        Label::new("Create Data Source")
                             .size(LabelSize::Custom(PANEL_TEXT_REMS))
                             .color(Color::Muted),
                     )
                     .into_any_element(),
             );
-            for (menu_index, driver) in DATABASE_DRIVERS.iter().enumerate() {
-                let driver_name = driver.to_string();
-                menu_rows.push(
-                    h_flex()
-                        .id(("db-menu-driver", menu_index))
-                        .w_full()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_0p5()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(cx.theme().colors().element_hover))
-                        .child(driver_badge(
-                            driver_badge_short(driver),
-                            driver_badge_color(driver),
-                            cx,
-                        ))
-                        .child(
-                            Label::new(driver_display_name(driver))
-                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                .color(Color::Default)
-                                .truncate(),
-                        )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.open_database_form(Some(driver_name.as_str()), window, cx);
-                        }))
-                        .into_any_element(),
-                );
+            let mut demo_header_added = false;
+            for (menu_index, row) in create_data_source_menu(sqlite_demo_exists)
+                .into_iter()
+                .enumerate()
+            {
+                match row.action {
+                    CreateDataSourceAction::Driver(driver) => {
+                        let seed = DataSourceSeed::driver(driver);
+                        menu_rows.push(
+                            h_flex()
+                                .id(("cds-driver", menu_index))
+                                .w_full()
+                                .flex_none()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .child(driver_badge(
+                                    driver_badge_short(driver),
+                                    driver_badge_color(driver),
+                                    cx,
+                                ))
+                                .child(
+                                    Label::new(create_data_source_driver_label(driver))
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Default)
+                                        .truncate(),
+                                )
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                    this.db_menu_open = false;
+                                    if let Some(root) = this.worktree_root(cx) {
+                                        open_data_sources_window_seeded(
+                                            root,
+                                            Some(seed.clone()),
+                                            cx,
+                                        );
+                                    }
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    CreateDataSourceAction::AllDataSources => {
+                        menu_rows.push(
+                            h_flex()
+                                .id("cds-all")
+                                .w_full()
+                                .flex_none()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .child(
+                                    Label::new("All Data Sources...")
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Default)
+                                        .truncate(),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    Icon::new(IconName::ChevronRight)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.db_menu_open = false;
+                                    if let Some(root) = this.worktree_root(cx) {
+                                        open_data_sources_window(root, cx);
+                                    }
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    CreateDataSourceAction::Demo(demo) => {
+                        if !demo_header_added {
+                            demo_header_added = true;
+                            menu_rows.push(
+                                h_flex()
+                                    .w_full()
+                                    .flex_none()
+                                    .px_2()
+                                    .pt_1()
+                                    .pb_0p5()
+                                    .child(
+                                        Label::new("Explore Demo Databases")
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Muted),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        let enabled = row.enabled;
+                        let seed = DataSourceSeed::demo(demo);
+                        let mut item = h_flex()
+                            .id(("cds-demo", menu_index))
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm();
+                        if enabled {
+                            item = item
+                                .cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _window, cx| {
+                                        this.db_menu_open = false;
+                                        if let Some(root) = this.worktree_root(cx) {
+                                            open_data_sources_window_seeded(
+                                                root,
+                                                Some(seed.clone()),
+                                                cx,
+                                            );
+                                        }
+                                        cx.notify();
+                                    },
+                                ));
+                        } else {
+                            item = item.opacity(0.55).tooltip(Tooltip::text(
+                                demo.disabled_reason().unwrap_or_default(),
+                            ));
+                        }
+                        menu_rows.push(
+                            item.child(driver_badge(
+                                driver_badge_short(demo.driver()),
+                                driver_badge_color(demo.driver()),
+                                cx,
+                            ))
+                            .child(
+                                Label::new(demo.label())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(if enabled {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    })
+                                    .truncate(),
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                }
             }
             Some(
                 v_flex()
@@ -13572,7 +13716,7 @@ impl Render for PhpPanel {
                     .border_color(cx.theme().colors().border)
                     .bg(cx.theme().colors().elevated_surface_background)
                     .shadow_sm()
-                    .max_h(px(220.))
+                    .max_h(px(460.))
                     .overflow_y_scroll()
                     .children(menu_rows),
             )
@@ -13633,7 +13777,7 @@ impl Render for PhpPanel {
                 .when_some(
                     self.form
                         .as_ref()
-                        .filter(|form| matches!(form.kind, FormKind::Database | FormKind::Sql)),
+                        .filter(|form| matches!(form.kind, FormKind::Sql)),
                     |this, form| this.child(render_form(form)),
                 )
                 .child(
@@ -14361,7 +14505,6 @@ fn render_tab_bar(active: PanelTab, cx: &Context<PhpPanel>) -> gpui::AnyElement 
 fn render_form(form: &FormState) -> gpui::AnyElement {
     let mut rows = Vec::new();
     let title = match form.kind {
-        FormKind::Database => "new database",
         FormKind::Sql => "sql console",
     };
     rows.push(
@@ -14423,7 +14566,6 @@ fn render_form(form: &FormState) -> gpui::AnyElement {
 
     let footer = match form.kind {
         FormKind::Sql => "Enter run · Esc cancel",
-        FormKind::Database => "Tab next · Enter save · Esc cancel",
     };
     rows.push(
         h_flex()
@@ -14637,47 +14779,33 @@ mod tests {
 
     #[test]
     fn form_defaults_match_field_labels() {
-        for kind in [FormKind::Database, FormKind::Sql] {
-            let form = FormState::new(kind);
-            assert_eq!(form.fields.len(), form.labels().len());
-            assert_eq!(form.active, 0);
-        }
-        let database = FormState::new(FormKind::Database);
-        assert_eq!(database.fields[1], "sqlite");
-        let sql = FormState::sql("app".to_string());
-        assert_eq!(sql.labels(), &["sql"]);
-        assert_eq!(sql.placeholder(0), Some("select * from users limit 20"));
-        assert_eq!(sql.connection.as_deref(), Some("app"));
+        let form = FormState::sql("app".to_string());
+        assert_eq!(form.kind, FormKind::Sql);
+        assert_eq!(form.fields.len(), form.labels().len());
+        assert_eq!(form.active, 0);
+        assert_eq!(form.labels(), &["sql"]);
+        assert_eq!(form.placeholder(0), Some("select * from users limit 20"));
+        assert_eq!(form.connection.as_deref(), Some("app"));
     }
 
     #[test]
     fn form_key_sequence_matches_typing_model() {
-        let mut database = FormState::new(FormKind::Database);
-        assert_eq!(database.fields.len(), 5);
-
-        for character in "notes".chars() {
-            let character = character.to_string();
-            assert_eq!(
-                database.handle_key("", Some(&character)),
-                FormKeyOutcome::Continue
-            );
-        }
-        database.handle_key("space", None);
-        assert_eq!(database.fields[0], "notes ");
-        database.handle_key("tab", None);
-        assert_eq!(database.active, 1);
-        database.handle_key("up", None);
-        assert_eq!(database.active, 0);
-        assert_eq!(database.handle_key("enter", None), FormKeyOutcome::Save);
-        assert_eq!(database.handle_key("escape", None), FormKeyOutcome::Cancel);
-
         let mut sql = FormState::sql("app".to_string());
+        assert_eq!(sql.fields.len(), 1);
+
         for character in "my query".chars() {
             let character = character.to_string();
-            sql.handle_key("", Some(&character));
+            assert_eq!(sql.handle_key("", Some(&character)), FormKeyOutcome::Continue);
         }
         assert_eq!(sql.fields[0], "my query");
+        sql.handle_key("space", None);
+        assert_eq!(sql.fields[0], "my query ");
+        sql.handle_key("backspace", None);
+        assert_eq!(sql.fields[0], "my query");
+        sql.handle_key("tab", None);
+        assert_eq!(sql.active, 0);
         assert_eq!(sql.handle_key("enter", None), FormKeyOutcome::Save);
+        assert_eq!(sql.handle_key("escape", None), FormKeyOutcome::Cancel);
     }
 
     #[test]
@@ -14883,76 +15011,6 @@ mod tests {
         .expect_err("non numeric port rejected");
         assert_eq!(error, "port must be a number");
         assert!(!path.exists());
-
-        std::fs::remove_dir_all(&root).expect("clean temporary project root");
-    }
-
-    #[test]
-    fn save_database_maps_target_by_shape() {
-        let root = temp_root("database_targets");
-        save_database_config(&root, &fields(&["notes", "sqlite", "notes.sqlite", "", ""]))
-            .expect("save sqlite connection");
-        save_database_config(
-            &root,
-            &fields(&[
-                "pg",
-                "postgres",
-                "postgres://app@localhost:5432/app",
-                "",
-                "",
-            ]),
-        )
-        .expect("save url connection");
-        save_database_config(
-            &root,
-            &fields(&["mysql", "mysql", "db.local:3306", "app", "app_db"]),
-        )
-        .expect("save host connection");
-
-        let path = root.join(".zed/databases.json");
-        let config = read_json(&path).expect("parse databases.json");
-        let connections = config["connections"].as_array().expect("connections array");
-        assert_eq!(connections.len(), 3);
-        let notes = &connections[0];
-        assert_eq!(notes["driver"], json!("sqlite"));
-        assert_eq!(notes["path"], json!("notes.sqlite"));
-        assert!(notes.get("host").is_none());
-        let pg = &connections[1];
-        assert_eq!(pg["url"], json!("postgres://app@localhost:5432/app"));
-        assert!(pg.get("path").is_none());
-        let mysql = &connections[2];
-        assert_eq!(mysql["host"], json!("db.local"));
-        assert_eq!(mysql["port"], json!(3306));
-        assert_eq!(mysql["user"], json!("app"));
-        assert_eq!(mysql["database"], json!("app_db"));
-
-        std::fs::remove_dir_all(&root).expect("clean temporary project root");
-    }
-
-    #[test]
-    fn save_database_upserts_and_preserves_other_connections() {
-        let root = temp_root("database_upsert");
-        let zed = root.join(".zed");
-        std::fs::create_dir_all(&zed).expect("create .zed");
-        std::fs::write(
-            zed.join("databases.json"),
-            r#"{
-  "connections": [
-    { "name": "app", "driver": "sqlite", "path": "old.sqlite" },
-    { "name": "pg", "driver": "postgres", "url": "postgres://localhost/app", "password_env": "PGPASSWORD" }
-  ]
-}"#,
-        )
-        .expect("seed databases.json");
-
-        save_database_config(&root, &fields(&["app", "sqlite", "new.sqlite", "", ""]))
-            .expect("update app");
-
-        let config = read_json(&zed.join("databases.json")).expect("parse databases.json");
-        let connections = config["connections"].as_array().expect("connections array");
-        assert_eq!(connections.len(), 2);
-        assert_eq!(connections[0]["path"], json!("new.sqlite"));
-        assert_eq!(connections[1]["password_env"], json!("PGPASSWORD"));
 
         std::fs::remove_dir_all(&root).expect("clean temporary project root");
     }
@@ -15259,15 +15317,6 @@ mod tests {
         }
         assert_eq!(driver_display_name("sqlserver"), "SQL Server");
         assert_eq!(driver_display_name("custom"), "custom");
-    }
-
-    #[test]
-    fn next_connection_name_prefills_unique_names() {
-        assert_eq!(next_connection_name("sqlite", &[]), "sqlite");
-        let taken = vec![connection_entry("sqlite")];
-        assert_eq!(next_connection_name("sqlite", &taken), "sqlite (1)");
-        let taken = vec![connection_entry("sqlite"), connection_entry("sqlite (1)")];
-        assert_eq!(next_connection_name("sqlite", &taken), "sqlite (2)");
     }
 
     #[test]
@@ -16339,6 +16388,134 @@ Host web1
         blank.name = "a".to_string();
         let sources = vec![blank, copy];
         assert_eq!(next_data_source_name("a copy", &sources), "a copy");
+    }
+
+    #[test]
+    fn create_data_source_menu_lists_drivers_in_phpstorm_order() {
+        let menu = create_data_source_menu(false);
+        let drivers = menu
+            .iter()
+            .filter_map(|row| match row.action {
+                CreateDataSourceAction::Driver(driver) => Some(driver),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(drivers, CREATE_DATA_SOURCE_DRIVERS.to_vec());
+        assert_eq!(
+            drivers,
+            vec![
+                "postgres",
+                "mysql",
+                "sqlserver",
+                "mariadb",
+                "sqlite",
+                "oracle",
+                "mongodb",
+                "redis",
+            ]
+        );
+        assert_eq!(
+            create_data_source_driver_label("sqlserver"),
+            "Microsoft SQL Server"
+        );
+        assert!(menu
+            .iter()
+            .filter(|row| matches!(row.action, CreateDataSourceAction::Driver(_)))
+            .all(|row| row.enabled));
+    }
+
+    #[test]
+    fn create_data_source_menu_places_all_sources_after_drivers() {
+        let menu = create_data_source_menu(false);
+        let all_index = menu
+            .iter()
+            .position(|row| row.action == CreateDataSourceAction::AllDataSources)
+            .expect("All Data Sources row");
+        assert_eq!(all_index, CREATE_DATA_SOURCE_DRIVERS.len());
+        assert!(menu[all_index].enabled);
+        assert_eq!(
+            menu.iter()
+                .filter(|row| matches!(row.action, CreateDataSourceAction::Demo(_)))
+                .count(),
+            3
+        );
+        assert_eq!(menu.len(), CREATE_DATA_SOURCE_DRIVERS.len() + 1 + 3);
+    }
+
+    #[test]
+    fn create_data_source_menu_demo_enablement_requires_sqlite_file() {
+        let disabled = create_data_source_menu(false);
+        assert!(disabled
+            .iter()
+            .filter(|row| matches!(row.action, CreateDataSourceAction::Demo(_)))
+            .all(|row| !row.enabled));
+
+        let enabled = create_data_source_menu(true);
+        for row in enabled {
+            if let CreateDataSourceAction::Demo(demo) = row.action {
+                assert_eq!(row.enabled, demo == DemoDatabase::Sqlite);
+                if !row.enabled {
+                    assert_eq!(demo.disabled_reason(), Some("requires a local server"));
+                }
+            }
+        }
+        assert_eq!(
+            DemoDatabase::Sqlite.disabled_reason(),
+            Some("demo.sqlite not found in project")
+        );
+    }
+
+    #[test]
+    fn create_data_source_name_derives_numbered_unique_names() {
+        let root = PathBuf::from("/tmp");
+        assert_eq!(create_data_source_name("postgres", &[]), "postgres1");
+        let mut first = DataSource::blank(root.clone());
+        first.name = "postgres1".to_string();
+        let mut second = DataSource::blank(root.clone());
+        second.name = "postgres2".to_string();
+        let sources = vec![first, second];
+        assert_eq!(create_data_source_name("postgres", &sources), "postgres3");
+        assert_eq!(create_data_source_name("mysql", &sources), "mysql1");
+    }
+
+    #[test]
+    fn seeded_data_source_preselects_driver_and_defaults() {
+        let root = PathBuf::from("/tmp/project");
+        let postgres = seeded_data_source("postgres", None, &root, &[]);
+        assert_eq!(postgres.name, "postgres1");
+        assert_eq!(postgres.driver, "postgres");
+        assert_eq!(postgres.port, "5432");
+        assert_eq!(postgres.root, root);
+        assert!(postgres.path.is_empty());
+
+        let mysql = seeded_data_source("mysql", None, &root, &[]);
+        assert_eq!(mysql.name, "mysql1");
+        assert_eq!(mysql.port, "3306");
+
+        let sqlite = seeded_data_source("sqlite", Some("demo.sqlite"), &root, &[]);
+        assert_eq!(sqlite.name, "sqlite1");
+        assert_eq!(sqlite.path, "demo.sqlite");
+        assert!(sqlite.port.is_empty());
+
+        let existing = vec![postgres];
+        assert_eq!(
+            seeded_data_source("postgres", None, &root, &existing).name,
+            "postgres2"
+        );
+    }
+
+    #[test]
+    fn demo_seed_never_fabricates_a_connection() {
+        let sqlite = DataSourceSeed::demo(DemoDatabase::Sqlite);
+        assert_eq!(sqlite.driver, "sqlite");
+        assert_eq!(sqlite.path.as_deref(), Some("demo.sqlite"));
+        let postgres = DataSourceSeed::demo(DemoDatabase::Postgres);
+        assert_eq!(postgres.driver, "postgres");
+        assert!(postgres.path.is_none());
+        assert!(!DemoDatabase::Postgres.enabled(true));
+        assert!(!DemoDatabase::MySql.enabled(true));
+        assert!(!DemoDatabase::Sqlite.enabled(false));
+        assert!(DemoDatabase::Sqlite.enabled(true));
     }
 
     #[test]
