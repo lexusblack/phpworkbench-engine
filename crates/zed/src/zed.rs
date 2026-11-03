@@ -2911,7 +2911,9 @@ mod tests {
     use serde_json::json;
     use settings::{SaturatingBool, SettingsStore, SplicingVec, watch_config_file};
     use std::{
+        cell::RefCell,
         path::{Path, PathBuf},
+        rc::Rc,
         sync::Arc,
         time::Duration,
     };
@@ -8708,6 +8710,1141 @@ mod tests {
                 .and_then(|path| workspace.project().read(cx).absolute_path(&path, cx));
             assert_eq!(active_path.as_ref(), expected_paths.last());
         });
+    }
+
+    async fn init_startup_test(cx: &mut TestAppContext) -> Arc<AppState> {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let app_state = init_test(cx);
+        cx.update(|cx| db::kvp::KeyValueStore::global(cx))
+            .write_kvp(onboarding::FIRST_OPEN.to_owned(), "false".to_owned())
+            .await
+            .unwrap();
+        app_state
+    }
+
+    async fn restart_startup_test_session(app_state: &Arc<AppState>, cx: &mut TestAppContext) {
+        use session::Session;
+
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        for window in cx.windows() {
+            let window = window.downcast::<MultiWorkspace>().unwrap();
+            flush_workspace_serialization(&window, cx).await;
+            VisualTestContext::from_window(window.into(), cx).deactivate_window();
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+        }
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.active_window()), None);
+        cx.update(|cx| {
+            app_state.session.update(cx, |session, _| {
+                session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+    }
+
+    async fn add_unsaved_buffer(
+        window: WindowHandle<MultiWorkspace>,
+        text: &str,
+        cx: &mut TestAppContext,
+    ) {
+        let editor = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    Editor::new_in_workspace(workspace, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| editor.insert(text, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    async fn save_project_and_other_session(cx: &mut TestAppContext) -> Arc<AppState> {
+        let app_state = init_startup_test(cx).await;
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({
+                    "other": { "note.txt": "note" },
+                    "project": { "file.txt": "project file" },
+                    "new": { "readme.txt": "readme" },
+                    "outside.txt": "outside",
+                }),
+            )
+            .await;
+        open_test_workspace_paths(vec![PathBuf::from(path!("/other"))], app_state.clone(), cx)
+            .await;
+        let project_window = open_test_workspace_paths(
+            vec![PathBuf::from(path!("/project"))],
+            app_state.clone(),
+            cx,
+        )
+        .await
+        .window;
+        add_unsaved_buffer(project_window, "project draft", cx).await;
+        restart_startup_test_session(&app_state, cx).await;
+        app_state
+    }
+
+    async fn save_session_without_folders(cx: &mut TestAppContext) -> Arc<AppState> {
+        let app_state = init_startup_test(cx).await;
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/"), json!({ "outside.txt": "outside" }))
+            .await;
+        cx.update(|cx| {
+            workspace::open_new(
+                Default::default(),
+                app_state.clone(),
+                cx,
+                |workspace, window, cx| {
+                    Editor::new_file(workspace, &Default::default(), window, cx);
+                },
+            )
+        })
+        .await
+        .unwrap();
+        let window = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace
+                    .active_item_as::<Editor>(cx)
+                    .unwrap()
+                    .update(cx, |editor, cx| editor.insert("UNSAVED", window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        restart_startup_test_session(&app_state, cx).await;
+        app_state
+    }
+
+    async fn open_on_startup(
+        request: OpenRequest,
+        app_state: &Arc<AppState>,
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::open_startup_request(request, app_state.clone(), futures::future::pending(), cx)
+        })
+        .await;
+        cx.run_until_parked();
+    }
+
+    fn startup_windows(cx: &TestAppContext) -> Vec<(Vec<PathBuf>, Vec<(String, bool)>)> {
+        let mut windows = cx
+            .windows()
+            .into_iter()
+            .map(|window| window_contents(window, cx))
+            .collect::<Vec<_>>();
+        windows.sort();
+        windows
+    }
+
+    fn window_contents(
+        window: gpui::AnyWindowHandle,
+        cx: &TestAppContext,
+    ) -> (Vec<PathBuf>, Vec<(String, bool)>) {
+        window
+            .downcast::<MultiWorkspace>()
+            .unwrap()
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                let roots = workspace
+                    .root_paths(cx)
+                    .iter()
+                    .map(|path| path.to_path_buf())
+                    .collect();
+                let mut items = workspace
+                    .items_of_type::<Editor>(cx)
+                    .map(|editor| {
+                        let editor = editor.read(cx);
+                        (editor.text(cx), editor.is_dirty(cx))
+                    })
+                    .collect::<Vec<_>>();
+                items.sort();
+                (roots, items)
+            })
+            .unwrap()
+    }
+
+    fn active_window_roots(cx: &TestAppContext) -> Vec<PathBuf> {
+        let active_window = cx.read(|cx| cx.active_window()).unwrap();
+        window_contents(active_window, cx).0
+    }
+
+    fn cli_environment_of(root: &str, cx: &TestAppContext) -> Option<String> {
+        cx.windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<MultiWorkspace>())
+            .find_map(|window| {
+                window
+                    .read_with(cx, |multi_workspace, cx| {
+                        let workspace = multi_workspace.workspace().read(cx);
+                        (workspace
+                            .root_paths(cx)
+                            .first()
+                            .map(|path| path.to_path_buf())
+                            == Some(PathBuf::from(root)))
+                        .then(|| {
+                            workspace
+                                .project()
+                                .read(cx)
+                                .environment()
+                                .read(cx)
+                                .inherited_cli_environment()
+                                .and_then(|env| env.get("REVIEW_ENV").cloned())
+                        })
+                    })
+                    .unwrap()
+            })
+            .unwrap()
+    }
+
+    struct IgnoredCliResponses;
+
+    impl cli::CliResponseSink for IgnoredCliResponses {
+        fn send(&self, _: cli::CliResponse) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn cli_request(
+        paths: &[&str],
+        open_behavior: cli::OpenBehavior,
+    ) -> (OpenRequest, mpsc::UnboundedSender<cli::CliRequest>) {
+        cli_connection(cli_open_request(paths, &[], open_behavior, None))
+    }
+
+    fn terminal_cli_request(
+        paths: &[&str],
+        open_behavior: cli::OpenBehavior,
+    ) -> (OpenRequest, mpsc::UnboundedSender<cli::CliRequest>) {
+        cli_connection(cli_open_request(
+            paths,
+            &[],
+            open_behavior,
+            Some(terminal_environment()),
+        ))
+    }
+
+    fn terminal_environment() -> collections::HashMap<String, String> {
+        collections::HashMap::from_iter([("REVIEW_ENV".to_owned(), "cli".to_owned())])
+    }
+
+    fn cli_open_request(
+        paths: &[&str],
+        urls: &[String],
+        open_behavior: cli::OpenBehavior,
+        env: Option<collections::HashMap<String, String>>,
+    ) -> cli::CliRequest {
+        cli::CliRequest::Open {
+            paths: paths.iter().map(|path| path.to_string()).collect(),
+            urls: urls.to_vec(),
+            diff_paths: Vec::new(),
+            diff_all: false,
+            wsl: None,
+            wait: false,
+            open_behavior,
+            env,
+            user_data_dir: None,
+            dev_container: false,
+            cwd: None,
+        }
+    }
+
+    fn cli_connection(
+        request: cli::CliRequest,
+    ) -> (OpenRequest, mpsc::UnboundedSender<cli::CliRequest>) {
+        let (cli_requests, cli_receiver) = mpsc::unbounded();
+        cli_requests.unbounded_send(request).unwrap();
+        let request = OpenRequest {
+            kind: Some(OpenRequestKind::CliConnection((
+                cli_receiver,
+                Box::new(IgnoredCliResponses),
+            ))),
+            ..OpenRequest::default()
+        };
+        (request, cli_requests)
+    }
+
+    fn project_window_with(items: &[(&str, bool)]) -> (Vec<PathBuf>, Vec<(String, bool)>) {
+        let mut items = items
+            .iter()
+            .map(|(text, dirty)| (text.to_string(), *dirty))
+            .collect::<Vec<_>>();
+        items.sort();
+        (vec![PathBuf::from(path!("/project"))], items)
+    }
+
+    fn other_window() -> (Vec<PathBuf>, Vec<(String, bool)>) {
+        (vec![PathBuf::from(path!("/other"))], Vec::new())
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_opens_in_its_restored_project(cx: &mut TestAppContext) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) =
+            cli_request(&[path!("/project/file.txt")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                other_window(),
+                project_window_with(&[("project draft", true), ("project file", false)]),
+            ]
+        );
+        assert_eq!(
+            active_window_roots(cx),
+            vec![PathBuf::from(path!("/project"))]
+        );
+        assert_eq!(cli_environment_of(path!("/project"), cx), None);
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_link_from_the_cli_opens_in_its_restored_project(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) = cli_connection(cli_open_request(
+            &[],
+            &[project_file_link()],
+            cli::OpenBehavior::Default,
+            None,
+        ));
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                other_window(),
+                project_window_with(&[("project draft", true), ("project file", false)]),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_without_the_cli_opens_in_its_restored_project(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let request = OpenRequest {
+            open_paths: vec![path!("/project/file.txt").to_owned()],
+            ..OpenRequest::default()
+        };
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                other_window(),
+                project_window_with(&[("project draft", true), ("project file", false)]),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_joins_a_restored_window_without_folders(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_session_without_folders(cx).await;
+        let (request, _cli) = cli_request(&[path!("/outside.txt")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![(
+                Vec::new(),
+                vec![("UNSAVED".to_owned(), true), ("outside".to_owned(), false)]
+            )]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_without_a_saved_session_opens_only_the_file(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_startup_test(cx).await;
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/"), json!({ "outside.txt": "outside" }))
+            .await;
+        let (request, _cli) =
+            terminal_cli_request(&[path!("/outside.txt")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![(
+                vec![PathBuf::from(path!("/outside.txt"))],
+                vec![("outside".to_owned(), false)]
+            )]
+        );
+        assert_eq!(
+            cli_environment_of(path!("/outside.txt"), cx),
+            Some("cli".to_owned())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_folder_request_for_a_restored_folder_opens_it_once_with_its_environment(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) =
+            terminal_cli_request(&[path!("/project")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                other_window(),
+                project_window_with(&[("project draft", true)]),
+            ]
+        );
+        assert_eq!(
+            cli_environment_of(path!("/project"), cx),
+            Some("cli".to_owned())
+        );
+        assert_eq!(cli_environment_of(path!("/other"), cx), None);
+        assert_eq!(
+            active_window_roots(cx),
+            vec![PathBuf::from(path!("/project"))]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_new_window_request_for_a_restored_folder_and_a_file_in_it_opens_it_once(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) = cli_request(
+            &[path!("/project"), path!("/project/file.txt")],
+            cli::OpenBehavior::AlwaysNew,
+        );
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx)
+                .into_iter()
+                .map(|(roots, _)| roots)
+                .collect::<Vec<_>>(),
+            vec![
+                vec![PathBuf::from(path!("/other"))],
+                vec![PathBuf::from(path!("/project"))],
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_folder_request_for_a_new_folder_opens_its_own_window(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) =
+            terminal_cli_request(&[path!("/new")], cli::OpenBehavior::ExistingWindow);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                (vec![PathBuf::from(path!("/new"))], Vec::new()),
+                other_window(),
+                project_window_with(&[("project draft", true)]),
+            ]
+        );
+        assert_eq!(
+            cli_environment_of(path!("/new"), cx),
+            Some("cli".to_owned())
+        );
+        assert_eq!(active_window_roots(cx), vec![PathBuf::from(path!("/new"))]);
+    }
+
+    #[gpui::test]
+    async fn test_startup_folder_request_without_the_cli_opens_its_own_window(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let request = OpenRequest {
+            open_paths: vec![path!("/new").to_owned()],
+            ..OpenRequest::default()
+        };
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                (vec![PathBuf::from(path!("/new"))], Vec::new()),
+                other_window(),
+                project_window_with(&[("project draft", true)]),
+            ]
+        );
+        assert_eq!(active_window_roots(cx), vec![PathBuf::from(path!("/new"))]);
+    }
+
+    #[gpui::test]
+    async fn test_startup_new_window_request_restores_a_window_without_folders(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_session_without_folders(cx).await;
+        let (request, _cli) = cli_request(&[], cli::OpenBehavior::AlwaysNew);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                (Vec::new(), vec![(String::new(), false)]),
+                (Vec::new(), vec![("UNSAVED".to_owned(), true)]),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_bare_startup_cli_request_restores_the_session_once(cx: &mut TestAppContext) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) = cli_request(&[], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                other_window(),
+                project_window_with(&[("project draft", true)]),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_link_request_opens_only_its_window(cx: &mut TestAppContext) {
+        let app_state = save_project_and_other_session(cx).await;
+        let request = OpenRequest {
+            kind: Some(OpenRequestKind::GitCommit {
+                sha: "0123456789abcdef".to_owned(),
+            }),
+            open_paths: vec![path!("/new").to_owned()],
+            ..OpenRequest::default()
+        };
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![(vec![PathBuf::from(path!("/new"))], Vec::new())]
+        );
+    }
+
+    async fn save_session_with_a_project_tab(cx: &mut TestAppContext) -> Arc<AppState> {
+        let app_state = init_startup_test(cx).await;
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(
+            path!("/"),
+            json!({
+                "project": { "file.txt": "project file" },
+                "new": { "readme.txt": "readme" },
+                "outside.txt": "outside",
+            }),
+        )
+        .await;
+        open_test_workspace_paths(
+            vec![
+                PathBuf::from(path!("/project")),
+                PathBuf::from(path!("/project/file.txt")),
+            ],
+            app_state.clone(),
+            cx,
+        )
+        .await;
+        restart_startup_test_session(&app_state, cx).await;
+        app_state
+    }
+
+    fn run_until_a_window_opens(cx: &mut TestAppContext) {
+        let mut steps = 0;
+        while cx.windows().is_empty() {
+            steps += 1;
+            assert!(steps < 100_000, "no window was opened");
+            if !cx.executor().tick() {
+                cx.executor().advance_clock(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_opens_after_the_session_is_restored(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_session_with_a_project_tab(cx).await;
+        let (request, _cli) = cli_request(&[path!("/outside.txt")], cli::OpenBehavior::Default);
+        let mut ready = cx.update(|cx| {
+            crate::open_startup_request(request, app_state.clone(), futures::future::pending(), cx)
+        });
+        run_until_a_window_opens(cx);
+        assert!((&mut ready).now_or_never().is_none());
+        assert_eq!(
+            startup_windows(cx)
+                .into_iter()
+                .map(|(roots, _)| roots)
+                .collect::<Vec<_>>(),
+            vec![vec![PathBuf::from(path!("/project"))]]
+        );
+
+        ready.await;
+        cx.run_until_parked();
+        assert_eq!(
+            startup_windows(cx),
+            vec![project_window_with(&[
+                ("outside", false),
+                ("project file", false)
+            ])]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_folder_request_does_not_join_an_open_window(cx: &mut TestAppContext) {
+        let app_state = init_startup_test(cx).await;
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({ "open": { "a.txt": "" }, "new": { "readme.txt": "readme" } }),
+            )
+            .await;
+        open_test_workspace_paths(vec![PathBuf::from(path!("/open"))], app_state.clone(), cx).await;
+        let (request, _cli) = cli_request(&[path!("/new")], cli::OpenBehavior::ExistingWindow);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                (vec![PathBuf::from(path!("/new"))], Vec::new()),
+                (vec![PathBuf::from(path!("/open"))], Vec::new()),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_new_window_file_request_opens_beside_the_restored_session(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) =
+            cli_request(&[path!("/project/file.txt")], cli::OpenBehavior::AlwaysNew);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                other_window(),
+                project_window_with(&[("project draft", true)]),
+                (
+                    vec![PathBuf::from(path!("/project/file.txt"))],
+                    vec![("project file".to_owned(), false)]
+                ),
+            ]
+        );
+        assert_eq!(
+            active_window_roots(cx),
+            vec![PathBuf::from(path!("/project/file.txt"))]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_reuse_window_file_request_does_not_replace_a_restored_window(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) = cli_request(&[path!("/project/file.txt")], cli::OpenBehavior::Reuse);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                other_window(),
+                project_window_with(&[("project draft", true)]),
+                (
+                    vec![PathBuf::from(path!("/project/file.txt"))],
+                    vec![("project file".to_owned(), false)]
+                ),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_reopens_its_own_saved_window_with_its_unsaved_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_startup_test(cx).await;
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({
+                    "project": { "file.txt": "project file" },
+                    "notes.txt": "notes",
+                }),
+            )
+            .await;
+        open_test_workspace_paths(
+            vec![PathBuf::from(path!("/project"))],
+            app_state.clone(),
+            cx,
+        )
+        .await;
+        let notes_window = open_test_workspace_paths(
+            vec![PathBuf::from(path!("/notes.txt"))],
+            app_state.clone(),
+            cx,
+        )
+        .await
+        .window;
+        notes_window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace
+                    .active_item_as::<Editor>(cx)
+                    .unwrap()
+                    .update(cx, |editor, cx| editor.insert("unsaved ", window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let edited_notes = startup_windows(cx)
+            .into_iter()
+            .find(|(roots, _)| roots == &[PathBuf::from(path!("/notes.txt"))])
+            .unwrap();
+        assert!(edited_notes.1[0].1);
+        restart_startup_test_session(&app_state, cx).await;
+
+        let (request, _cli) = cli_request(&[path!("/notes.txt")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![edited_notes, project_window_with(&[])]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_folder_request_takes_its_project_out_of_a_restored_sidebar(
+        cx: &mut TestAppContext,
+    ) {
+        use util::path_list::PathList;
+        use workspace::{OpenMode, ProjectGroupKey};
+
+        let app_state = init_startup_test(cx).await;
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({ "project": { "file.txt": "" }, "other": { "note.txt": "" } }),
+            )
+            .await;
+        let window = open_test_workspace_paths(
+            vec![PathBuf::from(path!("/project"))],
+            app_state.clone(),
+            cx,
+        )
+        .await
+        .window;
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.open_project(
+                    vec![path!("/other").into()],
+                    OpenMode::Add,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                let project_workspace = multi_workspace
+                    .workspaces()
+                    .find(|workspace| {
+                        workspace.read(cx).root_paths(cx)
+                            == [Arc::from(Path::new(path!("/project")))]
+                    })
+                    .unwrap()
+                    .clone();
+                multi_workspace.activate(project_workspace, None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let project_key = ProjectGroupKey::new(None, PathList::new(&[path!("/project")]));
+        let other_key = ProjectGroupKey::new(None, PathList::new(&[path!("/other")]));
+        let sidebar_projects = |cx: &TestAppContext| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .map(|window| {
+                    window
+                        .read_with(cx, |multi_workspace, _| {
+                            multi_workspace.project_group_keys()
+                        })
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sidebar_projects(cx).len(), 1);
+        assert!(sidebar_projects(cx)[0].contains(&project_key));
+        assert!(sidebar_projects(cx)[0].contains(&other_key));
+        restart_startup_test_session(&app_state, cx).await;
+
+        let (request, _cli) = terminal_cli_request(&[path!("/other")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                (vec![PathBuf::from(path!("/other"))], Vec::new()),
+                (vec![PathBuf::from(path!("/project"))], Vec::new()),
+            ]
+        );
+        let restored_sidebar = sidebar_projects(cx)
+            .into_iter()
+            .find(|projects| projects.contains(&project_key))
+            .unwrap();
+        assert_eq!(restored_sidebar, vec![project_key]);
+    }
+
+    #[gpui::test]
+    async fn test_startup_folder_request_opens_once_a_folder_that_a_saved_window_now_links_to(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_startup_test(cx).await;
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(
+            path!("/"),
+            json!({ "target": { "file.txt": "" }, "old": { "note.txt": "" } }),
+        )
+        .await;
+        open_test_workspace_paths(vec![PathBuf::from(path!("/target"))], app_state.clone(), cx)
+            .await;
+        restart_startup_test_session(&app_state, cx).await;
+        open_test_workspace_paths(vec![PathBuf::from(path!("/old"))], app_state.clone(), cx).await;
+        restart_startup_test_session(&app_state, cx).await;
+        fs.remove_dir(
+            Path::new(path!("/old")),
+            fs::RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: false,
+            },
+        )
+        .await
+        .unwrap();
+        fs.create_symlink(Path::new(path!("/old")), PathBuf::from(path!("/target")))
+            .await
+            .unwrap();
+
+        let (request, _cli) = cli_request(&[path!("/target")], cli::OpenBehavior::AlwaysNew);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![(vec![PathBuf::from(path!("/target"))], Vec::new())]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_request_for_more_folders_than_a_saved_window_restores_that_window(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) = cli_request(
+            &[path!("/new"), path!("/project")],
+            cli::OpenBehavior::AlwaysNew,
+        );
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                (
+                    vec![
+                        PathBuf::from(path!("/new")),
+                        PathBuf::from(path!("/project"))
+                    ],
+                    Vec::new()
+                ),
+                other_window(),
+                project_window_with(&[("project draft", true)]),
+            ]
+        );
+    }
+
+    fn project_file_link() -> String {
+        format!("file://{}", urlencoding::encode(path!("/project/file.txt")))
+    }
+
+    fn project_file_window() -> (Vec<PathBuf>, Vec<(String, bool)>) {
+        (
+            vec![PathBuf::from(path!("/project/file.txt"))],
+            vec![("project file".to_owned(), false)],
+        )
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_from_a_terminal_opens_in_its_own_window_with_its_environment(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (request, _cli) =
+            terminal_cli_request(&[path!("/project/file.txt")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![
+                other_window(),
+                project_window_with(&[("project draft", true)]),
+                project_file_window(),
+            ]
+        );
+        assert_eq!(
+            cli_environment_of(path!("/project/file.txt"), cx),
+            Some("cli".to_owned())
+        );
+        assert_eq!(cli_environment_of(path!("/project"), cx), None);
+        assert_eq!(
+            active_window_roots(cx),
+            vec![PathBuf::from(path!("/project/file.txt"))]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_restores_local_windows_only(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_startup_test(cx).await;
+        server_cx.update(|cx| {
+            release_channel::init(Version::new(0, 0, 0), cx);
+            HeadlessProject::init(cx);
+        });
+        let remote_fs = FakeFs::new(server_cx.executor());
+        remote_fs.insert_tree(path!("/remote"), json!({})).await;
+        let (connection_options, server_session, connect_guard) =
+            RemoteClient::fake_server(cx, server_cx);
+        let _headless = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session: server_session,
+                    fs: remote_fs,
+                    http_client: Arc::new(BlockedHttpClient),
+                    node_runtime: NodeRuntime::unavailable(),
+                    languages: Arc::new(LanguageRegistry::new(cx.background_executor().clone())),
+                    extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                    startup_time: std::time::Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+        drop(connect_guard);
+        recent_projects::open_remote_project(
+            connection_options,
+            vec![PathBuf::from(path!("/remote"))],
+            app_state.clone(),
+            OpenOptions::default(),
+            &mut cx.to_async(),
+        )
+        .await
+        .unwrap();
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({ "project": { "file.txt": "project file" } }),
+            )
+            .await;
+        open_test_workspace_paths(
+            vec![PathBuf::from(path!("/project"))],
+            app_state.clone(),
+            cx,
+        )
+        .await;
+        restart_startup_test_session(&app_state, cx).await;
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        let saved = crate::restorable_workspaces(&mut cx.to_async(), &app_state)
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 2);
+
+        let (request, _cli) =
+            cli_request(&[path!("/project/file.txt")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        assert_eq!(
+            startup_windows(cx),
+            vec![project_window_with(&[("project file", false)])]
+        );
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    async fn test_startup_stops_holding_later_requests_behind_a_silent_cli(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_startup_test(cx).await;
+        let (cli_requests, cli_receiver) = mpsc::unbounded::<cli::CliRequest>();
+        let request = OpenRequest {
+            kind: Some(OpenRequestKind::CliConnection((
+                cli_receiver,
+                Box::new(IgnoredCliResponses),
+            ))),
+            ..OpenRequest::default()
+        };
+        let (end_the_wait, wait_ended) = futures::channel::oneshot::channel::<()>();
+        let mut ready = cx.update(|cx| {
+            crate::open_startup_request(
+                request,
+                app_state.clone(),
+                async move {
+                    wait_ended.await.ok();
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!((&mut ready).now_or_never().is_none());
+
+        end_the_wait.send(()).unwrap();
+        ready.await;
+        drop(cli_requests);
+    }
+
+    #[gpui::test]
+    async fn test_startup_cli_request_that_comes_too_late_opens_without_the_session(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let (cli_requests, cli_receiver) = mpsc::unbounded::<cli::CliRequest>();
+        let request = OpenRequest {
+            kind: Some(OpenRequestKind::CliConnection((
+                cli_receiver,
+                Box::new(IgnoredCliResponses),
+            ))),
+            ..OpenRequest::default()
+        };
+        cx.update(|cx| {
+            crate::open_startup_request(request, app_state.clone(), futures::future::ready(()), cx)
+        })
+        .await;
+        cx.run_until_parked();
+        assert_eq!(startup_windows(cx), Vec::new());
+
+        cli_requests
+            .unbounded_send(cli_open_request(
+                &[path!("/outside.txt")],
+                &[],
+                cli::OpenBehavior::Default,
+                None,
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            startup_windows(cx),
+            vec![(
+                vec![PathBuf::from(path!("/outside.txt"))],
+                vec![("outside".to_owned(), false)]
+            )]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_outside_restored_projects_opens_in_the_front_window(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_project_and_other_session(cx).await;
+        let front_window_roots = crate::restorable_workspaces(&mut cx.to_async(), &app_state)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .active_workspace
+            .paths
+            .paths()
+            .to_vec();
+        let (request, _cli) = cli_request(&[path!("/outside.txt")], cli::OpenBehavior::Default);
+        open_on_startup(request, &app_state, cx).await;
+
+        let window_with_the_file = startup_windows(cx)
+            .into_iter()
+            .find(|(_, items)| items.contains(&("outside".to_owned(), false)))
+            .unwrap();
+        assert_eq!(window_with_the_file.0, front_window_roots);
+        assert_eq!(startup_windows(cx).len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_startup_folder_request_opens_after_the_session_is_restored(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = save_session_with_a_project_tab(cx).await;
+        let new_window = (vec![PathBuf::from(path!("/new"))], Vec::new());
+        let (request, _cli) = cli_request(&[path!("/new")], cli::OpenBehavior::Default);
+        let mut ready = cx.update(|cx| {
+            crate::open_startup_request(request, app_state.clone(), futures::future::pending(), cx)
+        });
+        run_until_a_window_opens(cx);
+        assert!((&mut ready).now_or_never().is_none());
+        assert_eq!(
+            startup_windows(cx)
+                .into_iter()
+                .map(|(roots, _)| roots)
+                .collect::<Vec<_>>(),
+            vec![vec![PathBuf::from(path!("/project"))]]
+        );
+
+        ready.await;
+        cx.run_until_parked();
+        assert_eq!(
+            startup_windows(cx),
+            vec![new_window, project_window_with(&[("project file", false)])]
+        );
+        assert_eq!(active_window_roots(cx), vec![PathBuf::from(path!("/new"))]);
+    }
+
+    #[gpui::test]
+    async fn test_startup_file_request_restores_the_window_it_opens_in_last(
+        cx: &mut TestAppContext,
+    ) {
+        for file in [path!("/other/note.txt"), path!("/project/file.txt")] {
+            let app_state = save_project_and_other_session(cx).await;
+            let restored_roots = Rc::new(RefCell::new(Vec::new()));
+            let _subscription = cx.update(|cx| {
+                let restored_roots = restored_roots.clone();
+                cx.observe_new::<MultiWorkspace>(move |multi_workspace, _, cx| {
+                    let roots = multi_workspace.workspace().read(cx).root_paths(cx);
+                    restored_roots.borrow_mut().push(roots);
+                })
+            });
+            let (request, _cli) = cli_request(&[file], cli::OpenBehavior::Default);
+            open_on_startup(request, &app_state, cx).await;
+
+            let restored_roots = restored_roots.borrow();
+            assert_eq!(restored_roots.len(), 2);
+            assert!(Path::new(file).starts_with(&restored_roots[1][0]));
+            for window in cx.windows() {
+                cx.update_window(window, |_, window, _| window.remove_window())
+                    .unwrap();
+            }
+            cx.run_until_parked();
+        }
     }
 
     fn has_view_item(cx: &mut App, item_name: &str) -> bool {

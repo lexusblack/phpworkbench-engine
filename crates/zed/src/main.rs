@@ -27,7 +27,11 @@ use db::kvp::{GlobalKeyValueStore, KeyValueStore};
 use editor::Editor;
 use extension::ExtensionHostProxy;
 use fs::{Fs, RealFs};
-use futures::{FutureExt, StreamExt, channel::oneshot, future};
+use futures::{
+    FutureExt, StreamExt,
+    channel::{mpsc, oneshot},
+    future,
+};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
@@ -46,7 +50,7 @@ use reqwest_client::ReqwestClient;
 use assets::Assets;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
-use project::{project_settings::ProjectSettings, trusted_worktrees};
+use project::{ProjectGroupKey, project_settings::ProjectSettings, trusted_worktrees};
 use recent_projects::{RemoteSettings, open_remote_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
@@ -60,11 +64,11 @@ use std::{
     process,
     rc::Rc,
     sync::{Arc, LazyLock, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use theme::{ActiveTheme, GlobalTheme, ThemeRegistry};
 use theme_settings::load_user_theme;
-use util::{ResultExt, maybe};
+use util::{ResultExt, maybe, paths::SanitizedPath};
 use uuid::Uuid;
 use workspace::{
     AppState, MultiWorkspace, SerializedWorkspaceLocation, SessionWorkspace, Toast,
@@ -75,7 +79,8 @@ use workspace::{
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
     derive_paths_with_position, edit_prediction_registry, handle_cli_connection,
-    handle_keymap_file_changes, initialize_workspace, open_paths_with_positions,
+    handle_cli_request, handle_keymap_file_changes, initialize_workspace,
+    open_paths_with_positions,
 };
 
 use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme};
@@ -926,11 +931,14 @@ fn main() {
             )
         };
 
-        let restore_task = match open_rx
+        let initial_request = open_rx
             .try_recv()
             .ok()
-            .and_then(|request| OpenRequest::parse(request, cx).log_err())
-        {
+            .and_then(|request| OpenRequest::parse(request, cx).log_err());
+        let runs_full_restore = initial_request
+            .as_ref()
+            .is_none_or(|request| request.is_focus_app_only());
+        let restore_task = match initial_request {
             Some(request) if request.is_focus_app_only() => cx.spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
@@ -940,8 +948,8 @@ fn main() {
                 }
             }),
             Some(request) => {
-                handle_open_request(request, app_state.clone(), cx);
-                Task::ready(())
+                let cli_request_wait = cx.background_executor().timer(STARTUP_CLI_REQUEST_WAIT);
+                open_startup_request(request, app_state.clone(), cli_request_wait, cx)
             }
             None => cx.spawn({
                 let app_state = app_state.clone();
@@ -956,7 +964,7 @@ fn main() {
         let (first_window_tx, first_window_rx) = oneshot::channel::<()>();
         let first_window_tx = Rc::new(RefCell::new(Some(first_window_tx)));
         let _first_window_subscription = cx.observe_new::<MultiWorkspace>(move |_, _, _| {
-            if let Some(tx) = first_window_tx.borrow_mut().take() {
+            if runs_full_restore && let Some(tx) = first_window_tx.borrow_mut().take() {
                 tx.send(()).ok();
             }
         });
@@ -1003,6 +1011,318 @@ fn main() {
         })
         .detach();
     });
+}
+
+const STARTUP_CLI_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
+pub(crate) fn open_startup_request(
+    request: OpenRequest,
+    app_state: Arc<AppState>,
+    cli_request_wait: impl Future<Output = ()> + 'static,
+    cx: &mut App,
+) -> Task<()> {
+    let is_cli_connection = matches!(request.kind, Some(OpenRequestKind::CliConnection(_)));
+    if !is_cli_connection && RequestedPaths::of_request(&request).is_none() {
+        handle_open_request(request, app_state, cx);
+        return Task::ready(());
+    }
+
+    cx.spawn(async move |cx| {
+        let Some(mut request) =
+            StartupRequest::read(request, cli_request_wait, &app_state, cx).await
+        else {
+            return;
+        };
+        let Some(requested) = cx.update(|cx| request.requested_paths(cx)) else {
+            request.open(app_state, cx);
+            return;
+        };
+
+        let fs = app_state.fs.clone();
+        let paths = derive_paths_with_position(fs.as_ref(), &requested.paths)
+            .await
+            .into_iter()
+            .map(|path| path.path)
+            .collect::<Vec<_>>();
+        let mut joins_restored_windows = requested.reuses_windows
+            && !cx.update(|cx| workspace::WorkspaceDb::global(cx).has_workspace_for_roots(&paths));
+        for path in &paths {
+            if fs.is_dir(path).await {
+                joins_restored_windows = false;
+            }
+        }
+
+        let requested_paths = resolved_paths(fs.as_ref(), &paths).await;
+        restore_local_windows(&app_state, &requested_paths, joins_restored_windows, cx).await;
+        if !joins_restored_windows {
+            request.open_in_new_window();
+        }
+        request.open(app_state, cx);
+    })
+}
+
+enum StartupRequest {
+    Cli {
+        request: cli::CliRequest,
+        requests: mpsc::UnboundedReceiver<cli::CliRequest>,
+        responses: Box<dyn cli::CliResponseSink>,
+    },
+    Other(OpenRequest),
+}
+
+impl StartupRequest {
+    async fn read(
+        request: OpenRequest,
+        cli_request_wait: impl Future<Output = ()>,
+        app_state: &Arc<AppState>,
+        cx: &mut AsyncApp,
+    ) -> Option<Self> {
+        match request.kind {
+            Some(OpenRequestKind::CliConnection((mut requests, responses))) => {
+                let cli_request_wait = cli_request_wait.fuse();
+                futures::pin_mut!(cli_request_wait);
+                let request = futures::select_biased! {
+                    request = requests.next() => Some(request),
+                    () = cli_request_wait => None,
+                };
+                let Some(request) = request else {
+                    cx.spawn({
+                        let app_state = app_state.clone();
+                        async move |cx| {
+                            handle_cli_connection((requests, responses), app_state, cx).await
+                        }
+                    })
+                    .detach();
+                    return None;
+                };
+                Some(Self::Cli {
+                    request: request?,
+                    requests,
+                    responses,
+                })
+            }
+            _ => Some(Self::Other(request)),
+        }
+    }
+
+    fn requested_paths(&self, cx: &App) -> Option<RequestedPaths> {
+        match self {
+            Self::Cli { request, .. } => RequestedPaths::of_cli_request(request, cx),
+            Self::Other(request) => RequestedPaths::of_request(request),
+        }
+    }
+
+    fn open_in_new_window(&mut self) {
+        match self {
+            Self::Cli {
+                request: cli::CliRequest::Open { open_behavior, .. },
+                ..
+            } => *open_behavior = cli::OpenBehavior::AlwaysNew,
+            Self::Cli { .. } => {}
+            Self::Other(request) => request.open_behavior = Some(cli::OpenBehavior::AlwaysNew),
+        }
+    }
+
+    fn open(self, app_state: Arc<AppState>, cx: &mut AsyncApp) {
+        match self {
+            Self::Cli {
+                request,
+                requests,
+                responses,
+            } => cx
+                .spawn(async move |cx| {
+                    handle_cli_request(request, requests, responses, app_state, cx).await
+                })
+                .detach(),
+            Self::Other(request) => cx.update(|cx| handle_open_request(request, app_state, cx)),
+        }
+    }
+}
+
+struct RequestedPaths {
+    paths: Vec<String>,
+    reuses_windows: bool,
+}
+
+impl RequestedPaths {
+    fn of_request(request: &OpenRequest) -> Option<Self> {
+        let opens_local_paths = request.kind.is_none()
+            && request.remote_connection.is_none()
+            && request.open_channel_notes.is_empty()
+            && request.join_channel.is_none()
+            && (!request.open_paths.is_empty() || !request.diff_paths.is_empty());
+        opens_local_paths.then(|| Self {
+            paths: request.open_paths.clone(),
+            reuses_windows: !request.open_paths.is_empty()
+                && request.diff_paths.is_empty()
+                && !request.dev_container
+                && matches!(
+                    request.open_behavior,
+                    None | Some(cli::OpenBehavior::Default | cli::OpenBehavior::ExistingWindow)
+                ),
+        })
+    }
+
+    fn of_cli_request(request: &cli::CliRequest, cx: &App) -> Option<Self> {
+        let cli::CliRequest::Open {
+            urls,
+            paths,
+            diff_paths,
+            diff_all,
+            wsl,
+            open_behavior,
+            dev_container,
+            env,
+            cwd,
+            ..
+        } = request
+        else {
+            return None;
+        };
+        if !urls.is_empty() {
+            let request = OpenRequest::parse(
+                RawOpenRequest {
+                    urls: urls.clone(),
+                    diff_paths: diff_paths.clone(),
+                    diff_all: *diff_all,
+                    dev_container: *dev_container,
+                    wsl: wsl.clone(),
+                    open_behavior: Some(*open_behavior),
+                },
+                cx,
+            )
+            .ok()?;
+            return Self::of_request(&request);
+        }
+        if paths.is_empty()
+            && diff_paths.is_empty()
+            && *open_behavior != cli::OpenBehavior::AlwaysNew
+        {
+            return None;
+        }
+        let mut requested = paths.clone();
+        if paths.is_empty()
+            && !diff_paths.is_empty()
+            && let Some(cwd) = cwd
+        {
+            requested.push(cwd.to_string_lossy().into_owned());
+        }
+        Some(Self {
+            paths: requested,
+            reuses_windows: !paths.is_empty()
+                && diff_paths.is_empty()
+                && !dev_container
+                && env.is_none()
+                && matches!(
+                    open_behavior,
+                    cli::OpenBehavior::Default | cli::OpenBehavior::ExistingWindow
+                ),
+        })
+    }
+}
+
+async fn restore_local_windows(
+    app_state: &Arc<AppState>,
+    requested_paths: &[PathBuf],
+    request_joins_restored_windows: bool,
+    cx: &mut AsyncApp,
+) {
+    let Some(mut multi_workspaces) = restorable_workspaces(cx, app_state).await else {
+        return;
+    };
+    let requested_roots = requested_paths
+        .iter()
+        .filter(|path| {
+            !requested_paths
+                .iter()
+                .any(|other| other != *path && path.starts_with(other))
+        })
+        .collect::<Vec<_>>();
+    if request_joins_restored_windows {
+        multi_workspaces.sort_by_key(|multi_workspace| {
+            let roots = multi_workspace.active_workspace.paths.paths();
+            requested_paths
+                .iter()
+                .any(|path| roots.iter().any(|root| path.starts_with(root)))
+        });
+    }
+    let opened_by_request = |roots: &[PathBuf]| {
+        !roots.is_empty()
+            && roots.iter().all(|root| requested_paths.contains(root))
+            && requested_roots.iter().all(|path| roots.contains(path))
+    };
+    let fs = app_state.fs.clone();
+    let mut error_count = 0;
+    for mut multi_workspace in multi_workspaces {
+        let saved = &multi_workspace.active_workspace;
+        if saved.location != SerializedWorkspaceLocation::Local {
+            continue;
+        }
+        if opened_by_request(&resolved_paths(fs.as_ref(), saved.paths.paths()).await) {
+            continue;
+        }
+        let mut project_groups = Vec::new();
+        for group in std::mem::take(&mut multi_workspace.state.project_groups) {
+            let key = ProjectGroupKey::from(group.clone());
+            if key.host().is_some()
+                || !opened_by_request(&resolved_paths(fs.as_ref(), key.path_list().paths()).await)
+            {
+                project_groups.push(group);
+            }
+        }
+        multi_workspace.state.project_groups = project_groups;
+        if let Err(error) = restore_multiworkspace(multi_workspace, app_state.clone(), cx).await {
+            log::error!("Failed to restore workspace: {error:#}");
+            error_count += 1;
+        }
+    }
+    if error_count > 0 {
+        let message = restore_errors_message(error_count);
+        cx.update(|cx| show_toast_in_active_workspace(&message, cx));
+    }
+}
+
+async fn resolved_paths(fs: &dyn Fs, paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut resolved = Vec::with_capacity(paths.len());
+    for path in paths {
+        let path = fs.canonicalize(path).await.unwrap_or_else(|_| path.clone());
+        resolved.push(
+            SanitizedPath::from_arc(Arc::from(path.as_path()))
+                .as_path()
+                .to_path_buf(),
+        );
+    }
+    resolved
+}
+
+fn restore_errors_message(error_count: usize) -> String {
+    if error_count == 1 {
+        "Failed to restore 1 workspace. Check logs for details.".to_string()
+    } else {
+        format!(
+            "Failed to restore {} workspaces. Check logs for details.",
+            error_count
+        )
+    }
+}
+
+fn show_toast_in_active_workspace(message: &str, cx: &mut App) -> bool {
+    if let Some(window) = cx.active_window()
+        && let Some(multi_workspace) = window.downcast::<MultiWorkspace>()
+    {
+        multi_workspace
+            .update(cx, |multi_workspace, _, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        Toast::new(NotificationId::unique::<()>(), message.to_string()),
+                        cx,
+                    )
+                });
+            })
+            .ok();
+        return true;
+    }
+    false
 }
 
 fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut App) {
@@ -1485,34 +1805,10 @@ pub(crate) async fn restore_or_create_workspace(
         }
 
         if error_count > 0 {
-            let message = if error_count == 1 {
-                "Failed to restore 1 workspace. Check logs for details.".to_string()
-            } else {
-                format!(
-                    "Failed to restore {} workspaces. Check logs for details.",
-                    error_count
-                )
-            };
+            let message = restore_errors_message(error_count);
 
             // Try to find an active workspace to show the toast
-            let toast_shown = cx.update(|cx| {
-                if let Some(window) = cx.active_window()
-                    && let Some(multi_workspace) = window.downcast::<MultiWorkspace>()
-                {
-                    multi_workspace
-                        .update(cx, |multi_workspace, _, cx| {
-                            multi_workspace.workspace().update(cx, |workspace, cx| {
-                                workspace.show_toast(
-                                    Toast::new(NotificationId::unique::<()>(), message.clone()),
-                                    cx,
-                                )
-                            });
-                        })
-                        .ok();
-                    return true;
-                }
-                false
-            });
+            let toast_shown = cx.update(|cx| show_toast_in_active_workspace(&message, cx));
 
             // If we couldn't show a toast (no windows opened successfully),
             // open a fallback empty workspace and show the error there

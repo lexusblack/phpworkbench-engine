@@ -1088,6 +1088,10 @@ impl WorkspaceDb {
         self.workspace_for_roots_internal(worktree_roots, None)
     }
 
+    pub fn has_workspace_for_roots<P: AsRef<Path>>(&self, worktree_roots: &[P]) -> bool {
+        self.workspace_for_roots(worktree_roots).is_some()
+    }
+
     pub(crate) fn remote_workspace_for_roots<P: AsRef<Path>>(
         &self,
         worktree_roots: &[P],
