@@ -51,10 +51,10 @@ use git::{
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
-    ClipboardItem, DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext,
-    MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, Subscription, Task,
-    TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
-    uniform_list,
+    ClipboardItem, DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    KeyContext, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy,
+    Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored,
+    deferred, uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, BufferEvent, File};
@@ -171,6 +171,10 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Activates the Stash tab.
+        ActivateStashTab,
+        /// Reloads the stash list.
+        RefreshStashes,
     ]
 );
 
@@ -603,6 +607,24 @@ struct SerializedCommitMessage {
 enum GitPanelTab {
     Changes,
     History,
+    Stash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StashOperation {
+    Apply,
+    Pop,
+    Drop,
+}
+
+impl StashOperation {
+    fn failure_prefix(self) -> &'static str {
+        match self {
+            Self::Apply => "Stash apply failed",
+            Self::Pop => "Stash pop failed",
+            Self::Drop => "Stash drop failed",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1211,6 +1233,7 @@ pub struct GitPanel {
     commit_template: Option<GitCommitTemplate>,
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
+    stash_state: crate::stash_tab::StashTabState,
     active_tab: GitPanelTab,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
@@ -1468,7 +1491,9 @@ impl GitPanel {
                 move |this, _git_store, event, window, cx| match event {
                     GitStoreEvent::RepositoryUpdated(
                         _,
-                        RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
+                        RepositoryEvent::StatusesChanged
+                        | RepositoryEvent::HeadChanged
+                        | RepositoryEvent::StashEntriesChanged,
                         true,
                     )
                     | GitStoreEvent::RepositoryAdded
@@ -1548,6 +1573,7 @@ impl GitPanel {
                 entry_count: 0,
                 bulk_staging: None,
                 stash_entries: Default::default(),
+                stash_state: Default::default(),
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
@@ -2105,6 +2131,7 @@ impl GitPanel {
             match self.active_tab {
                 GitPanelTab::Changes => dispatch_context.add("ChangesList"),
                 GitPanelTab::History => dispatch_context.add("HistoryList"),
+                GitPanelTab::Stash => dispatch_context.add("StashList"),
             }
         }
 
@@ -5652,6 +5679,7 @@ impl GitPanel {
         let repo = repo.read(cx);
 
         self.stash_entries = repo.cached_stash();
+        self.stash_state.reconcile(&self.stash_entries.entries);
 
         for status_entry in repo.cached_status() {
             self.changes_count += 1;
@@ -7435,11 +7463,24 @@ impl GitPanel {
             )
             .child(tab(
                 ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
+                active_tab == GitPanelTab::History,
                 false,
                 "History".into(),
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
+            ))
+            .child(
+                Divider::vertical()
+                    .color(ui::DividerColor::BorderFaded)
+                    .h_full(),
+            )
+            .child(tab(
+                ElementId::Name("stash-tab".into()),
+                active_tab == GitPanelTab::Stash,
+                false,
+                "Stash".into(),
+                GitPanelTab::Stash,
+                ActivateStashTab.boxed_clone(),
             ))
     }
 
@@ -7472,6 +7513,221 @@ impl GitPanel {
             .flex_1()
             .justify_center()
             .child(Label::new(message).color(Color::Muted))
+    }
+    fn render_stash_tab(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = &self.stash_state;
+        let buttons = state.buttons();
+        let count = self.stash_entries.entries.len();
+        let selected_entry = state.selected.and_then(|index| {
+            self.stash_entries
+                .entries
+                .iter()
+                .find(|entry| entry.index == index)
+        });
+        let border_color = cx.theme().colors().border.opacity(0.6);
+
+        v_flex()
+            .id("stash-tab-content")
+            .size_full()
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(border_color)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(Label::new("Stash").weight(FontWeight::MEDIUM))
+                            .child(
+                                Label::new(count.to_string())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        IconButton::new("git-stash-refresh", IconName::RotateCw)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Refresh Stashes"))
+                            .on_click(cx.listener(|this, _, _, cx| this.reload_stashes(cx))),
+                    ),
+            )
+            .when_some(state.error.clone(), |this, error| {
+                this.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(border_color)
+                        .child(Label::new(error).size(LabelSize::Small).color(Color::Error)),
+                )
+            })
+            .when_some(
+                state
+                    .confirming_drop
+                    .then_some(selected_entry)
+                    .flatten()
+                    .cloned(),
+                |this, entry| {
+                    this.child(
+                        h_flex()
+                            .px_2()
+                            .py_1()
+                            .gap_2()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(border_color)
+                            .child(
+                                Label::new(format!("Drop stash '{}'?", entry.message))
+                                    .size(LabelSize::Small)
+                                    .truncate(),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .flex_shrink_0()
+                                    .child(
+                                        Button::new("stash-confirm-drop", "Drop")
+                                            .label_size(LabelSize::Small)
+                                            .style(ButtonStyle::Tinted(TintColor::Error))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.run_stash_operation(StashOperation::Drop, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("stash-cancel-drop", "Cancel")
+                                            .label_size(LabelSize::Small)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.stash_state.cancel_drop();
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
+            )
+            .map(|this| {
+                if self.active_repository.is_none() {
+                    this.child(Self::render_history_placeholder("No repository found"))
+                } else if count == 0 {
+                    this.child(
+                        h_flex()
+                            .flex_1()
+                            .justify_center()
+                            .child(Label::new("No stashes").color(Color::Muted)),
+                    )
+                } else {
+                    this.child(
+                        div()
+                            .id("stash-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .children(self.stash_entries.entries.iter().map(|entry| {
+                                let selected = state.selected == Some(entry.index);
+                                let branch = crate::stash_tab::stash_branch_chip(entry);
+                                let relative_time = Self::stash_relative_time(entry.timestamp);
+                                let index = entry.index;
+                                h_flex()
+                                    .id(ElementId::Name(format!("stash-row-{index}").into()))
+                                    .w_full()
+                                    .px_2()
+                                    .py_1()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .border_b_1()
+                                    .border_color(border_color)
+                                    .when(selected, |this| {
+                                        this.bg(cx.theme().colors().element_selected)
+                                    })
+                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.stash_state.select(index);
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .child(
+                                                Label::new(entry.message.clone())
+                                                    .weight(FontWeight::MEDIUM)
+                                                    .truncate(),
+                                            )
+                                            .child(
+                                                Label::new(relative_time)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            ),
+                                    )
+                                    .when_some(branch, |this, branch| {
+                                        this.child(Chip::new(branch).label_color(Color::Muted))
+                                    })
+                            })),
+                    )
+                }
+            })
+            .child(
+                h_flex()
+                    .p_2()
+                    .gap_2()
+                    .justify_end()
+                    .border_t_1()
+                    .border_color(border_color)
+                    .when(state.busy, |this| {
+                        this.child(
+                            Label::new("Working…")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .child(
+                        Button::new("stash-apply", "Apply")
+                            .label_size(LabelSize::Small)
+                            .disabled(!buttons.apply)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.run_stash_operation(StashOperation::Apply, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("stash-pop", "Pop")
+                            .label_size(LabelSize::Small)
+                            .disabled(!buttons.pop)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.run_stash_operation(StashOperation::Pop, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("stash-drop", "Drop")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Tinted(TintColor::Error))
+                            .disabled(!buttons.drop)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.stash_state.begin_drop() {
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
+    }
+
+    fn stash_relative_time(timestamp: i64) -> SharedString {
+        let stash_time = OffsetDateTime::from_unix_timestamp(timestamp)
+            .unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+        time_format::format_localized_timestamp(
+            stash_time,
+            OffsetDateTime::now_utc(),
+            local_offset,
+            time_format::TimestampFormat::Relative,
+        )
+        .into()
     }
 
     fn commit_history_entries(&self) -> &[CommitHistoryEntry] {
@@ -7582,6 +7838,97 @@ impl GitPanel {
     ) {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
+    fn activate_stash_tab(
+        &mut self,
+        _: &ActivateStashTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_tab(GitPanelTab::Stash, window, cx);
+    }
+
+    fn refresh_stashes(
+        &mut self,
+        _: &RefreshStashes,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reload_stashes(cx);
+    }
+
+    fn reload_stashes(&mut self, cx: &mut Context<Self>) {
+        self.stash_state.clear_error();
+        if let Some(active_repository) = self.active_repository.clone() {
+            active_repository.update(cx, |repository, cx| repository.refresh(cx));
+        }
+        cx.notify();
+    }
+
+    fn run_stash_operation(&mut self, operation: StashOperation, cx: &mut Context<Self>) {
+        if self.stash_state.busy {
+            return;
+        }
+        let Some(selected) = self.stash_state.selected else {
+            return;
+        };
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+
+        self.stash_state.busy = true;
+        self.stash_state.confirming_drop = false;
+        self.stash_state.clear_error();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<()> = match operation {
+                StashOperation::Apply => {
+                    active_repository
+                        .update(cx, |repository, cx| {
+                            repository.stash_apply(Some(selected), cx)
+                        })
+                        .await
+                }
+                StashOperation::Pop => {
+                    active_repository
+                        .update(cx, |repository, cx| {
+                            repository.stash_pop(Some(selected), cx)
+                        })
+                        .await
+                }
+                StashOperation::Drop => {
+                    match active_repository
+                        .update(cx, |repository, cx| {
+                            repository.stash_drop(Some(selected), cx)
+                        })
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!("request was canceled")),
+                    }
+                }
+            };
+
+            this.update(cx, |this, cx| {
+                this.stash_state.busy = false;
+                match result {
+                    Ok(()) => {
+                        if matches!(operation, StashOperation::Pop | StashOperation::Drop) {
+                            this.stash_state.selected = None;
+                        }
+                        active_repository.update(cx, |repository, cx| repository.refresh(cx));
+                    }
+                    Err(error) => {
+                        this.stash_state.error =
+                            Some(format!("{}: {error}", operation.failure_prefix()));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
 
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
@@ -7596,6 +7943,14 @@ impl GitPanel {
             GitPanelTab::Changes => {
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
+            }
+            GitPanelTab::Stash => {
+                self.set_commit_history(CommitHistory::Loading, cx);
+                self._repo_subscriptions.clear();
+                self.stash_state.clear_error();
+                if let Some(active_repository) = self.active_repository.clone() {
+                    active_repository.update(cx, |repository, cx| repository.refresh(cx));
+                }
             }
         }
         cx.notify();
@@ -9521,6 +9876,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::activate_stash_tab))
+            .on_action(cx.listener(Self::refresh_stashes))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -9557,6 +9914,7 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::Stash => this.child(self.render_stash_tab(window, cx)),
                     })
                     .into_any_element(),
             )

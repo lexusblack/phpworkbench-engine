@@ -59,6 +59,7 @@ pub mod repository_selector;
 pub mod solo_diff_view;
 pub mod staged_diff;
 pub mod stash_picker;
+mod stash_tab;
 pub mod text_diff_view;
 pub mod unstaged_diff;
 

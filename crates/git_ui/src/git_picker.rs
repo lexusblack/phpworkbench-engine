@@ -155,20 +155,14 @@ impl GitPicker {
     }
 
     fn activate_next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.tab = match self.tab {
-            GitPickerTab::Branches => GitPickerTab::Stashes,
-            GitPickerTab::Stashes => GitPickerTab::Branches,
-        };
+        self.tab = GitPickerTab::Branches;
         self.ensure_active_picker(window, cx);
         self.focus_active_picker(window, cx);
         cx.notify();
     }
 
     fn activate_previous_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.tab = match self.tab {
-            GitPickerTab::Branches => GitPickerTab::Stashes,
-            GitPickerTab::Stashes => GitPickerTab::Branches,
-        };
+        self.tab = GitPickerTab::Branches;
         self.ensure_active_picker(window, cx);
         self.focus_active_picker(window, cx);
         cx.notify();
@@ -192,7 +186,6 @@ impl GitPicker {
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
         let branches_focus_handle = focus_handle.clone();
-        let stash_focus_handle = focus_handle;
 
         h_flex().p_2().pb_0p5().w_full().child(
             ToggleButtonGroup::single_row(
@@ -215,32 +208,12 @@ impl GitPicker {
                             cx,
                         )
                     }),
-                    ToggleButtonSimple::new(
-                        GitPickerTab::Stashes.to_string(),
-                        cx.listener(|this, _, window, cx| {
-                            this.tab = GitPickerTab::Stashes;
-                            this.ensure_active_picker(window, cx);
-                            this.focus_active_picker(window, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action_in(
-                            "Toggle Stash Picker",
-                            &ActivateStashTab,
-                            &stash_focus_handle,
-                            cx,
-                        )
-                    }),
                 ],
             )
             .label_size(LabelSize::Default)
             .style(ToggleButtonGroupStyle::Outlined)
             .auto_width()
-            .selected_index(match self.tab {
-                GitPickerTab::Branches => 0,
-                GitPickerTab::Stashes => 1,
-            }),
+            .selected_index(0),
         )
     }
 
