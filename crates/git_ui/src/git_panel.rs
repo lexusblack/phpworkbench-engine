@@ -12,6 +12,7 @@ use crate::project_diff::{DeployBranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
+use crate::stash_diff_view::{StashDiffView, build_stash_diff};
 use crate::unstaged_diff::UnstagedDiff;
 use crate::{
     branch_picker, phpstorm, picker_prompt, push_dialog::PushDialog, render_remote_button,
@@ -38,7 +39,7 @@ use git::repository::{
     Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus,
     get_git_committer,
 };
-use git::stash::GitStash;
+use git::stash::{GitStash, StashFileStatus};
 use git::status::{DiffStat, StageStatus};
 use git::{
     Amend, Commit, RestoreFile, Signoff, SkipHooks, ToggleStaged, repository::RepoPath,
@@ -86,7 +87,10 @@ use std::future::Future;
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use strum::{IntoEnumIterator, VariantNames};
 use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
@@ -303,7 +307,7 @@ impl Render for StashMessageModal {
                     .pb_1()
                     .w_full()
                     .gap_1p5()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::Small))
                     .child(Headline::new(self.kind.title()).size(HeadlineSize::XSmall)),
             )
             .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
@@ -1234,6 +1238,7 @@ pub struct GitPanel {
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
     stash_state: crate::stash_tab::StashTabState,
+    last_stash_file_click: Option<(String, Instant)>,
     active_tab: GitPanelTab,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
@@ -1574,6 +1579,7 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 stash_state: Default::default(),
+                last_stash_file_click: None,
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
@@ -2628,6 +2634,12 @@ impl GitPanel {
     fn open_diff(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == GitPanelTab::History {
             self.open_selected_history_commit(window, cx);
+            return;
+        }
+        if self.active_tab == GitPanelTab::Stash {
+            if let Some(path) = self.stash_state.selected_file.clone() {
+                self.open_stash_file_diff(&path, window, cx);
+            }
             return;
         }
         if self.selection_target_kind() == Some(SelectionTargetKind::Directory)
@@ -5680,6 +5692,14 @@ impl GitPanel {
 
         self.stash_entries = repo.cached_stash();
         self.stash_state.reconcile(&self.stash_entries.entries);
+        let pending_stash_load = if self.stash_state.selected.is_none() {
+            self.stash_entries.entries.last().map(|last| last.index)
+        } else {
+            None
+        };
+        if let Some(index) = pending_stash_load {
+            self.stash_state.select(index);
+        }
 
         for status_entry in repo.cached_status() {
             self.changes_count += 1;
@@ -5991,6 +6011,10 @@ impl GitPanel {
         self.commit_editor.update(cx, |editor, cx| {
             editor.set_placeholder_text(&placeholder_text, window, cx)
         });
+
+        if let Some(index) = pending_stash_load {
+            self.load_stash_files(index, cx);
+        }
 
         cx.notify();
     }
@@ -6890,7 +6914,7 @@ impl GitPanel {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Icon::new(IconName::ArrowDown).size(IconSize::XSmall))
+                    .child(Icon::new(IconName::ArrowDown).size(IconSize::Small))
                     .child(Label::new("Update").size(LabelSize::Small))
                     .when(behind > 0, |this| {
                         this.child(counter(format!("↓{behind}"), Color::Info))
@@ -6911,7 +6935,7 @@ impl GitPanel {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Icon::new(IconName::GitCommit).size(IconSize::XSmall))
+                    .child(Icon::new(IconName::GitCommit).size(IconSize::Small))
                     .child(Label::new("Commit").size(LabelSize::Small)),
             )
             .tooltip(Tooltip::for_action_title_in(
@@ -6931,7 +6955,7 @@ impl GitPanel {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Icon::new(IconName::ExpandUp).size(IconSize::XSmall))
+                    .child(Icon::new(IconName::ExpandUp).size(IconSize::Small))
                     .child(Label::new("Push").size(LabelSize::Small))
                     .when(ahead > 0, |this| {
                         this.child(counter(format!("↑{ahead}"), Color::Success))
@@ -7114,7 +7138,7 @@ impl GitPanel {
                         .bg(cx.theme().status().warning_background.opacity(0.5))
                         .child(
                             Icon::new(IconName::Warning)
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(Color::Warning),
                         )
                         .child(
@@ -7525,6 +7549,7 @@ impl GitPanel {
                 .find(|entry| entry.index == index)
         });
         let border_color = cx.theme().colors().border.opacity(0.6);
+        let file_count = state.files.len();
 
         v_flex()
             .id("stash-tab-content")
@@ -7622,54 +7647,135 @@ impl GitPanel {
                             .child(Label::new("No stashes").color(Color::Muted)),
                     )
                 } else {
+                    let tree = crate::stash_tab::build_stash_file_tree(&state.files);
+                    let tree_rows = self.render_stash_tree_nodes(tree, 0, cx);
+                    let empty_message = if state.files_error.is_some() {
+                        None
+                    } else {
+                        crate::stash_tab::stash_files_message(
+                            state.selected,
+                            state.files_loading,
+                            &state.files,
+                        )
+                    };
+                    let files_label = format!(
+                        "{} file{}",
+                        file_count,
+                        if file_count == 1 { "" } else { "s" }
+                    );
+
                     this.child(
-                        div()
-                            .id("stash-list")
+                        v_flex()
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .children(self.stash_entries.entries.iter().map(|entry| {
-                                let selected = state.selected == Some(entry.index);
-                                let branch = crate::stash_tab::stash_branch_chip(entry);
-                                let relative_time = Self::stash_relative_time(entry.timestamp);
-                                let index = entry.index;
+                            .child(
+                                div()
+                                    .id("stash-list")
+                                    .flex_basis(relative(0.4))
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .border_b_1()
+                                    .border_color(border_color)
+                                    .children(self.stash_entries.entries.iter().map(|entry| {
+                                        let selected = state.selected == Some(entry.index);
+                                        let branch = crate::stash_tab::stash_branch_chip(entry);
+                                        let relative_time =
+                                            Self::stash_relative_time(entry.timestamp);
+                                        let index = entry.index;
+                                        h_flex()
+                                            .id(ElementId::Name(
+                                                format!("stash-row-{index}").into(),
+                                            ))
+                                            .w_full()
+                                            .px_2()
+                                            .py_1()
+                                            .gap_2()
+                                            .cursor_pointer()
+                                            .border_b_1()
+                                            .border_color(border_color)
+                                            .when(selected, |this| {
+                                                this.bg(cx.theme().colors().element_selected)
+                                            })
+                                            .hover(|this| {
+                                                this.bg(cx.theme().colors().element_hover)
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.select_stash_and_load(index, cx);
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .child(
+                                                        Label::new(entry.message.clone())
+                                                            .weight(FontWeight::MEDIUM)
+                                                            .truncate(),
+                                                    )
+                                                    .child(
+                                                        Label::new(relative_time)
+                                                            .size(LabelSize::Small)
+                                                            .color(Color::Muted),
+                                                    ),
+                                            )
+                                            .when_some(branch, |this, branch| {
+                                                this.child(
+                                                    Chip::new(branch).label_color(Color::Muted),
+                                                )
+                                            })
+                                    })),
+                            )
+                            .child(
                                 h_flex()
-                                    .id(ElementId::Name(format!("stash-row-{index}").into()))
-                                    .w_full()
                                     .px_2()
                                     .py_1()
                                     .gap_2()
-                                    .cursor_pointer()
+                                    .justify_between()
                                     .border_b_1()
                                     .border_color(border_color)
-                                    .when(selected, |this| {
-                                        this.bg(cx.theme().colors().element_selected)
-                                    })
-                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.stash_state.select(index);
-                                        cx.notify();
-                                    }))
                                     .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .child(
-                                                Label::new(entry.message.clone())
-                                                    .weight(FontWeight::MEDIUM)
-                                                    .truncate(),
-                                            )
-                                            .child(
-                                                Label::new(relative_time)
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted),
-                                            ),
+                                        Label::new(files_label)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
                                     )
-                                    .when_some(branch, |this, branch| {
-                                        this.child(Chip::new(branch).label_color(Color::Muted))
+                                    .when(state.files_loading, |this| {
+                                        this.child(
+                                            Label::new("Loading…")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                    }),
+                            )
+                            .when_some(state.files_error.clone(), |this, error| {
+                                this.child(
+                                    h_flex()
+                                        .px_2()
+                                        .py_1()
+                                        .border_b_1()
+                                        .border_color(border_color)
+                                        .child(
+                                            Label::new(error)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Error),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("stash-files")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .when_some(empty_message, |this, message| {
+                                        this.child(
+                                            h_flex()
+                                                .p_2()
+                                                .child(Label::new(message).color(Color::Muted)),
+                                        )
                                     })
-                            })),
+                                    .children(tree_rows),
+                            ),
                     )
                 }
             })
@@ -7715,6 +7821,287 @@ impl GitPanel {
                             })),
                     ),
             )
+    }
+
+    fn render_stash_tree_nodes(
+        &self,
+        nodes: Vec<crate::stash_tab::StashTreeNode>,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        use crate::stash_tab::StashTreeNode;
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let indent = 8. + depth as f32 * TREE_INDENT;
+
+        for node in nodes {
+            match node {
+                StashTreeNode::Folder(folder) => {
+                    let collapsed = self.stash_state.is_dir_collapsed(&folder.path);
+                    let folder_path = folder.path.clone();
+                    let folder_name = folder.name.clone();
+                    let file_count = folder.file_count;
+
+                    rows.push(
+                        h_flex()
+                            .id(ElementId::Name(format!("stash-dir-{}", folder.path).into()))
+                            .h(self.list_item_height())
+                            .w_full()
+                            .pl(px(indent))
+                            .pr_2()
+                            .gap_1()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(cx.theme().colors().element_hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.stash_state.toggle_dir(&folder_path);
+                                cx.notify();
+                            }))
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                            )
+                            .child(
+                                Icon::new(if collapsed {
+                                    IconName::Folder
+                                } else {
+                                    IconName::FolderOpen
+                                })
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                            )
+                            .child(Label::new(folder_name).flex_1().truncate())
+                            .child(
+                                Label::new(format!("{file_count} files"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element(),
+                    );
+
+                    if !collapsed {
+                        rows.extend(self.render_stash_tree_nodes(folder.children, depth + 1, cx));
+                    }
+                }
+                StashTreeNode::File(file) => {
+                    let selected =
+                        self.stash_state.selected_file.as_deref() == Some(file.path.as_str());
+                    let file_path = file.path.clone();
+                    let file_path_for_click = file.path.clone();
+                    let display_name = file
+                        .path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&file.path)
+                        .to_string();
+                    let icon = FileIcons::get_icon(Path::new(&file.path), cx)
+                        .map(Icon::from_path)
+                        .unwrap_or_else(|| Icon::new(IconName::File))
+                        .size(IconSize::Small)
+                        .color(Color::Muted);
+                    let badge_color = Self::stash_status_color(file.status);
+
+                    rows.push(
+                        h_flex()
+                            .id(ElementId::Name(format!("stash-file-{}", file.path).into()))
+                            .h(self.list_item_height())
+                            .w_full()
+                            .pl(px(indent))
+                            .pr_2()
+                            .gap_1()
+                            .cursor_pointer()
+                            .when(selected, |this| {
+                                this.bg(cx.theme().colors().element_selected)
+                            })
+                            .hover(|this| this.bg(cx.theme().colors().element_hover))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                let now = Instant::now();
+                                let is_double_click = event.click_count() >= 2
+                                    || this.last_stash_file_click.as_ref().is_some_and(
+                                        |(path, clicked_at)| {
+                                            path == &file_path_for_click
+                                                && now.duration_since(*clicked_at)
+                                                    < Duration::from_millis(500)
+                                        },
+                                    );
+                                this.last_stash_file_click =
+                                    Some((file_path_for_click.clone(), now));
+                                this.stash_state.select_file(&file_path_for_click);
+                                if is_double_click {
+                                    this.open_stash_file_diff(&file_path_for_click, window, cx);
+                                }
+                                cx.notify();
+                            }))
+                            .child(icon)
+                            .child(Label::new(display_name).flex_1().truncate())
+                            .child(
+                                Label::new(file.status.letter())
+                                    .size(LabelSize::Small)
+                                    .color(badge_color),
+                            )
+                            .into_any_element(),
+                    );
+
+                    let _ = file_path;
+                }
+            }
+        }
+
+        rows
+    }
+
+    fn stash_status_color(status: StashFileStatus) -> Color {
+        match status {
+            StashFileStatus::Added => Color::VersionControlAdded,
+            StashFileStatus::Modified => Color::VersionControlModified,
+            StashFileStatus::Deleted => Color::VersionControlDeleted,
+            StashFileStatus::Renamed => Color::Accent,
+        }
+    }
+
+    fn select_stash_and_load(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.stash_state.select(index);
+        self.load_stash_files(index, cx);
+    }
+
+    fn load_stash_files(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+
+        self.stash_state.begin_files_load(index);
+        cx.notify();
+
+        let task = repository.update(cx, |repo, cx| repo.stash_files(index, cx));
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this.stash_state.files_for != Some(index) {
+                    return;
+                }
+                match result {
+                    Ok(files) => this.stash_state.finish_files_load(index, files),
+                    Err(error) => {
+                        this.stash_state
+                            .fail_files_load(index, format!("{error:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_stash_file_diff(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.stash_state.selected else {
+            return;
+        };
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let Some(workspace_entity) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let project = self.project.clone();
+        let path = path.to_string();
+        let title: SharedString = crate::stash_tab::stash_diff_title(index, &path).into();
+        let path_display: SharedString = path.clone().into();
+        self.stash_state.files_error = None;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let stash_bytes = repository
+                    .update(cx, |repo, cx| {
+                        repo.stash_file_content(index, path.clone(), cx)
+                    })
+                    .await?;
+
+                let work_directory =
+                    repository.read_with(cx, |repo, _| repo.work_directory_abs_path.clone());
+                let worktree_path = work_directory.join(&path);
+                let current_bytes = std::fs::read(&worktree_path).ok();
+
+                if stash_bytes.contains(&0)
+                    || current_bytes
+                        .as_ref()
+                        .is_some_and(|bytes| bytes.contains(&0))
+                {
+                    anyhow::bail!("Cannot show a diff for binary file '{path}'");
+                }
+
+                let stash_text = String::from_utf8_lossy(&stash_bytes).into_owned();
+                let current_text = current_bytes
+                    .as_deref()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    .unwrap_or_default();
+
+                let preview = crate::stash_tab::stash_preview_path(
+                    &std::env::temp_dir(),
+                    &crate::stash_tab::stash_ref(index),
+                    &path,
+                );
+                if let Some(parent) = preview.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&preview, &stash_bytes)?;
+                if current_bytes.is_none() {
+                    let empty_preview = preview.with_extension("worktree-empty");
+                    std::fs::write(empty_preview, b"")?;
+                }
+
+                anyhow::Ok((stash_text, current_text))
+            }
+            .await;
+
+            match result {
+                Ok((stash_text, current_text)) => {
+                    let language_path = std::path::PathBuf::from(&path);
+                    let build =
+                        build_stash_diff(stash_text, current_text, &language_path, project, cx)
+                            .await;
+
+                    match build {
+                        Ok((current_buffer, diff)) => {
+                            workspace_entity
+                                .update_in(cx, |workspace, window, cx| {
+                                    StashDiffView::open(
+                                        title,
+                                        path_display,
+                                        current_buffer,
+                                        diff,
+                                        workspace,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        }
+                        Err(error) => {
+                            this.update_in(cx, |this, _, cx| {
+                                this.stash_state.files_error = Some(format!("{error:#}"));
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    }
+                }
+                Err(error) => {
+                    this.update_in(cx, |this, _, cx| {
+                        this.stash_state.files_error = Some(format!("{error:#}"));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
     }
 
     fn stash_relative_time(timestamp: i64) -> SharedString {
@@ -8286,7 +8673,7 @@ impl GitPanel {
                                                                 .element_background)
                                                             .child(
                                                                 Icon::new(IconName::ArrowUp)
-                                                                    .size(IconSize::XSmall),
+                                                                    .size(IconSize::Small),
                                                             ),
                                                     )
                                                 }),
@@ -8796,7 +9183,7 @@ impl GitPanel {
                         } else {
                             IconName::ChevronDown
                         })
-                        .size(IconSize::XSmall)
+                        .size(IconSize::Small)
                         .color(Color::Muted),
                     )
                     .child(

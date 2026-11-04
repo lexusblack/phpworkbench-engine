@@ -16,16 +16,14 @@ use gpui::{
     anchored,
     deferred, px, size,
 };
-use http_client::{AsyncBody, HttpClient, Method};
 use project::{Project, ProjectPath};
-use reqwest_client::ReqwestClient;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use settings::Settings as _;
 use ui::{
-    Button, ContextMenu, IconButtonShape, Label, LabelSize, ListItem, PopoverMenu, Tooltip,
-    prelude::*,
+    Button, Checkbox, ContextMenu, DockSide, IconButtonShape, Label, LabelSize, ListItem,
+    PopoverMenu, Tooltip, ToggleState, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -1883,9 +1881,9 @@ fn dialog_editor(
         .border_color(if focused {
             colors.border_focused
         } else {
-            colors.border
+            colors.border_variant
         })
-        .rounded_xs()
+        .rounded_md()
         .px_2()
         .cursor_text()
         .child(
@@ -1924,8 +1922,21 @@ fn dialog_section_header(text: &'static str) -> AnyElement {
         .px_1()
         .py_2()
         .child(
-            Label::new(text)
-                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+            Label::new(text.to_uppercase())
+                .size(LabelSize::Custom(Rems(0.6875)))
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
+fn section_header(text: impl Into<SharedString>, cx: &App) -> AnyElement {
+    h_flex()
+        .w_full()
+        .flex_none()
+        .py_1()
+        .child(
+            Label::new(text.into().to_uppercase())
+                .size(LabelSize::Custom(Rems(0.6875)))
                 .color(Color::Muted),
         )
         .into_any_element()
@@ -1974,7 +1985,7 @@ fn dialog_toggle_with(
                 .id(SharedString::from(format!("{id_shared}-box")))
                 .flex_none()
                 .size(px(14.))
-                .rounded_xs()
+                .rounded_md()
                 .border_1()
                 .border_color(if checked {
                     cx.theme().colors().border_focused
@@ -1988,7 +1999,7 @@ fn dialog_toggle_with(
                         .justify_center()
                         .child(
                             Icon::new(IconName::Check)
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(Color::Accent),
                         )
                 }),
@@ -2023,10 +2034,10 @@ fn dialog_button(
             button = button.style(ButtonStyle::Filled);
         }
         DialogButtonVariant::Secondary => {
-            button = button.style(ButtonStyle::Subtle);
+            button = button.style(ButtonStyle::Outlined);
         }
         DialogButtonVariant::Link => {
-            button = button.style(ButtonStyle::Subtle).color(Color::Muted);
+            button = button.style(ButtonStyle::Subtle).color(Color::Accent);
         }
     }
     button
@@ -2043,8 +2054,8 @@ fn dialog_badge(chip: impl Into<SharedString>, color: Color, cx: &App) -> gpui::
         .rounded_sm()
         .bg(cx.theme().colors().element_hover)
         .child(
-            Label::new(format!("{} ", chip))
-                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+            Label::new(chip)
+                .size(LabelSize::Custom(Rems(0.625)))
                 .color(color),
         )
         .into_any_element()
@@ -2623,7 +2634,7 @@ impl Render for DeploymentDialog {
             .child(div().flex_1().min_w_0())
             .child(
                 Icon::new(IconName::ChevronDown)
-                    .size(IconSize::XSmall)
+                    .size(IconSize::Small)
                     .color(Color::Muted),
             )
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -2700,7 +2711,7 @@ impl Render for DeploymentDialog {
                                     IconButton::new("dp-ssh-edit", IconName::Ellipsis)
                                         .shape(IconButtonShape::Square)
                                         .track_focus(&dialog_slot(&focus, DeployFocusSlot::SshBrowse))
-                                        .icon_size(IconSize::XSmall)
+                                        .icon_size(IconSize::Small)
                                         .icon_color(Color::Muted)
                                         .tooltip(Tooltip::text("Edit SSH configurations"))
                                         .on_click(cx.listener(
@@ -2986,7 +2997,7 @@ impl Render for DeploymentDialog {
                             .child(
                                 IconButton::new("dp-root-help", IconName::CircleHelp)
                                     .shape(IconButtonShape::Square)
-                                    .icon_size(IconSize::XSmall)
+                                    .icon_size(IconSize::Small)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text(
                                         "The deployment root is the server path that mirrors the local project root",
@@ -3432,7 +3443,7 @@ impl Render for DeploymentDialog {
                                     .child(
                                         IconButton::new("deploy-add", IconName::Plus)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::XSmall)
+                                            .icon_size(IconSize::Small)
                                             .tooltip(Tooltip::text("Add server"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
@@ -3443,7 +3454,7 @@ impl Render for DeploymentDialog {
                                     .child(
                                         IconButton::new("deploy-remove", IconName::SquareMinus)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::XSmall)
+                                            .icon_size(IconSize::Small)
                                             .tooltip(Tooltip::text("Remove server"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
@@ -3454,7 +3465,7 @@ impl Render for DeploymentDialog {
                                     .child(
                                         IconButton::new("deploy-copy", IconName::Copy)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::XSmall)
+                                            .icon_size(IconSize::Small)
                                             .tooltip(Tooltip::text("Duplicate server"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
@@ -3465,7 +3476,7 @@ impl Render for DeploymentDialog {
                                     .child(
                                         IconButton::new("deploy-check", IconName::Check)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::XSmall)
+                                            .icon_size(IconSize::Small)
                                             .tooltip(Tooltip::text("Validate configuration"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, _window, cx| {
@@ -6588,11 +6599,13 @@ impl Render for SshConfigsDialog {
                     .id(("ssh-config-row", index))
                     .w_full()
                     .flex_none()
+                    .h(px(26.))
                     .px_1()
-                    .py_1()
                     .rounded_sm()
                     .cursor_pointer()
-                    .when(is_selected, |this| this.bg(colors.element_selected))
+                    .when(is_selected, |this| {
+                        this.border_l_2().border_color(colors.border_focused)
+                    })
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
                     .child(
                         Label::new(config.name.clone())
@@ -6623,7 +6636,7 @@ impl Render for SshConfigsDialog {
             .justify_between()
             .gap_2()
             .px_2()
-            .rounded_xs()
+            .rounded_md()
             .border_1()
             .border_color(colors.border)
             .cursor_pointer()
@@ -6862,7 +6875,7 @@ impl Render for SshConfigsDialog {
                         .justify_between()
                         .gap_2()
                         .px_2()
-                        .rounded_xs()
+                        .rounded_md()
                         .border_1()
                         .border_color(colors.border)
                         .cursor_pointer()
@@ -7083,7 +7096,7 @@ impl Render for SshConfigsDialog {
                                     .child(
                                         IconButton::new("ssh-add", IconName::Plus)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::XSmall)
+                                            .icon_size(IconSize::Small)
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
                                                     this.add_config(window, cx);
@@ -7093,7 +7106,7 @@ impl Render for SshConfigsDialog {
                                     .child(
                                         IconButton::new("ssh-remove", IconName::SquareMinus)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::XSmall)
+                                            .icon_size(IconSize::Small)
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
                                                     this.remove_config(window, cx);
@@ -7594,12 +7607,12 @@ impl Render for RootPickerDialog {
                 .flex_none()
                 .items_center()
                 .gap_1()
+                .h(px(26.))
                 .px_2()
-                .py_0p5()
                 .rounded_sm()
                 .cursor_pointer()
                 .when(self.selected == Some(".".to_string()), |this| {
-                    this.bg(colors.element_selected)
+                    this.border_l_2().border_color(colors.border_focused)
                 })
                 .hover(|style| style.bg(colors.element_hover))
                 .child(
@@ -7806,13 +7819,13 @@ impl RootPickerDialog {
                         } else {
                             IconName::Folder
                         })
-                        .size(IconSize::XSmall)
+                        .size(IconSize::Small)
                         .color(Color::Accent),
                     );
             } else {
                 item = item.child(div().flex_none().w(px(14.))).child(
                     Icon::new(IconName::File)
-                        .size(IconSize::XSmall)
+                        .size(IconSize::Small)
                         .color(Color::Muted),
                 );
             }
@@ -8200,7 +8213,7 @@ impl Render for DataSourcesDialog {
                         .child(div().flex_1().min_w_0())
                         .child(
                             Icon::new(IconName::ChevronDown)
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(Color::Muted),
                         )
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -8483,7 +8496,7 @@ impl Render for DataSourcesDialog {
                                 IconButton::new("ds-ssh-edit", IconName::Ellipsis)
                                     .shape(IconButtonShape::Square)
                                     .track_focus(&dialog_slot(&focus, DataSourceFocusSlot::SshEdit))
-                                    .icon_size(IconSize::XSmall)
+                                    .icon_size(IconSize::Small)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text("Edit SSH configurations"))
                                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -8630,7 +8643,7 @@ impl Render for DataSourcesDialog {
                         .child(
                             IconButton::new("ds-schemas-refresh", IconName::RotateCw)
                                 .shape(IconButtonShape::Square)
-                                .icon_size(IconSize::XSmall)
+                                .icon_size(IconSize::Small)
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                     this.refresh_schemas(cx);
                                 })),
@@ -8777,7 +8790,7 @@ impl Render for DataSourcesDialog {
                             IconButton::new("ds-advanced-add", IconName::Plus)
                                 .shape(IconButtonShape::Square)
                                 .track_focus(&dialog_slot(&focus, DataSourceFocusSlot::AdvancedAdd))
-                                .icon_size(IconSize::XSmall)
+                                .icon_size(IconSize::Small)
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.add_advanced_row(window, cx);
                                 })),
@@ -8789,7 +8802,7 @@ impl Render for DataSourcesDialog {
                                     &focus,
                                     DataSourceFocusSlot::AdvancedRemove,
                                 ))
-                                .icon_size(IconSize::XSmall)
+                                .icon_size(IconSize::Small)
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.remove_advanced_row(window, cx);
                                 })),
@@ -8869,7 +8882,7 @@ impl Render for DataSourcesDialog {
                                             .gap_1()
                                             .child(
                                                 Icon::new(IconName::DatabaseZap)
-                                                    .size(IconSize::XSmall)
+                                                    .size(IconSize::Small)
                                                     .color(Color::Muted),
                                             )
                                             .child(
@@ -8885,7 +8898,7 @@ impl Render for DataSourcesDialog {
                                             .child(
                                                 IconButton::new("ds-add", IconName::Plus)
                                                     .shape(IconButtonShape::Square)
-                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_size(IconSize::Small)
                                                     .on_click(cx.listener(
                                                         |this, _: &ClickEvent, window, cx| {
                                                             this.add_source(window, cx);
@@ -8895,7 +8908,7 @@ impl Render for DataSourcesDialog {
                                             .child(
                                                 IconButton::new("ds-remove", IconName::SquareMinus)
                                                     .shape(IconButtonShape::Square)
-                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_size(IconSize::Small)
                                                     .on_click(cx.listener(
                                                         |this, _: &ClickEvent, window, cx| {
                                                             this.remove_source(window, cx);
@@ -8905,7 +8918,7 @@ impl Render for DataSourcesDialog {
                                             .child(
                                                 IconButton::new("ds-copy", IconName::Copy)
                                                     .shape(IconButtonShape::Square)
-                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_size(IconSize::Small)
                                                     .on_click(cx.listener(
                                                         |this, _: &ClickEvent, window, cx| {
                                                             this.copy_source(window, cx);
@@ -9679,17 +9692,337 @@ pub(crate) fn first_non_empty_line<'a>(lines: impl Iterator<Item = &'a str>) -> 
         .map(str::to_string)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HttpBodyMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum HttpSubTab {
+    Params,
+    Authorization,
+    Headers,
+    Body,
+    Scripts,
+    Settings,
+}
+
+impl HttpSubTab {
+    const ALL: [HttpSubTab; 6] = [
+        HttpSubTab::Params,
+        HttpSubTab::Authorization,
+        HttpSubTab::Headers,
+        HttpSubTab::Body,
+        HttpSubTab::Scripts,
+        HttpSubTab::Settings,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            HttpSubTab::Params => "Params",
+            HttpSubTab::Authorization => "Authorization",
+            HttpSubTab::Headers => "Headers",
+            HttpSubTab::Body => "Body",
+            HttpSubTab::Scripts => "Scripts",
+            HttpSubTab::Settings => "Settings",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum HttpAuthType {
+    None,
+    ApiKey,
+    Basic,
+    Bearer,
+    OAuth2,
+}
+
+impl HttpAuthType {
+    const ALL: [HttpAuthType; 5] = [
+        HttpAuthType::None,
+        HttpAuthType::ApiKey,
+        HttpAuthType::Basic,
+        HttpAuthType::Bearer,
+        HttpAuthType::OAuth2,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            HttpAuthType::None => "No Auth",
+            HttpAuthType::ApiKey => "API Key",
+            HttpAuthType::Basic => "Basic Auth",
+            HttpAuthType::Bearer => "Bearer Token",
+            HttpAuthType::OAuth2 => "OAuth 2.0",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            HttpAuthType::None => "none",
+            HttpAuthType::ApiKey => "api-key",
+            HttpAuthType::Basic => "basic",
+            HttpAuthType::Bearer => "bearer",
+            HttpAuthType::OAuth2 => "oauth2",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ApiKeyLocation {
+    Header,
+    Query,
+}
+
+impl ApiKeyLocation {
+    fn label(self) -> &'static str {
+        match self {
+            ApiKeyLocation::Header => "Header",
+            ApiKeyLocation::Query => "Query",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum HttpBodyKind {
+    None,
     Raw,
-    Form,
+    FormData,
+    UrlEncoded,
+}
+
+impl HttpBodyKind {
+    const ALL: [HttpBodyKind; 4] = [
+        HttpBodyKind::None,
+        HttpBodyKind::Raw,
+        HttpBodyKind::FormData,
+        HttpBodyKind::UrlEncoded,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            HttpBodyKind::None => "none",
+            HttpBodyKind::Raw => "raw",
+            HttpBodyKind::FormData => "form-data",
+            HttpBodyKind::UrlEncoded => "x-www-form-urlencoded",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawContentType {
+    Json,
+    Xml,
+    Text,
+    Html,
+    JavaScript,
+}
+
+impl RawContentType {
+    const ALL: [RawContentType; 5] = [
+        RawContentType::Json,
+        RawContentType::Xml,
+        RawContentType::Text,
+        RawContentType::Html,
+        RawContentType::JavaScript,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            RawContentType::Json => "JSON",
+            RawContentType::Xml => "XML",
+            RawContentType::Text => "Text",
+            RawContentType::Html => "HTML",
+            RawContentType::JavaScript => "JavaScript",
+        }
+    }
+
+    fn mime(self) -> &'static str {
+        match self {
+            RawContentType::Json => "application/json",
+            RawContentType::Xml => "application/xml",
+            RawContentType::Text => "text/plain",
+            RawContentType::Html => "text/html",
+            RawContentType::JavaScript => "application/javascript",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum HttpResponseTab {
+    Body,
+    Headers,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct KeyValueRow {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    value: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl KeyValueRow {
+    fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct HttpAuthSettings {
+    #[serde(default = "default_auth_type")]
+    kind: HttpAuthType,
+    #[serde(default)]
+    api_key_name: String,
+    #[serde(default)]
+    api_key_value: String,
+    #[serde(default = "default_api_key_location")]
+    api_key_in: ApiKeyLocation,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    token: String,
+}
+
+fn default_auth_type() -> HttpAuthType {
+    HttpAuthType::None
+}
+
+fn default_api_key_location() -> ApiKeyLocation {
+    ApiKeyLocation::Header
+}
+
+impl Default for HttpAuthSettings {
+    fn default() -> Self {
+        Self {
+            kind: HttpAuthType::None,
+            api_key_name: String::new(),
+            api_key_value: String::new(),
+            api_key_in: ApiKeyLocation::Header,
+            username: String::new(),
+            password: String::new(),
+            token: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct HttpRequestSettings {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    subtab: Option<HttpSubTab>,
+    #[serde(default)]
+    params: Vec<KeyValueRow>,
+    #[serde(default)]
+    auth: HttpAuthSettings,
+    #[serde(default)]
+    headers: Vec<KeyValueRow>,
+    #[serde(default = "default_body_kind")]
+    body_kind: HttpBodyKind,
+    #[serde(default = "default_raw_content_type")]
+    raw_content_type: RawContentType,
+    #[serde(default)]
+    raw_body: String,
+    #[serde(default)]
+    body_fields: Vec<KeyValueRow>,
+    #[serde(default)]
+    follow_redirects: bool,
+    #[serde(default = "default_timeout")]
+    timeout_secs: u32,
+    #[serde(default = "default_true")]
+    verify_tls: bool,
+}
+
+fn default_body_kind() -> HttpBodyKind {
+    HttpBodyKind::None
+}
+
+fn default_raw_content_type() -> RawContentType {
+    RawContentType::Json
+}
+
+fn default_timeout() -> u32 {
+    30
+}
+
+impl Default for HttpRequestSettings {
+    fn default() -> Self {
+        Self {
+            method: "GET".to_string(),
+            url: String::new(),
+            subtab: Some(HttpSubTab::Params),
+            params: Vec::new(),
+            auth: HttpAuthSettings::default(),
+            headers: Vec::new(),
+            body_kind: HttpBodyKind::None,
+            raw_content_type: RawContentType::Json,
+            raw_body: String::new(),
+            body_fields: Vec::new(),
+            follow_redirects: false,
+            timeout_secs: default_timeout(),
+            verify_tls: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct HttpSettingsFile {
+    #[serde(default = "default_settings_version")]
+    version: u32,
+    #[serde(default)]
+    requests: BTreeMap<String, HttpRequestSettings>,
+}
+
+fn default_settings_version() -> u32 {
+    1
+}
+
+fn http_settings_key(file_path: &str, name: &str) -> String {
+    format!("{file_path}::{name}")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpPairKind {
+    Params,
+    Headers,
+    BodyFields,
+}
+
+#[derive(Clone)]
+struct PairEditors {
+    enabled: bool,
+    key: Entity<Editor>,
+    value: Entity<Editor>,
 }
 
 struct HttpBuilderEditors {
     url: Entity<Editor>,
-    headers: Entity<Editor>,
-    body: Entity<Editor>,
-    form_pairs: Vec<(Entity<Editor>, Entity<Editor>)>,
+    raw_body: Entity<Editor>,
+    auth_api_key_name: Entity<Editor>,
+    auth_api_key_value: Entity<Editor>,
+    auth_username: Entity<Editor>,
+    auth_password: Entity<Editor>,
+    auth_token: Entity<Editor>,
+    timeout: Entity<Editor>,
+    params: Vec<PairEditors>,
+    headers: Vec<PairEditors>,
+    body_fields: Vec<PairEditors>,
 }
 
 pub struct PhpPanel {
@@ -9722,7 +10055,28 @@ pub struct PhpPanel {
     http_status: HashMap<String, HttpStatus>,
     http_builder: Option<HttpBuilderEditors>,
     http_method: String,
-    http_body_mode: HttpBodyMode,
+    http_subtab: HttpSubTab,
+    http_params: Vec<KeyValueRow>,
+    http_headers: Vec<KeyValueRow>,
+    http_auth: HttpAuthSettings,
+    http_body_kind: HttpBodyKind,
+    http_raw_content_type: RawContentType,
+    http_raw_body: String,
+    http_body_fields: Vec<KeyValueRow>,
+    http_follow_redirects: bool,
+    http_timeout_secs: u32,
+    http_verify_tls: bool,
+    http_active_request: Option<HttpRequest>,
+    http_settings_file: HttpSettingsFile,
+    http_settings_root: Option<PathBuf>,
+    http_url_from_rows: bool,
+    http_rows_from_url: bool,
+    http_rows_dirty: bool,
+    http_auth_dirty: bool,
+    http_sync_scheduled: bool,
+    http_sync_guard: bool,
+    http_response_tab: HttpResponseTab,
+    http_response_pretty: bool,
     http_builder_response: Option<HttpProbeResponse>,
     http_builder_busy: bool,
     test_list_status: TestListStatus,
@@ -9949,7 +10303,28 @@ impl PhpPanel {
                     http_status: HashMap::new(),
                     http_builder: None,
                     http_method: "GET".to_string(),
-                    http_body_mode: HttpBodyMode::Raw,
+                    http_subtab: HttpSubTab::Params,
+                    http_params: Vec::new(),
+                    http_headers: Vec::new(),
+                    http_auth: HttpAuthSettings::default(),
+                    http_body_kind: HttpBodyKind::None,
+                    http_raw_content_type: RawContentType::Json,
+                    http_raw_body: String::new(),
+                    http_body_fields: Vec::new(),
+                    http_follow_redirects: false,
+                    http_timeout_secs: default_timeout(),
+                    http_verify_tls: true,
+                    http_active_request: None,
+                    http_settings_file: HttpSettingsFile::default(),
+                    http_settings_root: None,
+                    http_url_from_rows: false,
+                    http_rows_from_url: false,
+                    http_rows_dirty: false,
+                    http_auth_dirty: false,
+                    http_sync_scheduled: false,
+                    http_sync_guard: false,
+                    http_response_tab: HttpResponseTab::Body,
+                    http_response_pretty: true,
                     http_builder_response: None,
                     http_builder_busy: false,
                     test_list_status: TestListStatus::Unloaded,
@@ -10494,19 +10869,22 @@ impl PhpPanel {
                 } else {
                     IconName::Folder
                 })
-                .size(IconSize::XSmall)
+                .size(IconSize::Small)
                 .color(Color::Accent)
             } else {
                 match FileIcons::get_icon(Path::new(&entry.name), cx) {
-                    Some(icon_path) => Icon::from_path(icon_path).size(IconSize::XSmall),
-                    None => Icon::new(IconName::File).size(IconSize::XSmall),
+                    Some(icon_path) => Icon::from_path(icon_path).size(IconSize::Small),
+                    None => Icon::new(IconName::File).size(IconSize::Small),
                 }
             };
 
             let mut item = ListItem::new(("remote-entry", *line))
                 .indent_level(depth + 1)
+                .height(px(26.))
+                .rounded()
                 .selectable(true)
-                .toggle_state(selected)
+                .focused(selected)
+                .dock(DockSide::Left)
                 .always_show_disclosure_icon(true)
                 .start_slot(start_icon)
                 .child(Label::new(entry.name.clone()).truncate())
@@ -12366,7 +12744,7 @@ impl Render for PhpPanel {
             .child(
                 div().flex_none().child(
                     Icon::new(IconName::ChevronDown)
-                        .size(IconSize::XSmall)
+                        .size(IconSize::Small)
                         .color(Color::Muted),
                 ),
             )
@@ -12395,7 +12773,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("remote-configure", IconName::Ellipsis)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::XSmall)
+                    .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Deployment configuration"))
                     .aria_label("Deployment configuration")
@@ -12406,7 +12784,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("remote-refresh", IconName::RotateCw)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::XSmall)
+                    .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Refresh"))
                     .aria_label("Refresh remote listing")
@@ -12420,7 +12798,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("remote-sync", IconName::Share)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::XSmall)
+                    .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Sync"))
                     .aria_label("Sync files to server")
@@ -12674,7 +13052,7 @@ impl Render for PhpPanel {
                     .child(
                         div().flex_none().child(
                             Icon::new(IconName::ChevronDown)
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(Color::Muted),
                         ),
                     )
@@ -12722,7 +13100,7 @@ impl Render for PhpPanel {
                 );
             }
         } else {
-            remote_rows.push(empty_row("no servers configured"));
+            remote_rows.push(empty_state(IconName::Info, "No servers configured", "Add a server or pick one from the list", cx));
         }
 
         let mut database_rows = Vec::new();
@@ -12757,12 +13135,14 @@ impl Render for PhpPanel {
                             schema_rows.push(
                                 ListItem::new(format!("database-table-{index}-{table_index}"))
                                     .indent_level(1)
+                                    .height(px(24.))
+                                    .rounded()
                                     .child(
                                         h_flex()
                                             .gap_1()
                                             .child(
                                                 Icon::new(IconName::Table)
-                                                    .size(IconSize::XSmall)
+                                                    .size(IconSize::Small)
                                                     .color(Color::Muted),
                                             )
                                             .child(
@@ -12799,7 +13179,7 @@ impl Render for PhpPanel {
                                         } else {
                                             IconName::Circle
                                         })
-                                        .size(IconSize::XSmall)
+                                        .size(IconSize::Small)
                                         .color(
                                             if column.primary_key {
                                                 Color::Warning
@@ -12905,12 +13285,14 @@ impl Render for PhpPanel {
                             schema_rows.push(
                                 ListItem::new(format!("database-view-{index}-{view_index}"))
                                     .indent_level(2)
+                                    .height(px(24.))
+                                    .rounded()
                                     .child(
                                         h_flex()
                                             .gap_1()
                                             .child(
                                                 Icon::new(IconName::Table)
-                                                    .size(IconSize::XSmall)
+                                                    .size(IconSize::Small)
                                                     .color(Color::Muted),
                                             )
                                             .child(
@@ -13013,7 +13395,7 @@ impl Render for PhpPanel {
                                                 .gap_1()
                                                 .child(
                                                     Icon::new(IconName::DatabaseZap)
-                                                        .size(IconSize::XSmall)
+                                                        .size(IconSize::Small)
                                                         .color(Color::Muted),
                                                 )
                                                 .child(
@@ -13080,10 +13462,14 @@ impl Render for PhpPanel {
                 .id(("database-connection", index))
                 .w_full()
                 .flex_none()
-                .px_3()
-                .py_1()
+                .h(px(26.))
+                .px_2()
                 .gap_1()
+                .rounded_sm()
                 .cursor_pointer()
+                .when(expanded, |this| {
+                    this.border_l_2().border_color(cx.theme().colors().border_focused)
+                })
                 .hover(|this| this.bg(cx.theme().colors().element_hover))
                 .child(
                     div().flex_none().child(
@@ -13092,13 +13478,13 @@ impl Render for PhpPanel {
                         } else {
                             IconName::ChevronRight
                         })
-                        .size(IconSize::XSmall)
+                        .size(IconSize::Small)
                         .color(Color::Muted),
                     ),
                 )
                 .child(
                     Icon::new(IconName::DatabaseZap)
-                        .size(IconSize::XSmall)
+                        .size(IconSize::Small)
                         .color(Color::Accent),
                 )
                 .child(driver_badge(driver, driver_badge_color(driver), cx))
@@ -13199,6 +13585,9 @@ impl Render for PhpPanel {
                 });
 
                 let mut item = ListItem::new(("collection-request", collection_row_index))
+                    .height(px(26.))
+                    .rounded()
+                    .selectable(true)
                     .child(Label::new(text).truncate())
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                         this.run_collection_request(request_for_click.clone(), cx);
@@ -13257,9 +13646,20 @@ impl Render for PhpPanel {
                 });
 
                 let mut item = ListItem::new(("http-request", index))
+                    .height(px(26.))
+                    .rounded()
+                    .selectable(true)
                     .child(Label::new(text).truncate())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                        this.run_http_request(request_for_click.clone(), cx);
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.click_count() >= 2 {
+                            this.run_http_request(request_for_click.clone(), cx);
+                        } else {
+                            this.load_http_request_into_builder(
+                                request_for_click.clone(),
+                                window,
+                                cx,
+                            );
+                        }
                     }));
                 if let Some((status_text, color)) = status {
                     item = item.end_slot(
@@ -13296,20 +13696,24 @@ impl Render for PhpPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                Button::new("tests-run-all", "Run all")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
-                    .style(ButtonStyle::Subtle)
+                IconButton::new("tests-run-all", IconName::PlayFilled)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Run all tests"))
+                    .aria_label("Run all tests")
                     .disabled(tests_running)
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.run_tests(None, cx);
                     })),
             )
             .child(
-                Button::new("tests-refresh", "Refresh")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
-                    .style(ButtonStyle::Subtle)
+                IconButton::new("tests-refresh", IconName::RotateCw)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Refresh test files"))
+                    .aria_label("Refresh test files")
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.refresh_tests(cx);
                     })),
@@ -13326,6 +13730,9 @@ impl Render for PhpPanel {
         for (index, file) in self.test_files.iter().enumerate() {
             let file_for_click = file.clone();
             let mut item = ListItem::new(("test-file", index))
+                .height(px(26.))
+                .rounded()
+                .selectable(true)
                 .child(Label::new(file.clone()).truncate())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                     this.run_tests(Some(file_for_click.clone()), cx);
@@ -13379,22 +13786,23 @@ impl Render for PhpPanel {
         }
 
         if test_rows.is_empty() {
-            let (message, color) = match &self.test_list_status {
-                TestListStatus::Loading => ("loading…".to_string(), Color::Muted),
-                TestListStatus::Failed(message) => (message.clone(), Color::Error),
-                _ => ("no test files".to_string(), Color::Muted),
-            };
-            test_rows.push(
-                h_flex()
-                    .px_3()
-                    .py_1()
-                    .child(
-                        Label::new(message)
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .color(color),
-                    )
-                    .into_any_element(),
-            );
+            match &self.test_list_status {
+                TestListStatus::Failed(message) => test_rows.push(
+                    empty_state(IconName::Warning, "Tests failed to load", message.clone(), cx),
+                ),
+                TestListStatus::Loading => test_rows.push(empty_state(
+                    IconName::Info,
+                    "Loading tests…",
+                    "",
+                    cx,
+                )),
+                _ => test_rows.push(empty_state(
+                    IconName::PlayFilled,
+                    "No test files",
+                    "Refresh to discover PHPUnit tests",
+                    cx,
+                )),
+            }
         }
 
         let test_result_rows = match &self.test_run {
@@ -13496,7 +13904,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("db-add", IconName::Plus)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::XSmall)
+                    .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Add data source"))
                     .aria_label("Add data source")
@@ -13507,7 +13915,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("database-refresh", IconName::RotateCw)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::XSmall)
+                    .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Refresh"))
                     .aria_label("Refresh databases")
@@ -13518,7 +13926,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("database-sql", IconName::Terminal)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::XSmall)
+                    .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("SQL console"))
                     .aria_label("Open SQL console")
@@ -13618,7 +14026,7 @@ impl Render for PhpPanel {
                                 .child(div().flex_1())
                                 .child(
                                     Icon::new(IconName::ChevronRight)
-                                        .size(IconSize::XSmall)
+                                        .size(IconSize::Small)
                                         .color(Color::Muted),
                                 )
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -13758,6 +14166,7 @@ impl Render for PhpPanel {
                 .children(remote_server_menu)
                 .child(remote_status)
                 .when_some(remote_breadcrumb, |this, crumb| this.child(crumb))
+                .child(section_header("Remote Files", cx))
                 .child(
                     div()
                         .id("php-remote-tree")
@@ -13780,6 +14189,7 @@ impl Render for PhpPanel {
                         .filter(|form| matches!(form.kind, FormKind::Sql)),
                     |this, form| this.child(render_form(form)),
                 )
+                .child(section_header("Data Sources", cx))
                 .child(
                     div()
                         .id("php-database-tree")
@@ -13787,7 +14197,7 @@ impl Render for PhpPanel {
                         .min_h_0()
                         .overflow_y_scroll()
                         .children(if database_rows.is_empty() {
-                            vec![empty_row("no databases configured")]
+                            vec![empty_state(IconName::DatabaseZap, "No databases configured", "Create a data source to get started", cx)]
                         } else {
                             database_rows
                         }),
@@ -13805,6 +14215,7 @@ impl Render for PhpPanel {
                 .flex_1()
                 .min_h_0()
                 .child(tests_toolbar)
+                .child(section_header("Test Files", cx))
                 .child(
                     div()
                         .id("php-tests-scroll")
@@ -13823,17 +14234,29 @@ impl Render for PhpPanel {
                         .children(test_result_rows),
                 )
                 .into_any_element(),
-            PanelTab::Collections => div()
-                .id("php-collections-scroll")
+            PanelTab::Collections => v_flex()
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .overflow_y_scroll()
-                .children(if collection_rows.is_empty() {
-                    vec![empty_row("not configured")]
-                } else {
-                    collection_rows
-                })
+                .child(section_header("Collections", cx))
+                .child(
+                    div()
+                        .id("php-collections-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_y_scroll()
+                        .children(if collection_rows.is_empty() {
+                            vec![empty_state(
+                                IconName::File,
+                                "No collections",
+                                "Add a Postman collection to the project",
+                                cx,
+                            )]
+                        } else {
+                            collection_rows
+                        }),
+                )
                 .into_any_element(),
             PanelTab::Http => v_flex()
                 .flex_1()
@@ -13848,7 +14271,12 @@ impl Render for PhpPanel {
                         .w_full()
                         .overflow_y_scroll()
                         .children(if http_rows.is_empty() {
-                            vec![empty_row("not configured")]
+                            vec![empty_state(
+                                IconName::Info,
+                                "No HTTP requests",
+                                "Add a .http file to the project",
+                                cx,
+                            )]
                         } else {
                             http_rows
                         }),
@@ -13894,6 +14322,341 @@ impl Render for PhpPanel {
 }
 
 impl PhpPanel {
+    fn new_http_pair(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        kind: HttpPairKind,
+    ) -> PairEditors {
+        let key = cx.new(|cx| Editor::single_line(window, cx));
+        let value = cx.new(|cx| Editor::single_line(window, cx));
+        let wants = move |event: &EditorEvent| {
+            if kind == HttpPairKind::Params {
+                matches!(event, EditorEvent::BufferEdited)
+            } else {
+                matches!(event, EditorEvent::Blurred)
+            }
+        };
+        let key_sub = cx.subscribe(&key, move |this: &mut Self, _, event, cx| {
+            if wants(event) && !this.http_sync_guard {
+                this.on_http_pair_blurred(kind, cx);
+            }
+        });
+        let value_sub = cx.subscribe(&value, move |this: &mut Self, _, event, cx| {
+            if wants(event) && !this.http_sync_guard {
+                this.on_http_pair_blurred(kind, cx);
+            }
+        });
+        self._subscriptions.push(key_sub);
+        self._subscriptions.push(value_sub);
+        PairEditors {
+            enabled: true,
+            key,
+            value,
+        }
+    }
+
+    fn on_http_pair_blurred(&mut self, kind: HttpPairKind, cx: &mut Context<Self>) {
+        self.sync_http_state_from_editors(cx);
+        if kind == HttpPairKind::Params {
+            self.http_url_from_rows = true;
+            self.http_rows_from_url = false;
+        }
+        self.persist_http_settings(cx);
+        self.http_builder_response = None;
+        cx.notify();
+    }
+
+    fn sync_http_state_from_editors(&mut self, cx: &mut Context<Self>) {
+        let Some(editors) = self.http_builder.as_ref() else {
+            return;
+        };
+        let read = |editor: &Entity<Editor>| editor.read(cx).text(cx);
+        let params = editors
+            .params
+            .iter()
+            .map(|pair| KeyValueRow {
+                enabled: pair.enabled,
+                key: read(&pair.key),
+                value: read(&pair.value),
+            })
+            .collect::<Vec<_>>();
+        let headers = editors
+            .headers
+            .iter()
+            .map(|pair| KeyValueRow {
+                enabled: pair.enabled,
+                key: read(&pair.key),
+                value: read(&pair.value),
+            })
+            .collect::<Vec<_>>();
+        let body_fields = editors
+            .body_fields
+            .iter()
+            .map(|pair| KeyValueRow {
+                enabled: pair.enabled,
+                key: read(&pair.key),
+                value: read(&pair.value),
+            })
+            .collect::<Vec<_>>();
+        self.http_params = params;
+        self.http_headers = headers;
+        self.http_body_fields = body_fields;
+        self.http_raw_body = read(&editors.raw_body);
+        self.http_auth.api_key_name = read(&editors.auth_api_key_name);
+        self.http_auth.api_key_value = read(&editors.auth_api_key_value);
+        self.http_auth.username = read(&editors.auth_username);
+        self.http_auth.password = read(&editors.auth_password);
+        self.http_auth.token = read(&editors.auth_token);
+        self.http_timeout_secs = read(&editors.timeout)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(default_timeout());
+    }
+
+    fn ensure_http_pair_count(
+        &mut self,
+        kind: HttpPairKind,
+        desired: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = match kind {
+            HttpPairKind::Params => self.http_builder.as_ref().map(|e| e.params.len()),
+            HttpPairKind::Headers => self.http_builder.as_ref().map(|e| e.headers.len()),
+            HttpPairKind::BodyFields => self.http_builder.as_ref().map(|e| e.body_fields.len()),
+        }
+        .unwrap_or(0);
+        if current == desired {
+            return;
+        }
+        if current < desired {
+            let mut added = Vec::new();
+            for _ in current..desired {
+                added.push(self.new_http_pair(window, cx, kind));
+            }
+            if let Some(editors) = self.http_builder.as_mut() {
+                match kind {
+                    HttpPairKind::Params => editors.params.extend(added),
+                    HttpPairKind::Headers => editors.headers.extend(added),
+                    HttpPairKind::BodyFields => editors.body_fields.extend(added),
+                }
+            }
+        } else if let Some(editors) = self.http_builder.as_mut() {
+            match kind {
+                HttpPairKind::Params => editors.params.truncate(desired),
+                HttpPairKind::Headers => editors.headers.truncate(desired),
+                HttpPairKind::BodyFields => editors.body_fields.truncate(desired),
+            }
+        }
+    }
+
+    /// Applies pending two-way URL/table and load-time editor updates after the
+    /// current frame, avoiding re-entrant entity updates from `set_text`.
+    fn schedule_http_editor_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.http_sync_scheduled
+            || !(self.http_rows_from_url
+                || self.http_url_from_rows
+                || self.http_rows_dirty
+                || self.http_auth_dirty)
+        {
+            return;
+        }
+        self.http_sync_scheduled = true;
+        let params = self.http_params.clone();
+        let headers = self.http_headers.clone();
+        let body_fields = self.http_body_fields.clone();
+        let auth = self.http_auth.clone();
+        let raw_body = self.http_raw_body.clone();
+        let timeout = self.http_timeout_secs.to_string();
+        let rows_from_url = self.http_rows_from_url;
+        let url_from_rows = self.http_url_from_rows;
+        let rows_dirty = self.http_rows_dirty;
+        let auth_dirty = self.http_auth_dirty;
+        cx.defer_in(window, move |this, window, cx| {
+            this.http_sync_guard = true;
+            this.ensure_http_pair_count(
+                HttpPairKind::Params,
+                params.len().max(1),
+                window,
+                cx,
+            );
+            this.ensure_http_pair_count(
+                HttpPairKind::Headers,
+                headers.len().max(1),
+                window,
+                cx,
+            );
+            this.ensure_http_pair_count(
+                HttpPairKind::BodyFields,
+                body_fields.len().max(1),
+                window,
+                cx,
+            );
+            if rows_from_url || rows_dirty {
+                if let Some(editors) = this.http_builder.as_ref() {
+                    let mut set_pair = |pair: &PairEditors, row: &KeyValueRow| {
+                        pair.key.update(cx, |editor, cx| {
+                            editor.set_text(row.key.clone(), window, cx);
+                        });
+                        pair.value.update(cx, |editor, cx| {
+                            editor.set_text(row.value.clone(), window, cx);
+                        });
+                    };
+                    for (pair, row) in editors.params.iter().zip(params.iter()) {
+                        set_pair(pair, row);
+                    }
+                    for (pair, row) in editors.headers.iter().zip(headers.iter()) {
+                        set_pair(pair, row);
+                    }
+                    for (pair, row) in editors.body_fields.iter().zip(body_fields.iter()) {
+                        set_pair(pair, row);
+                    }
+                }
+            }
+            if auth_dirty {
+                if let Some(editors) = this.http_builder.as_ref() {
+                    let mut set = |editor: &Entity<Editor>, value: &str| {
+                        editor.update(cx, |editor, cx| {
+                            editor.set_text(value.to_string(), window, cx);
+                        });
+                    };
+                    set(&editors.auth_api_key_name, &auth.api_key_name);
+                    set(&editors.auth_api_key_value, &auth.api_key_value);
+                    set(&editors.auth_username, &auth.username);
+                    set(&editors.auth_password, &auth.password);
+                    set(&editors.auth_token, &auth.token);
+                    set(&editors.raw_body, &raw_body);
+                    set(&editors.timeout, &timeout);
+                }
+            }
+            if url_from_rows {
+                if let Some(editors) = this.http_builder.as_ref() {
+                    let current = editors.url.read(cx).text(cx);
+                    let (base, _) = parse_url_query(&current);
+                    let url = serialize_url_query(&base, &params);
+                    editors.url.update(cx, |editor, cx| {
+                        editor.set_text(url, window, cx);
+                    });
+                }
+            }
+            this.http_sync_guard = false;
+            this.http_sync_scheduled = false;
+            this.http_rows_from_url = false;
+            this.http_url_from_rows = false;
+            this.http_rows_dirty = false;
+            this.http_auth_dirty = false;
+            cx.notify();
+        });
+    }
+
+    fn current_http_url(&self, cx: &Context<Self>) -> String {
+        let Some(editors) = self.http_builder.as_ref() else {
+            return String::new();
+        };
+        let current = editors.url.read(cx).text(cx);
+        if self.http_url_from_rows {
+            let (base, _) = parse_url_query(&current);
+            serialize_url_query(&base, &self.http_params)
+        } else {
+            current
+        }
+    }
+
+    fn persist_http_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.http_active_request.clone() else {
+            return;
+        };
+        let Some(root) = self.http_settings_root.clone() else {
+            return;
+        };
+        let url = self.current_http_url(cx);
+        let key = http_settings_key(request.file.path.as_unix_str(), &request.name);
+        let settings = HttpRequestSettings {
+            method: self.http_method.clone(),
+            url,
+            subtab: Some(self.http_subtab),
+            params: self.http_params.clone(),
+            auth: self.http_auth.clone(),
+            headers: self.http_headers.clone(),
+            body_kind: self.http_body_kind,
+            raw_content_type: self.http_raw_content_type,
+            raw_body: self.http_raw_body.clone(),
+            body_fields: self.http_body_fields.clone(),
+            follow_redirects: self.http_follow_redirects,
+            timeout_secs: self.http_timeout_secs,
+            verify_tls: self.http_verify_tls,
+        };
+        self.http_settings_file
+            .requests
+            .insert(key, settings);
+        let _ = save_http_settings(&root, &self.http_settings_file);
+    }
+
+    fn toggle_http_pair(&mut self, kind: HttpPairKind, index: usize, cx: &mut Context<Self>) {
+        if let Some(editors) = self.http_builder.as_mut() {
+            let pair = match kind {
+                HttpPairKind::Params => editors.params.get_mut(index),
+                HttpPairKind::Headers => editors.headers.get_mut(index),
+                HttpPairKind::BodyFields => editors.body_fields.get_mut(index),
+            };
+            if let Some(pair) = pair {
+                pair.enabled = !pair.enabled;
+            }
+        }
+        self.sync_http_state_from_editors(cx);
+        self.persist_http_settings(cx);
+        cx.notify();
+    }
+
+    fn add_http_pair(
+        &mut self,
+        kind: HttpPairKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pair = self.new_http_pair(window, cx, kind);
+        if let Some(editors) = self.http_builder.as_mut() {
+            match kind {
+                HttpPairKind::Params => editors.params.push(pair),
+                HttpPairKind::Headers => editors.headers.push(pair),
+                HttpPairKind::BodyFields => editors.body_fields.push(pair),
+            }
+        }
+        self.sync_http_state_from_editors(cx);
+        self.http_rows_dirty = true;
+        cx.notify();
+    }
+
+    fn remove_http_pair(&mut self, kind: HttpPairKind, index: usize, cx: &mut Context<Self>) {
+        if let Some(editors) = self.http_builder.as_mut() {
+            match kind {
+                HttpPairKind::Params => {
+                    if index < editors.params.len() {
+                        editors.params.remove(index);
+                    }
+                }
+                HttpPairKind::Headers => {
+                    if index < editors.headers.len() {
+                        editors.headers.remove(index);
+                    }
+                }
+                HttpPairKind::BodyFields => {
+                    if index < editors.body_fields.len() {
+                        editors.body_fields.remove(index);
+                    }
+                }
+            }
+        }
+        self.sync_http_state_from_editors(cx);
+        self.http_rows_dirty = true;
+        if kind == HttpPairKind::Params {
+            self.http_url_from_rows = true;
+        }
+        self.persist_http_settings(cx);
+        cx.notify();
+    }
+
     fn ensure_http_editors(
         &mut self,
         window: &mut Window,
@@ -13901,87 +14664,299 @@ impl PhpPanel {
     ) -> &HttpBuilderEditors {
         if self.http_builder.is_none() {
             let url = cx.new(|cx| Editor::single_line(window, cx));
-            let headers = cx.new(|cx| Editor::auto_height(2, 6, window, cx));
-            let body = cx.new(|cx| Editor::auto_height(3, 12, window, cx));
+            let raw_body = cx.new(|cx| Editor::auto_height(6, 18, window, cx));
+            let auth_api_key_name = cx.new(|cx| Editor::single_line(window, cx));
+            let auth_api_key_value = cx.new(|cx| Editor::single_line(window, cx));
+            let auth_username = cx.new(|cx| Editor::single_line(window, cx));
+            let auth_password = cx.new(|cx| Editor::single_line(window, cx));
+            let auth_token = cx.new(|cx| Editor::single_line(window, cx));
+            let timeout = cx.new(|cx| Editor::single_line(window, cx));
 
             let url_sub = cx.subscribe(&url, |this: &mut Self, editor, event, cx| {
-                if matches!(event, EditorEvent::BufferEdited) {
-                    let _ = editor.read(cx).text(cx);
-                    this.http_builder_response = None;
-                    cx.notify();
+                if this.http_sync_guard {
+                    return;
+                }
+                match event {
+                    EditorEvent::BufferEdited => {
+                        this.http_builder_response = None;
+                        cx.notify();
+                    }
+                    EditorEvent::Blurred => {
+                        let text = editor.read(cx).text(cx);
+                        let (_, rows) = parse_url_query(&text);
+                        this.http_params = rows;
+                        this.http_rows_from_url = true;
+                        this.http_url_from_rows = false;
+                        this.http_rows_dirty = true;
+                        this.persist_http_settings(cx);
+                        cx.notify();
+                    }
+                    _ => {}
                 }
             });
-            let headers_sub = cx.subscribe(&headers, |this: &mut Self, _editor, event, cx| {
-                if matches!(event, EditorEvent::BufferEdited) {
-                    this.http_builder_response = None;
-                    cx.notify();
+            let raw_body_sub = cx.subscribe(&raw_body, |this: &mut Self, editor, event, cx| {
+                if matches!(event, EditorEvent::Blurred) && !this.http_sync_guard {
+                    this.http_raw_body = editor.read(cx).text(cx);
+                    this.persist_http_settings(cx);
                 }
             });
-            let body_sub = cx.subscribe(&body, |this: &mut Self, _editor, event, cx| {
-                if matches!(event, EditorEvent::BufferEdited) {
-                    this.http_builder_response = None;
-                    cx.notify();
-                }
-            });
+            let auth_subs = [
+                cx.subscribe(&auth_api_key_name, |this: &mut Self, _, event, cx| {
+                    if matches!(event, EditorEvent::Blurred) && !this.http_sync_guard {
+                        this.sync_http_state_from_editors(cx);
+                        this.persist_http_settings(cx);
+                    }
+                }),
+                cx.subscribe(&auth_api_key_value, |this: &mut Self, _, event, cx| {
+                    if matches!(event, EditorEvent::Blurred) && !this.http_sync_guard {
+                        this.sync_http_state_from_editors(cx);
+                        this.persist_http_settings(cx);
+                    }
+                }),
+                cx.subscribe(&auth_username, |this: &mut Self, _, event, cx| {
+                    if matches!(event, EditorEvent::Blurred) && !this.http_sync_guard {
+                        this.sync_http_state_from_editors(cx);
+                        this.persist_http_settings(cx);
+                    }
+                }),
+                cx.subscribe(&auth_password, |this: &mut Self, _, event, cx| {
+                    if matches!(event, EditorEvent::Blurred) && !this.http_sync_guard {
+                        this.sync_http_state_from_editors(cx);
+                        this.persist_http_settings(cx);
+                    }
+                }),
+                cx.subscribe(&auth_token, |this: &mut Self, _, event, cx| {
+                    if matches!(event, EditorEvent::Blurred) && !this.http_sync_guard {
+                        this.sync_http_state_from_editors(cx);
+                        this.persist_http_settings(cx);
+                    }
+                }),
+                cx.subscribe(&timeout, |this: &mut Self, _, event, cx| {
+                    if matches!(event, EditorEvent::Blurred) && !this.http_sync_guard {
+                        this.sync_http_state_from_editors(cx);
+                        this.persist_http_settings(cx);
+                    }
+                }),
+            ];
             self._subscriptions.push(url_sub);
-            self._subscriptions.push(headers_sub);
-            self._subscriptions.push(body_sub);
-            let form_pair = (
-                cx.new(|cx| Editor::single_line(window, cx)),
-                cx.new(|cx| Editor::single_line(window, cx)),
-            );
+            self._subscriptions.push(raw_body_sub);
+            self._subscriptions.extend(auth_subs);
+
+            let params = vec![self.new_http_pair(window, cx, HttpPairKind::Params)];
+            let headers = vec![self.new_http_pair(window, cx, HttpPairKind::Headers)];
+            let body_fields = vec![self.new_http_pair(window, cx, HttpPairKind::BodyFields)];
             self.http_builder = Some(HttpBuilderEditors {
                 url,
+                raw_body,
+                auth_api_key_name,
+                auth_api_key_value,
+                auth_username,
+                auth_password,
+                auth_token,
+                timeout,
+                params,
                 headers,
-                body,
-                form_pairs: vec![form_pair],
+                body_fields,
             });
         }
         self.http_builder.as_ref().expect("http editors")
     }
 
-    fn http_editor_text(editor: &Entity<Editor>, cx: &Context<Self>) -> String {
-        editor.read(cx).text(cx)
+    fn load_http_request_into_builder(
+        &mut self,
+        request: HttpRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.persist_http_settings(cx);
+        let root = request.root.clone();
+        if self.http_settings_root.as_deref() != Some(root.as_path()) {
+            self.http_settings_file = load_http_settings(&root);
+            self.http_settings_root = Some(root);
+        }
+        let detail = std::fs::read_to_string(&request.absolute_path)
+            .ok()
+            .and_then(|contents| parse_http_request_detail(&contents, &request.name));
+        let key = http_settings_key(request.file.path.as_unix_str(), &request.name);
+        let stored = self.http_settings_file.requests.get(&key).cloned();
+        let mut settings = stored.unwrap_or_else(|| {
+            let mut settings = HttpRequestSettings::default();
+            if let Some(detail) = &detail {
+                settings.method = detail.method.clone();
+                settings.url = detail.url.clone();
+                settings.headers = detail
+                    .headers
+                    .iter()
+                    .map(|(name, value)| KeyValueRow::new(name.clone(), value.clone()))
+                    .collect();
+                if !detail.body.is_empty() {
+                    settings.body_kind = HttpBodyKind::Raw;
+                    settings.raw_body = detail.body.clone();
+                }
+            }
+            settings
+        });
+        if settings.method.is_empty() {
+            settings.method = "GET".to_string();
+        }
+        if settings.params.is_empty() && settings.url.contains('?') {
+            let (_, rows) = parse_url_query(&settings.url);
+            settings.params = rows;
+        }
+
+        let loaded_url = settings.url.clone();
+        self.http_method = settings.method;
+        self.http_subtab = settings.subtab.unwrap_or(HttpSubTab::Params);
+        self.http_params = settings.params;
+        self.http_auth = settings.auth;
+        self.http_headers = settings.headers;
+        self.http_body_kind = settings.body_kind;
+        self.http_raw_content_type = settings.raw_content_type;
+        self.http_raw_body = settings.raw_body;
+        self.http_body_fields = settings.body_fields;
+        self.http_follow_redirects = settings.follow_redirects;
+        self.http_timeout_secs = settings.timeout_secs;
+        self.http_verify_tls = settings.verify_tls;
+        self.http_active_request = Some(request.clone());
+        self.http_rows_dirty = true;
+        self.http_auth_dirty = true;
+        self.http_rows_from_url = false;
+        self.http_url_from_rows = false;
+
+        self.ensure_http_editors(window, cx);
+        self.http_sync_guard = true;
+        if let Some(editors) = self.http_builder.as_ref() {
+            let mut set = |editor: &Entity<Editor>, value: &str| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_text(value.to_string(), window, cx);
+                });
+            };
+            set(&editors.url, &loaded_url);
+            set(&editors.raw_body, &self.http_raw_body);
+            set(&editors.auth_api_key_name, &self.http_auth.api_key_name);
+            set(&editors.auth_api_key_value, &self.http_auth.api_key_value);
+            set(&editors.auth_username, &self.http_auth.username);
+            set(&editors.auth_password, &self.http_auth.password);
+            set(&editors.auth_token, &self.http_auth.token);
+            set(&editors.timeout, &self.http_timeout_secs.to_string());
+        }
+        self.http_sync_guard = false;
+        self.saved_message = Some(format!("loaded request: {}", request.name));
+        cx.notify();
+    }
+
+    fn render_http_pair_table(
+        &mut self,
+        kind: HttpPairKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(editors) = self.http_builder.as_ref() else {
+            return div().into_any_element();
+        };
+        let pairs = match kind {
+            HttpPairKind::Params => editors.params.clone(),
+            HttpPairKind::Headers => editors.headers.clone(),
+            HttpPairKind::BodyFields => editors.body_fields.clone(),
+        };
+        let colors = cx.theme().colors();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, pair) in pairs.iter().enumerate() {
+            let panel = cx.entity().downgrade();
+            let toggle_panel = panel.clone();
+            let row = h_flex()
+                .id(format!("http-pair-row-{}-{}", kind as usize, index))
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .h(px(28.))
+                .px_1()
+                .rounded_sm()
+                .hover(|style| style.bg(colors.element_hover))
+                .child(
+                    Checkbox::new(
+                        format!("http-pair-check-{}-{}", kind as usize, index),
+                        if pair.enabled {
+                            ToggleState::Selected
+                        } else {
+                            ToggleState::Unselected
+                        },
+                    )
+                    .on_click(move |_state, _window, cx| {
+                        if let Some(panel) = toggle_panel.upgrade() {
+                            let _ = panel.update(cx, |this, cx| {
+                                this.toggle_http_pair(kind, index, cx);
+                            });
+                        }
+                    }),
+                )
+                .child(dialog_editor(
+                    format!("http-pair-key-{}-{}", kind as usize, index),
+                    &pair.key,
+                    None,
+                    window,
+                    cx,
+                ))
+                .child(dialog_editor(
+                    format!("http-pair-value-{}-{}", kind as usize, index),
+                    &pair.value,
+                    None,
+                    window,
+                    cx,
+                ))
+                .child(
+                    IconButton::new(format!("http-pair-remove-{}-{}", kind as usize, index), IconName::Close)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Remove row"))
+                        .aria_label("Remove row")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            this.remove_http_pair(kind, index, cx);
+                        })),
+                );
+            rows.push(row.into_any_element());
+        }
+        rows.push(
+            h_flex()
+                .id(("http-pair-add", kind as usize))
+                .w_full()
+                .flex_none()
+                .items_center()
+                .px_1()
+                .py_1()
+                .child(
+                    Button::new(("http-add-row", kind as usize), "＋ Add")
+                        .size(ButtonSize::Compact)
+                        .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.add_http_pair(kind, window, cx);
+                        })),
+                )
+                .into_any_element(),
+        );
+        v_flex()
+            .id(("http-pair-table", kind as usize))
+            .w_full()
+            .gap_0p5()
+            .children(rows)
+            .into_any_element()
     }
 
     fn render_http_builder(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.ensure_http_editors(window, cx);
-        let colors = cx.theme().colors();
-        let editors = self.http_builder.as_ref().expect("http editors");
-        let url_editor = editors.url.clone();
-        let headers_editor = editors.headers.clone();
-        let body_editor = editors.body.clone();
-
-        let busy = self.http_builder_busy;
+        self.schedule_http_editor_sync(window, cx);
+        let colors = cx.theme().colors().clone();
         let method = self.http_method.clone();
 
-        let headers_text = Self::http_editor_text(&headers_editor, cx);
-        let headers_count = headers_text
-            .lines()
-            .filter(|line| {
-                line.split_once(':')
-                    .map(|(name, _)| !name.trim().is_empty())
-                    .unwrap_or(false)
-            })
-            .count();
-        let headers_hint = if headers_count == 0 {
-            "no headers".to_string()
-        } else {
-            format!("{headers_count} header(s)")
-        };
-        let body_text = Self::http_editor_text(&body_editor, cx);
-        let body_hint = if body_text.trim().is_empty() {
-            "no body".to_string()
-        } else {
-            format!("{} bytes", body_text.len())
-        };
-
-        // --- method dropdown ---
         let panel = cx.entity().downgrade();
         let trigger = Button::new("http-method-trigger", method.clone())
             .size(ButtonSize::Compact)
             .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
-            .style(ButtonStyle::Subtle);
+            .style(ButtonStyle::Subtle)
+            .tooltip(Tooltip::text("HTTP method"));
         let method_menu = PopoverMenu::new("http-method-menu")
             .menu(move |window, cx| {
                 let panel = panel.clone();
@@ -13998,6 +14973,7 @@ impl PhpPanel {
                                     if let Some(panel) = menu_panel.upgrade() {
                                         panel.update(cx, |panel, cx| {
                                             panel.http_method = chosen.clone();
+                                            panel.persist_http_settings(cx);
                                             cx.notify();
                                         });
                                     }
@@ -14010,18 +14986,27 @@ impl PhpPanel {
             .anchor(Anchor::BottomLeft)
             .trigger(trigger);
 
-        // --- url input ---
+        let url_editor = self
+            .http_builder
+            .as_ref()
+            .expect("http editors")
+            .url
+            .clone();
         let url_input = div()
             .id("http-url-box")
             .flex_1()
             .min_w_0()
-            .h(px(26.))
+            .h(px(28.))
             .flex()
             .items_center()
             .px_2()
-            .rounded_xs()
+            .rounded_md()
             .border_1()
-            .border_color(colors.border)
+            .border_color(if url_editor.read(cx).focus_handle(cx).is_focused(window) {
+                colors.border_focused
+            } else {
+                colors.border_variant
+            })
             .bg(colors.editor_background)
             .cursor_text()
             .child(
@@ -14032,6 +15017,7 @@ impl PhpPanel {
                     .child(dialog_editor_element(&url_editor, cx)),
             );
 
+        let busy = self.http_builder_busy;
         let send_label = if busy { "Sending…" } else { "Send" };
         let send_button = dialog_button("http-send", send_label, DialogButtonVariant::Primary)
             .disabled(busy)
@@ -14042,6 +15028,7 @@ impl PhpPanel {
         let mut rows = Vec::new();
         rows.push(
             h_flex()
+                .id("http-request-line")
                 .w_full()
                 .flex_none()
                 .items_center()
@@ -14056,234 +15043,154 @@ impl PhpPanel {
                 .into_any_element(),
         );
 
-        rows.push(
-            div()
-                .id("http-headers-block")
-                .w_full()
-                .flex_none()
-                .px_2()
-                .py_1()
-                .border_b_1()
-                .border_color(colors.border)
-                .child(
-                    h_flex().w_full().items_center().gap_2().child(
-                        Label::new(format!("Headers · {headers_hint}"))
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .color(Color::Muted),
-                    ),
-                )
-                .child(
-                    div()
-                        .id("http-headers-editor")
-                        .w_full()
-                        .mt_1()
-                        .rounded_xs()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.editor_background)
-                        .px_2()
-                        .py_1()
-                        .cursor_text()
-                        .child(dialog_editor_element(&headers_editor, cx)),
-                )
-                .into_any_element(),
-        );
-
-        let raw_active = self.http_body_mode == HttpBodyMode::Raw;
-        let form_active = !raw_active;
-
-        let mut body_header = h_flex()
+        let mut subtab_row = h_flex()
+            .id("http-subtabs")
             .w_full()
+            .flex_none()
             .items_center()
-            .gap_2()
-            .child(
-                Label::new(format!("Body · {body_hint}"))
-                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                    .color(Color::Muted),
-            )
-            .child(
-                Button::new("http-body-mode-raw", "raw")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
-                    .style(if raw_active {
-                        ButtonStyle::Filled
-                    } else {
-                        ButtonStyle::Subtle
+            .gap_1()
+            .px_2()
+            .border_b_1()
+            .border_color(colors.border);
+        for tab in HttpSubTab::ALL {
+            let selected = self.http_subtab == tab;
+            subtab_row = subtab_row.child(
+                h_flex()
+                    .id(("http-subtab", tab as usize))
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(selected, |this| {
+                        this.border_b_2().border_color(colors.border_focused)
                     })
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.http_body_mode = HttpBodyMode::Raw;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("http-body-mode-form", "form")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
-                    .style(if form_active {
-                        ButtonStyle::Filled
-                    } else {
-                        ButtonStyle::Subtle
-                    })
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.http_body_mode = HttpBodyMode::Form;
+                    .child(
+                        Label::new(tab.label())
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(if selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.http_subtab = tab;
+                        this.persist_http_settings(cx);
                         cx.notify();
                     })),
             );
+        }
+        rows.push(subtab_row.into_any_element());
 
-        let body_area: AnyElement = if raw_active {
-            div()
-                .id("http-body-editor")
+        let content = match self.http_subtab {
+            HttpSubTab::Params => v_flex()
+                .id("http-params")
                 .w_full()
-                .mt_1()
-                .rounded_xs()
-                .border_1()
-                .border_color(colors.border_variant)
-                .bg(colors.editor_background)
-                .px_2()
-                .py_1()
-                .cursor_text()
-                .child(dialog_editor_element(&body_editor, cx))
-                .into_any_element()
-        } else {
-            let mut form_col = v_flex().id("http-form-body").w_full().mt_1().gap_1();
-            let pairs = editors.form_pairs.clone();
-            for (index, (name_editor, value_editor)) in pairs.iter().enumerate() {
-                let pair_index = index;
-                form_col = form_col.child(
+                .gap_1()
+                .child(
                     h_flex()
                         .w_full()
                         .items_center()
-                        .gap_1()
+                        .child(section_header("Query Params", cx))
+                        .child(div().flex_1())
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h(px(24.))
-                                .rounded_xs()
-                                .border_1()
-                                .border_color(colors.border_variant)
-                                .bg(colors.editor_background)
-                                .px_2()
-                                .cursor_text()
-                                .child(dialog_editor_element(name_editor, cx)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h(px(24.))
-                                .rounded_xs()
-                                .border_1()
-                                .border_color(colors.border_variant)
-                                .bg(colors.editor_background)
-                                .px_2()
-                                .cursor_text()
-                                .child(dialog_editor_element(value_editor, cx)),
-                        )
-                        .child(
-                            IconButton::new(("http-form-remove", pair_index), IconName::Close)
-                                .size(ButtonSize::Compact)
-                                .shape(IconButtonShape::Square)
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                    if let Some(editors) = this.http_builder.as_mut() {
-                                        if editors.form_pairs.len() > 1 {
-                                            editors.form_pairs.remove(pair_index);
-                                            cx.notify();
-                                        }
-                                    }
-                                })),
+                            Label::new("editing the URL updates these rows; edits here rewrite the URL")
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .color(Color::Muted)
+                                .truncate(),
                         ),
-                );
+                )
+                .child(self.render_http_pair_table(HttpPairKind::Params, window, cx))
+                .into_any_element(),
+            HttpSubTab::Authorization => self.render_http_auth(window, cx),
+            HttpSubTab::Headers => {
+                let auto = self.auto_generated_headers(cx);
+                let mut auto_rows: Vec<AnyElement> = auto
+                    .iter()
+                    .map(|(name, value)| {
+                        h_flex()
+                            .w_full()
+                            .flex_none()
+                            .h(px(24.))
+                            .px_1()
+                            .gap_1()
+                            .child(
+                                Label::new(name.clone())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Muted)
+                                    .flex_none(),
+                            )
+                            .child(
+                                Label::new(value.clone())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                            .into_any_element()
+                    })
+                    .collect();
+                if auto_rows.is_empty() {
+                    auto_rows.push(
+                        Label::new("no generated headers for the current body")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted)
+                            .into_any_element(),
+                    );
+                }
+                v_flex()
+                    .id("http-headers")
+                    .w_full()
+                    .gap_1()
+                    .child(section_header("Headers", cx))
+                    .child(self.render_http_pair_table(HttpPairKind::Headers, window, cx))
+                    .child(section_header("Auto-generated headers", cx))
+                    .child(
+                        v_flex()
+                            .id("http-auto-headers")
+                            .w_full()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.editor_background)
+                            .p_1()
+                            .gap_0p5()
+                            .children(auto_rows),
+                    )
+                    .into_any_element()
             }
-            form_col = form_col.child(
-                Button::new("http-form-add", "＋ field")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
-                    .style(ButtonStyle::Subtle)
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        if let Some(editors) = this.http_builder.as_mut() {
-                            let pair = (
-                                cx.new(|cx| Editor::single_line(window, cx)),
-                                cx.new(|cx| Editor::single_line(window, cx)),
-                            );
-                            editors.form_pairs.push(pair);
-                            cx.notify();
-                        }
-                    })),
-            );
-            form_col.into_any_element()
+            HttpSubTab::Body => self.render_http_body(window, cx),
+            HttpSubTab::Scripts => v_flex()
+                .id("http-scripts")
+                .w_full()
+                .p_3()
+                .gap_1()
+                .child(section_header("Scripts", cx))
+                .child(
+                    Label::new("pre-request / test scripts: not supported yet")
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            HttpSubTab::Settings => self.render_http_settings(window, cx),
         };
 
-        body_header = body_header.when(!form_active, |this| this);
         rows.push(
             div()
-                .id("http-body-block")
+                .id("http-subtab-content")
                 .w_full()
                 .flex_none()
+                .max_h(px(360.))
+                .overflow_y_scroll()
                 .px_2()
                 .py_1()
-                .border_b_1()
-                .border_color(colors.border)
-                .child(body_header)
-                .child(body_area)
+                .child(content)
                 .into_any_element(),
         );
 
         if let Some(response) = self.http_builder_response.clone() {
-            let status_color = if (200..400).contains(&response.status) {
-                Color::Success
-            } else {
-                Color::Error
-            };
-            let content_type = response
-                .headers
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                .map(|(_, value)| value.clone())
-                .unwrap_or_else(|| "no content-type".to_string());
-            rows.push(
-                h_flex()
-                    .w_full()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(
-                        Label::new(format!(
-                            "HTTP {} · {} ms",
-                            response.status, response.time_ms
-                        ))
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .color(status_color),
-                    )
-                    .child(
-                        Label::new(format!("{content_type} · {} bytes", response.body.len()))
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .color(Color::Muted)
-                            .truncate(),
-                    )
-                    .into_any_element(),
-            );
-            rows.push(
-                div()
-                    .id("http-builder-response")
-                    .w_full()
-                    .flex_shrink_0()
-                    .max_h(px(240.))
-                    .overflow_y_scroll()
-                    .bg(colors.editor_background)
-                    .px_2()
-                    .py_1()
-                    .child(
-                        Label::new(response.body.clone())
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .color(Color::Default),
-                    )
-                    .into_any_element(),
-            );
+            rows.push(self.render_http_response(&response, cx));
         }
 
         v_flex()
@@ -14296,125 +15203,671 @@ impl PhpPanel {
             .into_any_element()
     }
 
+    fn auto_generated_headers(&self, cx: &Context<Self>) -> Vec<(String, String)> {
+        let body = compose_http_request(
+            "",
+            &self.http_headers,
+            &self.http_auth,
+            self.http_body_kind,
+            self.http_raw_content_type,
+            &self.http_raw_body,
+            &self.http_body_fields,
+            "boundary",
+        );
+        let mut headers = Vec::new();
+        if let Some(content_type) = body.content_type {
+            headers.push(("Content-Type".to_string(), content_type));
+        }
+        headers.push(("Accept".to_string(), "*/*".to_string()));
+        headers.push(("User-Agent".to_string(), "php-http/curl".to_string()));
+        if let Some(body) = &body.body {
+            headers.push(("Content-Length".to_string(), body.len().to_string()));
+        }
+        let _ = cx;
+        headers
+    }
+
+    fn render_http_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let kind = self.http_auth.kind;
+        let panel = cx.entity().downgrade();
+        let trigger = Button::new("http-auth-trigger", kind.label())
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+            .style(ButtonStyle::Subtle)
+            .tooltip(Tooltip::text("Authorization type"));
+        let menu = PopoverMenu::new("http-auth-menu")
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for candidate in HttpAuthType::ALL {
+                        let menu_panel = panel.clone();
+                        let is_active = candidate == kind;
+                        menu = menu.item(
+                            ui::ContextMenuEntry::new(candidate.label())
+                                .toggleable(ui::IconPosition::Start, is_active)
+                                .handler(move |_window: &mut Window, cx: &mut App| {
+                                    if let Some(panel) = menu_panel.upgrade() {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.http_auth.kind = candidate;
+                                            panel.persist_http_settings(cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        );
+                    }
+                    menu
+                }))
+            })
+            .anchor(Anchor::BottomLeft)
+            .trigger(trigger);
+
+        let mut fields = v_flex().id("http-auth-fields").w_full().gap_1();
+        if let Some(editors) = self.http_builder.as_ref() {
+            match kind {
+                HttpAuthType::None => {
+                    fields = fields.child(
+                        Label::new("This request does not use authorization.")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted),
+                    );
+                }
+                HttpAuthType::ApiKey => {
+                    fields = fields
+                        .child(dialog_row("Key", dialog_editor(
+                            "http-auth-key-name",
+                            &editors.auth_api_key_name,
+                            None,
+                            window,
+                            cx,
+                        )))
+                        .child(dialog_row("Value", dialog_editor(
+                            "http-auth-key-value",
+                            &editors.auth_api_key_value,
+                            None,
+                            window,
+                            cx,
+                        )))
+                        .child(dialog_row(
+                            "Add to",
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("http-auth-key-header", "Header")
+                                        .size(ButtonSize::Compact)
+                                        .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .style(if self.http_auth.api_key_in == ApiKeyLocation::Header {
+                                            ButtonStyle::Filled
+                                        } else {
+                                            ButtonStyle::Subtle
+                                        })
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                            this.http_auth.api_key_in = ApiKeyLocation::Header;
+                                            this.persist_http_settings(cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("http-auth-key-query", "Query")
+                                        .size(ButtonSize::Compact)
+                                        .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .style(if self.http_auth.api_key_in == ApiKeyLocation::Query {
+                                            ButtonStyle::Filled
+                                        } else {
+                                            ButtonStyle::Subtle
+                                        })
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                            this.http_auth.api_key_in = ApiKeyLocation::Query;
+                                            this.persist_http_settings(cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .into_any_element(),
+                        ));
+                }
+                HttpAuthType::Basic => {
+                    fields = fields
+                        .child(dialog_row("Username", dialog_editor(
+                            "http-auth-username",
+                            &editors.auth_username,
+                            None,
+                            window,
+                            cx,
+                        )))
+                        .child(dialog_row("Password", dialog_editor(
+                            "http-auth-password",
+                            &editors.auth_password,
+                            None,
+                            window,
+                            cx,
+                        )));
+                }
+                HttpAuthType::Bearer => {
+                    fields = fields.child(dialog_row("Token", dialog_editor(
+                        "http-auth-token",
+                        &editors.auth_token,
+                        None,
+                        window,
+                        cx,
+                    )));
+                }
+                HttpAuthType::OAuth2 => {
+                    fields = fields.child(
+                        Label::new("OAuth 2.0 fields are not implemented; no auth header is sent.")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted),
+                    );
+                }
+            }
+        }
+        v_flex()
+            .id("http-auth")
+            .w_full()
+            .gap_2()
+            .child(section_header("Authorization", cx))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Label::new("Auth type")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted)
+                            .flex_none(),
+                    )
+                    .child(menu),
+            )
+            .child(fields)
+            .into_any_element()
+    }
+
+    fn render_http_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let mut modes = h_flex().w_full().items_center().gap_1();
+        for mode in HttpBodyKind::ALL {
+            let selected = self.http_body_kind == mode;
+            modes = modes.child(
+                Button::new(("http-body-mode", mode as usize), mode.label())
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(if selected {
+                        ButtonStyle::Filled
+                    } else {
+                        ButtonStyle::Subtle
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.http_body_kind = mode;
+                        this.persist_http_settings(cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut content = v_flex().w_full().gap_1();
+        if let Some(editors) = self.http_builder.as_ref() {
+            match self.http_body_kind {
+                HttpBodyKind::None => {
+                    content = content.child(
+                        Label::new("This request has no body.")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted),
+                    );
+                }
+                HttpBodyKind::Raw => {
+                    let panel = cx.entity().downgrade();
+                    let active = self.http_raw_content_type;
+                    let trigger = Button::new("http-raw-content-type", active.label())
+                        .size(ButtonSize::Compact)
+                        .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .style(ButtonStyle::Subtle)
+                        .tooltip(Tooltip::text("Raw body content type"));
+                    let menu = PopoverMenu::new("http-raw-content-type-menu")
+                        .menu(move |window, cx| {
+                            let panel = panel.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                for candidate in RawContentType::ALL {
+                                    let menu_panel = panel.clone();
+                                    let is_active = candidate == active;
+                                    menu = menu.item(
+                                        ui::ContextMenuEntry::new(candidate.label())
+                                            .toggleable(ui::IconPosition::Start, is_active)
+                                            .handler(move |_window: &mut Window, cx: &mut App| {
+                                                if let Some(panel) = menu_panel.upgrade() {
+                                                    panel.update(cx, |panel, cx| {
+                                                        panel.http_raw_content_type = candidate;
+                                                        panel.persist_http_settings(cx);
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            }),
+                                    );
+                                }
+                                menu
+                            }))
+                        })
+                        .anchor(Anchor::BottomLeft)
+                        .trigger(trigger);
+                    content = content
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Label::new("Content-Type")
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Muted),
+                                )
+                                .child(menu),
+                        )
+                        .child(
+                            div()
+                                .id("http-raw-body-editor")
+                                .w_full()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(colors.border_variant)
+                                .bg(colors.editor_background)
+                                .px_2()
+                                .py_1()
+                                .cursor_text()
+                                .child(dialog_editor_element(&editors.raw_body, cx)),
+                        );
+                }
+                HttpBodyKind::FormData | HttpBodyKind::UrlEncoded => {
+                    content = content.child(
+                        self.render_http_pair_table(HttpPairKind::BodyFields, window, cx),
+                    );
+                }
+            }
+        }
+        v_flex()
+            .id("http-body")
+            .w_full()
+            .gap_2()
+            .child(section_header("Body", cx))
+            .child(modes)
+            .child(content)
+            .into_any_element()
+    }
+
+    fn render_http_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editors) = self.http_builder.as_ref() else {
+            return div().into_any_element();
+        };
+        let timeout_editor = editors.timeout.clone();
+        let follow = self.http_follow_redirects;
+        let verify = self.http_verify_tls;
+        v_flex()
+            .id("http-settings")
+            .w_full()
+            .gap_2()
+            .child(section_header("Settings", cx))
+            .child(
+                dialog_toggle_with(
+                    "http-follow-redirects",
+                    follow,
+                    "Follow redirects",
+                    None,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.http_follow_redirects = !this.http_follow_redirects;
+                    this.persist_http_settings(cx);
+                    cx.notify();
+                })),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .min_h(px(28.))
+                    .child(
+                        Label::new("Timeout (seconds)")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted)
+                            .flex_none(),
+                    )
+                    .child(div().w(px(80.)).child(dialog_editor(
+                        "http-timeout",
+                        &timeout_editor,
+                        Some(px(80.)),
+                        window,
+                        cx,
+                    ))),
+            )
+            .child(
+                dialog_toggle_with("http-verify-tls", verify, "Verify TLS", None, cx)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.http_verify_tls = !this.http_verify_tls;
+                        this.persist_http_settings(cx);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_http_response(
+        &mut self,
+        response: &HttpProbeResponse,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let status_color = response_status_color(response.status);
+        let content_type = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone());
+        let body_text = if self.http_response_pretty {
+            pretty_body(&response.body, content_type.as_deref())
+        } else {
+            response.body.clone()
+        };
+        let mut header_rows = response
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .h(px(22.))
+                    .gap_2()
+                    .child(
+                        Label::new(name.clone())
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted)
+                            .flex_none(),
+                    )
+                    .child(
+                        Label::new(value.clone())
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .truncate(),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        if header_rows.is_empty() {
+            header_rows.push(
+                Label::new("no response headers")
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
+        }
+        let body_active = self.http_response_tab == HttpResponseTab::Body;
+        let headers_active = self.http_response_tab == HttpResponseTab::Headers;
+        let panel = cx.entity().downgrade();
+        let pretty_toggle = Checkbox::new(
+            "http-response-pretty",
+            if self.http_response_pretty {
+                ToggleState::Selected
+            } else {
+                ToggleState::Unselected
+            },
+        )
+        .label("Pretty")
+        .on_click(move |_state, _window, cx| {
+            if let Some(panel) = panel.upgrade() {
+                let _ = panel.update(cx, |this, cx| {
+                    this.http_response_pretty = !this.http_response_pretty;
+                    cx.notify();
+                });
+            }
+        });
+
+        v_flex()
+            .id("http-response")
+            .w_full()
+            .flex_none()
+            .border_t_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .id("http-response-status")
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(colors.element_hover)
+                            .child(
+                                Label::new(format!("HTTP {}", response.status))
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(status_color),
+                            ),
+                    )
+                    .child(
+                        Label::new(format!("{} ms", response.time_ms))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("{} B", response.body.len()))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(pretty_toggle),
+            )
+            .child(
+                h_flex()
+                    .id("http-response-tabs")
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(
+                        h_flex()
+                            .id("http-response-tab-body")
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .when(body_active, |this| {
+                                this.border_b_2().border_color(colors.border_focused)
+                            })
+                            .child(
+                                Label::new("Body")
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(if body_active {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    }),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.http_response_tab = HttpResponseTab::Body;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .id("http-response-tab-headers")
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .when(headers_active, |this| {
+                                this.border_b_2().border_color(colors.border_focused)
+                            })
+                            .child(
+                                Label::new("Headers")
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(if headers_active {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    }),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.http_response_tab = HttpResponseTab::Headers;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("http-response-content")
+                    .w_full()
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .bg(colors.editor_background)
+                    .px_2()
+                    .py_1()
+                    .children(if body_active {
+                        vec![
+                            Label::new(body_text)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .color(Color::Default)
+                                .into_any_element(),
+                        ]
+                    } else {
+                        header_rows
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn send_http_builder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.http_builder_busy {
             return;
         }
-        let method_text = self.http_method.clone();
         self.ensure_http_editors(window, cx);
-        let editors = self.http_builder.as_ref().expect("http editors");
-        let url = Self::http_editor_text(&editors.url, cx).trim().to_string();
+        self.sync_http_state_from_editors(cx);
+        if self.http_url_from_rows {
+            self.schedule_http_editor_sync(window, cx);
+        }
+        let url = self.current_http_url(cx).trim().to_string();
         if url.is_empty() {
             self.saved_message = Some("failed: URL is empty".to_string());
             cx.notify();
             return;
         }
-        let method = match Method::from_bytes(method_text.as_bytes()) {
-            Ok(method) => method,
-            Err(_) => {
-                self.saved_message = Some(format!("failed: bad method {method_text}"));
-                cx.notify();
-                return;
-            }
-        };
-        let headers = Self::http_editor_text(&editors.headers, cx)
-            .lines()
-            .filter_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                let name = name.trim();
-                if name.is_empty() {
-                    return None;
-                }
-                Some((name.to_string(), value.trim().to_string()))
-            })
-            .collect::<Vec<_>>();
-        let body = if self.http_body_mode == HttpBodyMode::Form {
-            let pairs = editors
-                .form_pairs
-                .iter()
-                .filter_map(|(name, value)| {
-                    let name = Self::http_editor_text(name, cx).trim().to_string();
-                    let value = Self::http_editor_text(value, cx);
-                    if name.is_empty() {
-                        None
-                    } else {
-                        Some((name, value))
-                    }
-                })
-                .collect::<Vec<_>>();
-            serde_json::to_string(
-                &pairs
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), Value::String(value.clone())))
-                    .collect::<std::collections::BTreeMap<&str, Value>>(),
-            )
-            .unwrap_or_else(|_| "{}".to_string())
-        } else {
-            Self::http_editor_text(&editors.body, cx)
-        };
+        let method_text = self.http_method.clone();
+        let boundary = multipart_boundary();
+        let composed = compose_http_request(
+            &url,
+            &self.http_headers,
+            &self.http_auth,
+            self.http_body_kind,
+            self.http_raw_content_type,
+            &self.http_raw_body,
+            &self.http_body_fields,
+            &boundary,
+        );
+        self.persist_http_settings(cx);
 
-        let mut headers = headers;
-        if self.http_body_mode == HttpBodyMode::Form
-            && !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        {
-            headers.push(("Content-Type".to_string(), "application/json".to_string()));
-        }
+        let method = method_text;
+        let timeout = self.http_timeout_secs.max(1);
+        let follow = self.http_follow_redirects;
+        let verify = self.http_verify_tls;
+        let headers = composed.headers.clone();
+        let body = composed.body.clone();
+        let request_url = composed.url.clone();
 
         self.http_builder_busy = true;
         self.http_builder_response = None;
         cx.notify();
 
-        let client: std::sync::Arc<dyn HttpClient> = std::sync::Arc::new(ReqwestClient::new());
-
         let task = cx.background_spawn(async move {
-            let mut request = http_client::Request::builder().method(method).uri(&url);
-            for (name, value) in headers.iter() {
-                request = request.header(name.as_str(), value.as_str());
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "phpworkbench-http-{}-{}",
+                std::process::id(),
+                nanos
+            ));
+            std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+            let file = dir.join("request.http");
+            let contents = format!("### ad-hoc\n{} {}\n", method, request_url);
+            std::fs::write(&file, contents).map_err(|error| error.to_string())?;
+            let body_file = dir.join("body.bin");
+            if let Some(body) = &body {
+                std::fs::write(&body_file, body.as_bytes()).map_err(|error| error.to_string())?;
             }
-            let body = if body.trim().is_empty() {
-                AsyncBody::empty()
-            } else {
-                AsyncBody::from(body.into_bytes())
-            };
-            let request = match request.body(body) {
-                Ok(request) => request,
-                Err(error) => return Err(format!("{error}")),
-            };
+
+            let mut command = std::process::Command::new("php-http");
+            command
+                .arg("run")
+                .arg(&file)
+                .arg("--name")
+                .arg("ad-hoc")
+                .arg("--json")
+                .arg("--timeout")
+                .arg(timeout.to_string());
+            if follow {
+                command.arg("--follow");
+            }
+            if !verify {
+                command.arg("--insecure");
+            }
+            for (name, value) in &headers {
+                command.arg("--header").arg(format!("{name}: {value}"));
+            }
+            if body.is_some() {
+                command.arg("--raw").arg(&body_file);
+            }
+
             let started = std::time::Instant::now();
-            let response = match client.send(request).await {
-                Ok(response) => response,
-                Err(error) => return Err(format!("{error}")),
-            };
-            let status = response.status().as_u16();
-            let headers = response
-                .headers()
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_string(),
-                        value.to_str().unwrap_or_default().to_string(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let body_bytes = {
-                use futures::AsyncReadExt as _;
-                let mut body = response.into_body();
-                let mut bytes = Vec::new();
-                if let Err(error) = body.read_to_end(&mut bytes).await {
-                    return Err(format!("failed to read response body: {error}"));
+            let output = command.output();
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let _ = std::fs::remove_dir_all(&dir);
+            match output {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let value: Value = serde_json::from_str(&stdout)
+                        .map_err(|_| {
+                            first_non_empty_line(stdout.lines())
+                                .unwrap_or_else(|| "invalid JSON response".to_string())
+                        })?;
+                    let status = value
+                        .get("status")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u16;
+                    let body = value
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let headers = value
+                        .get("headers")
+                        .and_then(Value::as_object)
+                        .map(|object| {
+                            object
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.clone(),
+                                        value.as_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    Ok(HttpProbeResponse {
+                        status,
+                        time_ms: elapsed_ms,
+                        headers,
+                        body,
+                    })
                 }
-                bytes
-            };
-            let time_ms = started.elapsed().as_millis() as u64;
-            let body = String::from_utf8_lossy(&body_bytes).to_string();
-            Ok(HttpProbeResponse {
-                status,
-                time_ms,
-                headers,
-                body,
-            })
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "request failed".to_string()))
+                }
+                Err(error) => Err(error.to_string()),
+            }
         });
 
         cx.spawn(async move |this, cx| {
@@ -14424,6 +15877,10 @@ impl PhpPanel {
                 match result {
                     Ok(response) => {
                         let status = response.status;
+                        if let Some(request) = this.http_active_request.as_ref() {
+                            this.http_status
+                                .insert(http_request_key(request), HttpStatus::Response(response.clone()));
+                        }
                         this.http_builder_response = Some(response);
                         this.saved_message = if (200..400).contains(&status) {
                             Some(format!("request finished: HTTP {status}"))
@@ -14441,6 +15898,380 @@ impl PhpPanel {
         })
         .detach();
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpRequestDetail {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+fn parse_http_request_detail(contents: &str, name: &str) -> Option<HttpRequestDetail> {
+    let mut section_name: Option<String> = None;
+    let mut section_lines: Vec<&str> = Vec::new();
+    let mut found: Option<Vec<&str>> = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("###") {
+            if let Some(current) = section_name.take() {
+                if current.trim() == name {
+                    found = Some(std::mem::take(&mut section_lines));
+                    break;
+                }
+            }
+            section_name = Some(rest.trim().to_string());
+            section_lines.clear();
+        } else {
+            section_lines.push(line);
+        }
+    }
+    if found.is_none() {
+        if let Some(current) = section_name {
+            if current.trim() == name {
+                found = Some(section_lines);
+            }
+        }
+    }
+    let lines = found?;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with("//")
+            || line.starts_with('@')
+        {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    let (method, url) = parse_request_line(lines.get(index)?.trim())?;
+    index += 1;
+    let mut headers = Vec::new();
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if line.is_empty() {
+            index += 1;
+            break;
+        }
+        if line.starts_with('#') || line.starts_with("//") {
+            index += 1;
+            continue;
+        }
+        match line.split_once(':') {
+            Some((key, value)) if !key.trim().is_empty() => {
+                headers.push((key.trim().to_string(), value.trim().to_string()));
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+    let body = lines[index..].join("\n").trim_end().to_string();
+    Some(HttpRequestDetail {
+        method,
+        url,
+        headers,
+        body,
+    })
+}
+
+fn url_encode_component(input: &str) -> String {
+    let mut out = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn url_decode_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &input[i + 1..i + 3];
+                match u8::from_str_radix(hex, 16) {
+                    Ok(value) => {
+                        out.push(value);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_url_query(url: &str) -> (String, Vec<KeyValueRow>) {
+    let (before_fragment, fragment) = match url.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (url, None),
+    };
+    let (base, query) = match before_fragment.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (before_fragment, None),
+    };
+    let mut rows = Vec::new();
+    if let Some(query) = query {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            rows.push(KeyValueRow::new(
+                url_decode_component(key),
+                url_decode_component(value),
+            ));
+        }
+    }
+    let base = match fragment {
+        Some(fragment) => format!("{base}#{fragment}"),
+        None => base.to_string(),
+    };
+    (base, rows)
+}
+
+fn serialize_url_query(base: &str, rows: &[KeyValueRow]) -> String {
+    let (before_fragment, fragment) = match base.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (base, None),
+    };
+    let base = before_fragment.split('?').next().unwrap_or(before_fragment);
+    let pairs = rows
+        .iter()
+        .filter(|row| row.enabled && !row.key.trim().is_empty())
+        .map(|row| {
+            format!(
+                "{}={}",
+                url_encode_component(row.key.trim()),
+                url_encode_component(&row.value)
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut url = base.to_string();
+    if !pairs.is_empty() {
+        url.push('?');
+        url.push_str(&pairs.join("&"));
+    }
+    if let Some(fragment) = fragment {
+        url.push('#');
+        url.push_str(fragment);
+    }
+    url
+}
+
+fn auth_headers(auth: &HttpAuthSettings) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    match auth.kind {
+        HttpAuthType::ApiKey
+            if auth.api_key_in == ApiKeyLocation::Header && !auth.api_key_name.trim().is_empty() =>
+        {
+            vec![(
+                auth.api_key_name.trim().to_string(),
+                auth.api_key_value.clone(),
+            )]
+        }
+        HttpAuthType::Basic => {
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", auth.username, auth.password));
+            vec![("Authorization".to_string(), format!("Basic {encoded}"))]
+        }
+        HttpAuthType::Bearer if !auth.token.trim().is_empty() => vec![(
+            "Authorization".to_string(),
+            format!("Bearer {}", auth.token.trim()),
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn auth_query(auth: &HttpAuthSettings) -> Option<(String, String)> {
+    if auth.kind == HttpAuthType::ApiKey
+        && auth.api_key_in == ApiKeyLocation::Query
+        && !auth.api_key_name.trim().is_empty()
+    {
+        Some((
+            auth.api_key_name.trim().to_string(),
+            auth.api_key_value.clone(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn encode_urlencoded(rows: &[KeyValueRow]) -> String {
+    rows.iter()
+        .filter(|row| row.enabled && !row.key.trim().is_empty())
+        .map(|row| {
+            format!(
+                "{}={}",
+                url_encode_component(row.key.trim()),
+                url_encode_component(&row.value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn build_multipart(rows: &[KeyValueRow], boundary: &str) -> String {
+    let mut out = String::new();
+    for row in rows
+        .iter()
+        .filter(|row| row.enabled && !row.key.trim().is_empty())
+    {
+        out.push_str("--");
+        out.push_str(boundary);
+        out.push_str("\r\n");
+        out.push_str(&format!(
+            "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+            row.key.trim()
+        ));
+        out.push_str(&row.value);
+        out.push_str("\r\n");
+    }
+    out.push_str("--");
+    out.push_str(boundary);
+    out.push_str("--\r\n");
+    out
+}
+
+fn multipart_boundary() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("----phpworkbench-{nanos:x}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposedRequest {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+    content_type: Option<String>,
+}
+
+fn compose_http_request(
+    url: &str,
+    headers: &[KeyValueRow],
+    auth: &HttpAuthSettings,
+    body_kind: HttpBodyKind,
+    raw_content_type: RawContentType,
+    raw_body: &str,
+    body_fields: &[KeyValueRow],
+    boundary: &str,
+) -> ComposedRequest {
+    let mut composed_url = url.to_string();
+    if let Some((key, value)) = auth_query(auth) {
+        let separator = if composed_url.contains('?') { '&' } else { '?' };
+        composed_url.push(separator);
+        composed_url.push_str(&url_encode_component(&key));
+        composed_url.push('=');
+        composed_url.push_str(&url_encode_component(&value));
+    }
+
+    let mut composed_headers = headers
+        .iter()
+        .filter(|row| row.enabled && !row.key.trim().is_empty())
+        .map(|row| (row.key.trim().to_string(), row.value.clone()))
+        .collect::<Vec<_>>();
+    composed_headers.extend(auth_headers(auth));
+
+    let (body, content_type) = match body_kind {
+        HttpBodyKind::None => (None, None),
+        HttpBodyKind::Raw => {
+            let body = (!raw_body.is_empty()).then(|| raw_body.to_string());
+            (body, Some(raw_content_type.mime().to_string()))
+        }
+        HttpBodyKind::FormData => (
+            Some(build_multipart(body_fields, boundary)),
+            Some(format!("multipart/form-data; boundary={boundary}")),
+        ),
+        HttpBodyKind::UrlEncoded => (
+            Some(encode_urlencoded(body_fields)),
+            Some("application/x-www-form-urlencoded".to_string()),
+        ),
+    };
+
+    let has_content_type = composed_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    if !has_content_type {
+        if let Some(content_type) = &content_type {
+            composed_headers.push(("Content-Type".to_string(), content_type.clone()));
+        }
+    }
+
+    ComposedRequest {
+        url: composed_url,
+        headers: composed_headers,
+        body,
+        content_type,
+    }
+}
+
+fn http_settings_path(root: &Path) -> PathBuf {
+    root.join(".zed/http-settings.json")
+}
+
+fn load_http_settings(root: &Path) -> HttpSettingsFile {
+    std::fs::read_to_string(http_settings_path(root))
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn save_http_settings(root: &Path, settings: &HttpSettingsFile) -> Result<()> {
+    let path = http_settings_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(settings)?;
+    std::fs::write(path, format!("{text}\n"))?;
+    Ok(())
+}
+
+fn response_status_color(status: u16) -> Color {
+    match status {
+        200..=299 => Color::Success,
+        300..=399 => Color::Accent,
+        400..=499 => Color::Warning,
+        _ => Color::Error,
+    }
+}
+
+fn pretty_body(body: &str, content_type: Option<&str>) -> String {
+    let looks_json = content_type
+        .map(|content_type| content_type.to_ascii_lowercase().contains("json"))
+        .unwrap_or(false)
+        || body.trim_start().starts_with('{')
+        || body.trim_start().starts_with('[');
+    if looks_json {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            return serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_string());
+        }
+    }
+    body.to_string()
 }
 
 const HTTP_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
@@ -14602,8 +16433,8 @@ fn remote_protocol_badge(protocol: &str, cx: &App) -> gpui::AnyElement {
         .rounded_sm()
         .bg(cx.theme().colors().element_hover)
         .child(
-            Label::new(format!("{} ", protocol))
-                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+            Label::new(protocol.to_string())
+                .size(LabelSize::Custom(Rems(0.625)))
                 .color(Color::Muted),
         )
         .into_any_element()
@@ -14630,6 +16461,37 @@ fn empty_row(message: &'static str) -> gpui::AnyElement {
                 .size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .color(Color::Muted),
         )
+        .into_any_element()
+}
+
+fn empty_state(
+    icon: IconName,
+    title: impl Into<SharedString>,
+    hint: impl Into<SharedString>,
+    _cx: &App,
+) -> gpui::AnyElement {
+    let title: SharedString = title.into();
+    let hint: SharedString = hint.into();
+    v_flex()
+        .w_full()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .py_8()
+        .px_3()
+        .child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted))
+        .child(
+            Label::new(title)
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                .color(Color::Default),
+        )
+        .when(!hint.is_empty(), |this| {
+            this.child(
+                Label::new(hint)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .color(Color::Muted),
+            )
+        })
         .into_any_element()
 }
 
@@ -15341,6 +17203,245 @@ mod tests {
         assert_eq!(views[0].columns.len(), 1);
         assert!(views[0].columns[0].primary_key);
         assert!(parse_database_views(r#"{"views":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn http_query_rows_round_trip_through_url() {
+        let url = "https://example.test/search?q=hello%20world&tag=a%26b&empty=";
+        let (base, rows) = parse_url_query(url);
+        assert_eq!(base, "https://example.test/search");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].key, "q");
+        assert_eq!(rows[0].value, "hello world");
+        assert_eq!(rows[1].value, "a&b");
+        let rebuilt = serialize_url_query(&base, &rows);
+        let (base2, rows2) = parse_url_query(&rebuilt);
+        assert_eq!(base, base2);
+        assert_eq!(rows, rows2);
+    }
+
+    #[test]
+    fn http_query_serialization_skips_disabled_and_empty_keys() {
+        let rows = vec![
+            KeyValueRow::new("a", "1"),
+            KeyValueRow {
+                enabled: false,
+                key: "b".to_string(),
+                value: "2".to_string(),
+            },
+            KeyValueRow::new("", "ignored"),
+        ];
+        assert_eq!(
+            serialize_url_query("https://x.test/path", &rows),
+            "https://x.test/path?a=1"
+        );
+        assert_eq!(serialize_url_query("https://x.test/path", &[]), "https://x.test/path");
+    }
+
+    #[test]
+    fn http_auth_maps_to_headers_and_query() {
+        let basic = HttpAuthSettings {
+            kind: HttpAuthType::Basic,
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            ..HttpAuthSettings::default()
+        };
+        assert_eq!(
+            auth_headers(&basic),
+            vec![(
+                "Authorization".to_string(),
+                "Basic dXNlcjpwYXNz".to_string()
+            )]
+        );
+        let bearer = HttpAuthSettings {
+            kind: HttpAuthType::Bearer,
+            token: "tok".to_string(),
+            ..HttpAuthSettings::default()
+        };
+        assert_eq!(
+            auth_headers(&bearer),
+            vec![("Authorization".to_string(), "Bearer tok".to_string())]
+        );
+        let api_key_header = HttpAuthSettings {
+            kind: HttpAuthType::ApiKey,
+            api_key_name: "X-Api-Key".to_string(),
+            api_key_value: "secret".to_string(),
+            api_key_in: ApiKeyLocation::Header,
+            ..HttpAuthSettings::default()
+        };
+        assert_eq!(
+            auth_headers(&api_key_header),
+            vec![("X-Api-Key".to_string(), "secret".to_string())]
+        );
+        let api_key_query = HttpAuthSettings {
+            api_key_in: ApiKeyLocation::Query,
+            ..api_key_header
+        };
+        assert_eq!(
+            auth_query(&api_key_query),
+            Some(("X-Api-Key".to_string(), "secret".to_string()))
+        );
+        assert!(auth_headers(&api_key_query).is_empty());
+    }
+
+    #[test]
+    fn http_body_modes_serialize() {
+        let fields = vec![KeyValueRow::new("a b", "1+2"), KeyValueRow::new("x", "y")];
+        assert_eq!(encode_urlencoded(&fields), "a%20b=1%2B2&x=y");
+        let multipart = build_multipart(&fields, "BOUNDARY");
+        assert!(multipart.contains("Content-Disposition: form-data; name=\"a b\""));
+        assert!(multipart.contains("--BOUNDARY--\r\n"));
+        let raw = compose_http_request(
+            "https://x.test",
+            &[],
+            &HttpAuthSettings::default(),
+            HttpBodyKind::Raw,
+            RawContentType::Json,
+            "{\"a\":1}",
+            &[],
+            "B",
+        );
+        assert_eq!(raw.body.as_deref(), Some("{\"a\":1}"));
+        assert!(raw
+            .headers
+            .contains(&("Content-Type".to_string(), "application/json".to_string())));
+        let none = compose_http_request(
+            "https://x.test",
+            &[],
+            &HttpAuthSettings::default(),
+            HttpBodyKind::None,
+            RawContentType::Json,
+            "ignored",
+            &[],
+            "B",
+        );
+        assert!(none.body.is_none());
+    }
+
+    #[test]
+    fn http_compose_applies_api_key_query_and_keeps_explicit_content_type() {
+        let auth = HttpAuthSettings {
+            kind: HttpAuthType::ApiKey,
+            api_key_name: "key".to_string(),
+            api_key_value: "v".to_string(),
+            api_key_in: ApiKeyLocation::Query,
+            ..HttpAuthSettings::default()
+        };
+        let headers = vec![KeyValueRow::new("Content-Type", "text/custom")];
+        let composed = compose_http_request(
+            "https://x.test/p?a=1",
+            &headers,
+            &auth,
+            HttpBodyKind::Raw,
+            RawContentType::Json,
+            "{}",
+            &[],
+            "B",
+        );
+        assert_eq!(composed.url, "https://x.test/p?a=1&key=v");
+        assert_eq!(
+            composed
+                .headers
+                .iter()
+                .filter(|(name, _)| name == "Content-Type")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn http_settings_round_trip_through_json() {
+        let mut file = HttpSettingsFile::default();
+        let mut settings = HttpRequestSettings {
+            method: "POST".to_string(),
+            url: "https://x.test?a=1".to_string(),
+            subtab: Some(HttpSubTab::Body),
+            params: vec![KeyValueRow::new("a", "1")],
+            auth: HttpAuthSettings {
+                kind: HttpAuthType::Bearer,
+                token: "t".to_string(),
+                ..HttpAuthSettings::default()
+            },
+            headers: vec![KeyValueRow::new("Accept", "application/json")],
+            body_kind: HttpBodyKind::Raw,
+            raw_content_type: RawContentType::Json,
+            raw_body: "{\"a\":1}".to_string(),
+            body_fields: vec![KeyValueRow::new("f", "v")],
+            follow_redirects: true,
+            timeout_secs: 12,
+            verify_tls: false,
+        };
+        file.requests.insert(
+            http_settings_key("requests.http", "Create"),
+            settings.clone(),
+        );
+        let json = serde_json::to_string(&file).expect("serialize settings");
+        let decoded: HttpSettingsFile = serde_json::from_str(&json).expect("deserialize settings");
+        assert_eq!(decoded.requests.len(), 1);
+        assert_eq!(
+            decoded
+                .requests
+                .get(&http_settings_key("requests.http", "Create")),
+            Some(&settings)
+        );
+        assert_eq!(settings.subtab, Some(HttpSubTab::Body));
+        assert!(!settings.verify_tls);
+    }
+
+    #[test]
+    fn http_settings_save_and_load_round_trip() {
+        let root = temp_root("http_settings_round_trip");
+        let mut file = HttpSettingsFile::default();
+        file.requests.insert(
+            http_settings_key("a.http", "R"),
+            HttpRequestSettings {
+                url: "http://127.0.0.1/".to_string(),
+                ..HttpRequestSettings::default()
+            },
+        );
+        save_http_settings(&root, &file).expect("save settings");
+        let loaded = load_http_settings(&root);
+        assert_eq!(loaded, file);
+        std::fs::write(http_settings_path(&root), "not json").expect("break settings");
+        assert!(load_http_settings(&root).requests.is_empty());
+        std::fs::remove_dir_all(&root).expect("clean temporary project root");
+    }
+
+    #[test]
+    fn http_response_status_and_pretty_body() {
+        assert!(matches!(response_status_color(204), Color::Success));
+        assert!(matches!(response_status_color(301), Color::Accent));
+        assert!(matches!(response_status_color(404), Color::Warning));
+        assert!(matches!(response_status_color(500), Color::Error));
+        assert_eq!(
+            pretty_body("{\"b\":2,\"a\":1}", Some("application/json")),
+            "{\n  \"b\": 2,\n  \"a\": 1\n}"
+        );
+        assert_eq!(pretty_body("plain", Some("text/plain")), "plain");
+    }
+
+    #[test]
+    fn http_request_detail_parses_headers_and_body() {
+        let contents = "\
+### Create
+POST https://example.test/users
+Content-Type: application/json
+X-Test: 1
+
+{\"name\":\"Ada\"}
+";
+        let detail = parse_http_request_detail(contents, "Create").expect("detail");
+        assert_eq!(detail.method, "POST");
+        assert_eq!(detail.url, "https://example.test/users");
+        assert_eq!(
+            detail.headers,
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("X-Test".to_string(), "1".to_string())
+            ]
+        );
+        assert_eq!(detail.body, "{\"name\":\"Ada\"}");
+        assert!(parse_http_request_detail(contents, "Missing").is_none());
     }
 
     #[test]
