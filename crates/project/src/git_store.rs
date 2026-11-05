@@ -8490,6 +8490,53 @@ impl Repository {
         })
     }
 
+    pub fn stash_files(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Vec<git::stash::StashFile>>> {
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, _| {
+                this.send_job("stash_files", None, move |git_repo, _cx| async move {
+                    match git_repo {
+                        RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                            backend.stash_files(index).await
+                        }
+                        RepositoryState::Remote(_) => {
+                            anyhow::bail!(
+                                "stash file listing is not supported for remote repositories"
+                            )
+                        }
+                    }
+                })
+            })?
+            .await?
+        })
+    }
+
+    pub fn stash_file_content(
+        &mut self,
+        index: usize,
+        path: String,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Vec<u8>>> {
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, _| {
+                this.send_job("stash_file_content", None, move |git_repo, _cx| async move {
+                    match git_repo {
+                        RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                            backend.stash_file_content(index, &path).await
+                        }
+                        RepositoryState::Remote(_) => {
+                            anyhow::bail!("reading stash file content is not supported for remote repositories")
+                        }
+                    }
+                })
+            })?
+            .await?
+        })
+    }
+
     pub fn add_path_to_gitignore(
         &mut self,
         repo_path: &RepoPath,

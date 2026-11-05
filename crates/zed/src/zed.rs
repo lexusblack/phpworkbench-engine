@@ -503,17 +503,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let window_handle = window.window_handle();
         let multi_workspace_handle = cx.entity();
 
-        cx.defer(move |cx| {
-            window_handle
-                .update(cx, |_, window, cx| {
-                    let sidebar =
-                        cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
-                    multi_workspace_handle.update(cx, |multi_workspace, cx| {
-                        multi_workspace.register_sidebar(sidebar, cx);
-                    });
-                })
-                .ok();
-        });
+        // Threads sidebar disabled (PhpStorm-like single-window layout).
     })
     .detach();
 

@@ -11,6 +11,94 @@ pub struct StashEntry {
     pub timestamp: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StashFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+impl StashFileStatus {
+    pub fn from_status_code(code: &str) -> Option<Self> {
+        match code.chars().next()? {
+            'A' | 'C' => Some(Self::Added),
+            'M' | 'T' | 'U' => Some(Self::Modified),
+            'D' => Some(Self::Deleted),
+            'R' => Some(Self::Renamed),
+            _ => None,
+        }
+    }
+
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Modified => "M",
+            Self::Deleted => "D",
+            Self::Renamed => "R",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct StashFile {
+    pub status: StashFileStatus,
+    pub path: String,
+    pub old_path: Option<String>,
+}
+
+/// Parse `git stash show --name-status` output into changed files.
+pub fn parse_stash_files(output: &str) -> Vec<StashFile> {
+    output.lines().filter_map(parse_stash_file_line).collect()
+}
+
+fn parse_stash_file_line(line: &str) -> Option<StashFile> {
+    let mut parts = line.split('\t');
+    let code = parts.next()?.trim();
+    let status = StashFileStatus::from_status_code(code)?;
+    let first_path = unquote_git_path(parts.next()?);
+
+    if matches!(status, StashFileStatus::Renamed) {
+        let new_path = parts.next().map(unquote_git_path)?;
+        Some(StashFile {
+            status,
+            path: new_path,
+            old_path: Some(first_path),
+        })
+    } else {
+        Some(StashFile {
+            status,
+            path: first_path,
+            old_path: None,
+        })
+    }
+}
+
+fn unquote_git_path(path: &str) -> String {
+    let Some(inner) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
+        return path.to_string();
+    };
+
+    let mut result = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            result.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => result.push('\n'),
+            Some('t') => result.push('\t'),
+            Some('r') => result.push('\r'),
+            Some('\\') => result.push('\\'),
+            Some('"') => result.push('"'),
+            Some(other) => result.push(other),
+            None => break,
+        }
+    }
+    result
+}
+
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct GitStash {
     pub entries: Arc<[StashEntry]>,
@@ -210,6 +298,22 @@ mod tests {
         assert_eq!(stash.entries[0].branch, Some("main".to_string()));
         assert_eq!(stash.entries[1].index, 1);
         assert_eq!(stash.entries[1].branch, Some("feature".to_string()));
+    }
+
+    #[test]
+    fn test_parse_stash_files_name_status() {
+        let parsed = parse_stash_files(
+            "M\tbackend/controllers/A.php\nA\tnewfile.txt\nD\told.txt\nR100\told/name.rs\tnew/name.rs\n",
+        );
+
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].status, StashFileStatus::Modified);
+        assert_eq!(parsed[0].path, "backend/controllers/A.php");
+        assert_eq!(parsed[1].status, StashFileStatus::Added);
+        assert_eq!(parsed[2].status, StashFileStatus::Deleted);
+        assert_eq!(parsed[3].status, StashFileStatus::Renamed);
+        assert_eq!(parsed[3].path, "new/name.rs");
+        assert_eq!(parsed[3].old_path.as_deref(), Some("old/name.rs"));
     }
 
     #[test]

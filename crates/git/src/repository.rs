@@ -847,6 +847,19 @@ pub trait GitRepository: Send + Sync {
 
     fn stash_entries(&self) -> BoxFuture<'static, Result<GitStash>>;
 
+    /// Lists the files changed by the stash at `index`, including untracked
+    /// files when git supports reporting them.
+    fn stash_files(&self, index: usize) -> BoxFuture<'_, Result<Vec<crate::stash::StashFile>>> {
+        let _ = index;
+        async { Ok(Vec::new()) }.boxed()
+    }
+
+    /// Loads the raw content of `path` as recorded in the stash at `index`.
+    fn stash_file_content(&self, index: usize, path: &str) -> BoxFuture<'_, Result<Vec<u8>>> {
+        let _ = (index, path);
+        async { anyhow::bail!("loading stash file content is unsupported") }.boxed()
+    }
+
     fn check_access(&self) -> BoxFuture<'_, Result<()>> {
         async move { Ok(()) }.boxed()
     }
@@ -2154,6 +2167,68 @@ impl GitRepository for RealGitRepository {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("git status failed: {stderr}");
                 }
+            })
+            .boxed()
+    }
+
+    fn stash_files(&self, index: usize) -> BoxFuture<'_, Result<Vec<crate::stash::StashFile>>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                let stash_ref = format!("stash@{{{index}}}");
+
+                let include_untracked = git
+                    .build_command(&[
+                        "stash",
+                        "show",
+                        "--include-untracked",
+                        "--name-status",
+                        stash_ref.as_str(),
+                        "--",
+                    ])
+                    .output()
+                    .await?;
+
+                let output = if include_untracked.status.success() {
+                    include_untracked
+                } else {
+                    git.build_command(&["stash", "show", "--name-status", stash_ref.as_str(), "--"])
+                        .output()
+                        .await?
+                };
+
+                anyhow::ensure!(
+                    output.status.success(),
+                    "git stash show failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+
+                Ok(crate::stash::parse_stash_files(&String::from_utf8_lossy(
+                    &output.stdout,
+                )))
+            })
+            .boxed()
+    }
+
+    fn stash_file_content(&self, index: usize, path: &str) -> BoxFuture<'_, Result<Vec<u8>>> {
+        let git = self.git_binary_in_worktree();
+        let path = path.to_string();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                let object = format!("stash@{{{index}}}:{path}");
+                let output = git
+                    .build_command(&["show", object.as_str()])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "git show {} failed: {}",
+                    object,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(output.stdout)
             })
             .boxed()
     }
