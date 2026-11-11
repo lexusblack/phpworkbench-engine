@@ -24,6 +24,14 @@ use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
 
+const fn platform_tooltip(macos: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        macos
+    } else {
+        other
+    }
+}
+
 pub enum PanelEvent {
     ZoomIn,
     ZoomOut,
@@ -1373,7 +1381,7 @@ impl Dock {
             .child(self.render_stripe_button(
                 "left-stripe-commit",
                 ui::IconName::GitCommit,
-                "Commit & Changes (⌘0)",
+                platform_tooltip("Commit & Changes (⌘0)", "Commit & Changes (Alt+0)"),
                 is_git_active,
                 {
                     let is_active = is_git_active;
@@ -1393,7 +1401,7 @@ impl Dock {
             .child(self.render_stripe_button(
                 "left-stripe-project",
                 ui::IconName::Folder,
-                "Project (⌘1)",
+                platform_tooltip("Project (⌘1)", "Project (Alt+1)"),
                 is_project_active,
                 {
                     let is_active = is_project_active;
@@ -1413,7 +1421,7 @@ impl Dock {
             .child(self.render_stripe_button(
                 "left-stripe-structure",
                 ui::IconName::ListTree,
-                "Structure (⌘7)",
+                platform_tooltip("Structure (⌘7)", "Structure (Alt+7)"),
                 is_outline_active,
                 {
                     let is_active = is_outline_active;
@@ -1482,7 +1490,7 @@ impl Dock {
             .child(self.render_stripe_button(
                 "left-stripe-terminal",
                 ui::IconName::Terminal,
-                "Terminal (⌥F12)",
+                platform_tooltip("Terminal (⌥F12)", "Terminal (Alt+F12)"),
                 is_terminal_active,
                 |_, window, cx| {
                     window.dispatch_action(Box::new(crate::ToggleBottomDock), cx);
@@ -1493,7 +1501,7 @@ impl Dock {
             .child(self.render_stripe_button(
                 "left-stripe-problems",
                 ui::IconName::Warning,
-                "Problems / Diagnostics (⌘6)",
+                platform_tooltip("Problems / Diagnostics (⌘6)", "Problems / Diagnostics (Alt+6)"),
                 false,
                 |_, window, cx| {
                     if let Ok(action) = cx.build_action("diagnostics::Deploy", None) {
@@ -1506,7 +1514,7 @@ impl Dock {
             .child(self.render_stripe_button(
                 "left-stripe-git-log",
                 ui::IconName::GitBranch,
-                "Git Log & Branches (⌘9)",
+                platform_tooltip("Git Log & Branches (⌘9)", "Git Log & Branches (Alt+9)"),
                 false,
                 {
                     let git_action = git_panel_ix
@@ -1668,7 +1676,7 @@ impl Dock {
             .child(self.render_right_stripe_button(
                 "stripe-database",
                 Icon::from_path("icons/file_icons/database_stripe.svg"),
-                "Database (⌘1)",
+                "Database",
                 is_database_active,
                 make_click_handler("databases", is_database_active),
                 cx,
