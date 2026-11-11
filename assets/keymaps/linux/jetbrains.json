@@ -4,7 +4,7 @@
       "ctrl-alt-s": "zed::OpenSettings",
       "ctrl-{": "pane::ActivatePreviousItem",
       "ctrl-}": "pane::ActivateNextItem",
-      "shift-escape": null, // Unmap workspace::zoom
+      "shift-escape": "workspace::CloseActiveDock",
       "ctrl-~": "git::Branch",
       "ctrl-f2": "debugger::Stop",
       "f6": "debugger::Pause",
@@ -132,6 +132,7 @@
       "ctrl-alt-shift-n": "project_symbols::Toggle",
       "alt-0": "git_panel::ToggleFocus",
       "alt-1": "project_panel::ToggleFocus",
+      "f12": "workspace::JumpToLastToolWindow",
       "alt-5": "debug_panel::ToggleFocus",
       "alt-6": "diagnostics::Deploy",
       "alt-7": "outline_panel::ToggleFocus",
@@ -207,9 +208,9 @@
     },
   },
   {
-    "context": "Dock || Workspace || OutlinePanel || ProjectPanel || CollabPanel",
+    "context": "Dock || Workspace || OutlinePanel || ProjectPanel || CollabPanel || PhpPanel",
     "bindings": {
-      "escape": "editor::ToggleFocus",
+      "escape": "workspace::FocusActiveEditor",
       "shift-escape": "workspace::CloseActiveDock",
     },
   },

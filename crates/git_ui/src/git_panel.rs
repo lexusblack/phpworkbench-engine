@@ -95,7 +95,7 @@ use strum::{IntoEnumIterator, VariantNames};
 use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{
-    ButtonLike, Checkbox, Chip, ContextMenu, ContextMenuEntry, Divider, DocumentationSide,
+    ButtonLike, Checkbox, Chip, ContextMenu, ContextMenuEntry, DocumentationSide,
     ElevationIndex, IndentGuideColors, KeyBinding, PopoverMenu, PopoverMenuHandle,
     ProjectEmptyState, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar,
     prelude::*,
@@ -6788,8 +6788,7 @@ impl GitPanel {
         SplitButton::new(
             ButtonLike::new_rounded_left("git-changes-actions-split-button-left")
                 .layer(ElevationIndex::ModalSurface)
-                .size(ButtonSize::Compact)
-                .child(Label::new(text).size(LabelSize::Small).mr_0p5())
+                .child(Label::new(text).size(LabelSize::Default).mr_0p5())
                 .tooltip(Tooltip::for_action_title_in(
                     tooltip,
                     action.as_ref(),
@@ -6841,12 +6840,12 @@ impl GitPanel {
                                 .gap_1()
                                 .child(
                                     Icon::new(IconName::Diff)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::default())
                                         .color(Color::Muted),
                                 )
                                 .child(
                                     Label::new("View Diff")
-                                        .size(LabelSize::Small)
+                                        .size(LabelSize::Default)
                                         .color(Color::Muted),
                                 )
                                 .when(
@@ -6910,12 +6909,11 @@ impl GitPanel {
 
         let update = ButtonLike::new("phpstorm-toolbar-update")
             .layer(ElevationIndex::ModalSurface)
-            .size(ButtonSize::Compact)
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Icon::new(IconName::ArrowDown).size(IconSize::Small))
-                    .child(Label::new("Update").size(LabelSize::Small))
+                    .child(Icon::new(IconName::ArrowDown).size(IconSize::default()))
+                    .child(Label::new("Update").size(LabelSize::Default))
                     .when(behind > 0, |this| {
                         this.child(counter(format!("↓{behind}"), Color::Info))
                     }),
@@ -6931,12 +6929,11 @@ impl GitPanel {
 
         let commit = ButtonLike::new("phpstorm-toolbar-commit")
             .layer(ElevationIndex::ModalSurface)
-            .size(ButtonSize::Compact)
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Icon::new(IconName::GitCommit).size(IconSize::Small))
-                    .child(Label::new("Commit").size(LabelSize::Small)),
+                    .child(Icon::new(IconName::GitCommit).size(IconSize::default()))
+                    .child(Label::new("Commit").size(LabelSize::Default)),
             )
             .tooltip(Tooltip::for_action_title_in(
                 "Commit changes",
@@ -6951,12 +6948,11 @@ impl GitPanel {
         let repository_for_push = repository.clone();
         let push = ButtonLike::new("phpstorm-toolbar-push")
             .layer(ElevationIndex::ModalSurface)
-            .size(ButtonSize::Compact)
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Icon::new(IconName::ExpandUp).size(IconSize::Small))
-                    .child(Label::new("Push").size(LabelSize::Small))
+                    .child(Icon::new(IconName::ExpandUp).size(IconSize::default()))
+                    .child(Label::new("Push").size(LabelSize::Default))
                     .when(ahead > 0, |this| {
                         this.child(counter(format!("↑{ahead}"), Color::Success))
                     }),
@@ -7241,11 +7237,10 @@ impl GitPanel {
             .child(SplitButton::new(
                 ButtonLike::new_rounded_left(format!("split-button-left-{}", title))
                     .layer(ElevationIndex::ModalSurface)
-                    .size(ButtonSize::Compact)
                     .disabled(!can_commit || self.modal_open)
                     .child(
                         Label::new(title)
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Default)
                             .color(label_color)
                             .mr_0p5(),
                     )
@@ -7440,22 +7435,43 @@ impl GitPanel {
                 .cursor_pointer()
                 .id(id)
                 .h_full()
+                .items_center()
+                .justify_center()
                 .py_1()
                 .gap_1()
                 .flex_1()
-                .justify_center()
-                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                .border_b_1()
-                .when(!active, |s| {
-                    s.bg(cx.theme().colors().editor_background.opacity(0.6))
-                        .border_color(cx.theme().colors().border.opacity(0.6))
+                .hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.5)))
+                .when(active, |this| {
+                    this.border_b_2()
+                        .border_color(cx.theme().colors().border_focused)
                 })
-                .child(Label::new(label.clone()).when(!active, |this| this.color(Color::Muted)))
+                .when(!active, |this| {
+                    this.border_b_2()
+                        .border_color(gpui::transparent_black())
+                })
+                .child(
+                    Label::new(label.clone())
+                        .size(LabelSize::Default)
+                        .color(if active { Color::Default } else { Color::Muted })
+                        .when(active, |this| this.weight(FontWeight::MEDIUM)),
+                )
                 .when(show_changes && self.changes_count > 0, |this| {
                     this.child(
-                        Label::new(format!("({})", self.changes_count))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .px_1p5()
+                            .py(px(1.))
+                            .rounded_full()
+                            .bg(if active {
+                                cx.theme().colors().border_focused.opacity(0.18)
+                            } else {
+                                cx.theme().colors().element_hover.opacity(0.8)
+                            })
+                            .child(
+                                Label::new(self.changes_count.to_string())
+                                    .size(LabelSize::Custom(Rems(0.725)))
+                                    .weight(FontWeight::SEMIBOLD)
+                                    .color(if active { Color::Accent } else { Color::Muted }),
+                            ),
                     )
                 })
                 .tooltip(Tooltip::for_action_title_in(
@@ -7472,6 +7488,9 @@ impl GitPanel {
             .relative()
             .h(Tab::container_height(cx))
             .w_full()
+            .bg(cx.theme().colors().tab_bar_background)
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
             .child(tab(
                 ElementId::Name("changes-tab".into()),
                 active_tab == GitPanelTab::Changes,
@@ -7480,11 +7499,6 @@ impl GitPanel {
                 GitPanelTab::Changes,
                 ActivateChangesTab.boxed_clone(),
             ))
-            .child(
-                Divider::vertical()
-                    .color(ui::DividerColor::BorderFaded)
-                    .h_full(),
-            )
             .child(tab(
                 ElementId::Name("history-tab".into()),
                 active_tab == GitPanelTab::History,
@@ -7493,11 +7507,6 @@ impl GitPanel {
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
             ))
-            .child(
-                Divider::vertical()
-                    .color(ui::DividerColor::BorderFaded)
-                    .h_full(),
-            )
             .child(tab(
                 ElementId::Name("stash-tab".into()),
                 active_tab == GitPanelTab::Stash,
@@ -9446,8 +9455,17 @@ impl GitPanel {
         let marked = self.marked_entries.contains(&entry.repo_path);
         let status_style = settings.status_style;
         let status = entry.status;
-        let file_icon = if settings.file_icons {
-            FileIcons::get_icon(entry.repo_path.as_std_path(), cx)
+        let show_file_icons = settings.file_icons;
+        let file_icon = if show_file_icons {
+            let is_dir = repo
+                .work_directory_abs_path
+                .join(entry.repo_path.as_std_path())
+                .is_dir();
+            if is_dir {
+                FileIcons::get_folder_icon(false, entry.repo_path.as_std_path(), cx)
+            } else {
+                FileIcons::get_icon(entry.repo_path.as_std_path(), cx)
+            }
         } else {
             None
         };
@@ -9457,7 +9475,7 @@ impl GitPanel {
         let is_deleted = status.is_deleted();
         let is_created = status.is_created();
 
-        let label_color = if status_style == StatusStyle::LabelColor {
+        let label_color = if status_style == StatusStyle::LabelColor || show_file_icons {
             if has_conflict {
                 Color::VersionControlConflict
             } else if is_created {
@@ -9533,12 +9551,12 @@ impl GitPanel {
             .min_w_0()
             .flex_1()
             .gap_1()
-            .when(settings.file_icons, |this| {
-                let icon = file_icon
-                    .map(Icon::from_path)
-                    .unwrap_or_else(|| Icon::new(IconName::File))
-                    .size(IconSize::Small)
-                    .color(Color::Muted);
+            .when(show_file_icons, |this| {
+                let icon = if let Some(path) = file_icon {
+                    Icon::from_path(path).size(IconSize::Small)
+                } else {
+                    Icon::new(IconName::File).size(IconSize::Small).color(Color::Muted)
+                };
                 let reserves_chevron_slot =
                     tree_view && folder_indicator.shows_chevron() && folder_indicator.shows_icon();
                 if reserves_chevron_slot {
@@ -9558,7 +9576,7 @@ impl GitPanel {
                     this.child(icon)
                 }
             })
-            .when(status_style != StatusStyle::LabelColor, |el| {
+            .when(status_style != StatusStyle::LabelColor && !show_file_icons, |el| {
                 el.child(git_status_icon(status))
             })
             .map(|this| {
@@ -10609,7 +10627,7 @@ impl RenderOnce for PanelRepoFooter {
             .trigger_with_tooltip(
                 Button::new("repo-selector", active_repo_name)
                     .size(ButtonSize::None)
-                    .label_size(LabelSize::Small)
+                    .label_size(LabelSize::Default)
                     .truncate(true),
                 move |_, cx| {
                     if single_repo {
@@ -10628,7 +10646,7 @@ impl RenderOnce for PanelRepoFooter {
 
         let branch_selector_button = Button::new("branch-selector", branch_name)
             .size(ButtonSize::None)
-            .label_size(LabelSize::Small)
+            .label_size(LabelSize::Default)
             .truncate(true)
             .on_click(|_, window, cx| {
                 window.dispatch_action(zed_actions::git::Switch.boxed_clone(), cx);

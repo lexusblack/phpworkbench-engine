@@ -63,8 +63,8 @@ impl Settings for GitPanelSettings {
             button: git_panel.button.unwrap(),
             dock: git_panel.dock.unwrap().into(),
             default_width: git_panel.default_width.unwrap().into_gpui(),
-            status_style: git_panel.status_style.unwrap(),
-            file_icons: git_panel.file_icons.unwrap(),
+            status_style: git_panel.status_style.unwrap_or(StatusStyle::LabelColor),
+            file_icons: git_panel.file_icons.unwrap_or(true),
             folder_indicator: git_panel.folder_indicator.unwrap(),
             scrollbar: ScrollbarSettings {
                 show: git_panel

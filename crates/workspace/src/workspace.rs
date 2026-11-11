@@ -418,6 +418,10 @@ actions!(
         CloseAllDocks,
         /// Toggles all docks.
         ToggleAllDocks,
+        /// Jumps to the last active tool window.
+        JumpToLastToolWindow,
+        /// Focuses the active editor pane/item from anywhere (e.g. on Escape).
+        FocusActiveEditor,
         /// Closes the current window.
         CloseWindow,
         /// Closes the current project.
@@ -1636,6 +1640,7 @@ pub struct Workspace {
     session_id: Option<String>,
     scheduled_tasks: Vec<Task<()>>,
     last_open_dock_positions: Vec<DockPosition>,
+    pub last_active_dock: Option<DockPosition>,
     removing: bool,
     open_in_dev_container: bool,
     _dev_container_task: Option<Task<Result<()>>>,
@@ -2145,6 +2150,7 @@ impl Workspace {
 
             scheduled_tasks: Vec::new(),
             last_open_dock_positions: Vec::new(),
+            last_active_dock: None,
             removing: false,
             sidebar_focus_handle: None,
             multi_workspace,
@@ -4585,6 +4591,7 @@ impl Workspace {
         });
 
         if reveal_dock {
+            self.last_active_dock = Some(dock_side);
             self.dismiss_zoomed_items_to_reveal(Some(dock_side), window, cx);
         }
 
@@ -4603,12 +4610,13 @@ impl Workspace {
         })
     }
 
-    fn close_active_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub fn close_active_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if let Some(dock) = self.active_dock(window, cx).cloned() {
             self.save_open_dock_positions(cx);
             dock.update(cx, |dock, cx| {
                 dock.set_open(false, window, cx);
             });
+            self.focus_active_editor(window, cx);
             return true;
         }
         false
@@ -4686,6 +4694,32 @@ impl Workspace {
         cx.focus_self(window);
         cx.notify();
         self.serialize_workspace(window, cx);
+    }
+
+    /// Focuses the active editor pane/item from anywhere in the window.
+    pub fn focus_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active_pane = self.active_pane.clone();
+        active_pane.update(cx, |pane, cx| {
+            pane.focus_active_item(window, cx);
+        });
+    }
+
+    /// Jumps focus to the last active tool window, opening it if it was closed.
+    pub fn jump_to_last_tool_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let position = self.last_active_dock.unwrap_or(DockPosition::Left);
+        let dock = self.dock_at_position(position);
+        if !dock.read(cx).is_open() {
+            self.toggle_dock(position, window, cx);
+        } else {
+            dock.update(cx, |dock, cx| {
+                if let Some(active_panel) = dock.active_panel() {
+                    let focus_handle = active_panel.activation_focus_handle(cx);
+                    window.focus(&focus_handle, cx);
+                } else {
+                    window.focus(&dock.focus_handle(cx), cx);
+                }
+            });
+        }
     }
 
     /// Transfer focus to the panel of the given type.
@@ -4866,7 +4900,7 @@ impl Workspace {
             .unwrap_or_else(|| self.active_pane.read(cx).focus_handle(cx))
     }
 
-    fn dismiss_zoomed_items_to_reveal(
+    pub(crate) fn dismiss_zoomed_items_to_reveal(
         &mut self,
         dock_to_reveal: Option<DockPosition>,
         window: &mut Window,
@@ -8237,6 +8271,12 @@ impl Workspace {
                 }),
             )
             .on_action(cx.listener(Self::toggle_all_docks))
+            .on_action(cx.listener(|this, _: &FocusActiveEditor, window, cx| {
+                this.focus_active_editor(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpToLastToolWindow, window, cx| {
+                this.jump_to_last_tool_window(window, cx);
+            }))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ClearAllNotifications, _, cx| {
                     workspace.clear_all_notifications(cx);
@@ -8724,7 +8764,12 @@ impl Workspace {
                     let size = size_state
                         .and_then(|state| state.size)
                         .unwrap_or_else(|| panel.default_size(window, cx));
-                    container = container.w(size);
+                    let total_size = if position == DockPosition::Left || position == DockPosition::Right {
+                        size + px(38.0)
+                    } else {
+                        size
+                    };
+                    container = container.w(total_size);
                     // Allow the fixed-width dock to shrink when there isn't
                     // enough space (e.g. when the sidebar is open). The
                     // stored size is preserved so the dock expands back
@@ -8733,7 +8778,12 @@ impl Workspace {
                     style.flex_shrink = Some(1.0);
                 }
                 if let Some(min) = min_size {
-                    container = container.min_w(min);
+                    let min_total = if position == DockPosition::Left || position == DockPosition::Right {
+                        min + px(38.0)
+                    } else {
+                        min
+                    };
+                    container = container.min_w(min_total);
                 }
             } else {
                 let size = size_state
@@ -8741,6 +8791,8 @@ impl Workspace {
                     .unwrap_or_else(|| panel.default_size(window, cx));
                 container = container.h(size);
             }
+        } else if position == DockPosition::Left || position == DockPosition::Right {
+            container = container.w(px(38.0)).h_full();
         }
 
         Some(container)

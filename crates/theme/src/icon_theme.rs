@@ -66,12 +66,91 @@ pub struct IconDefinition {
 }
 
 const FILE_STEMS_BY_ICON_KEY: &[(&str, &[&str])] = &[
-    ("docker", &["Containerfile", "Dockerfile", ".dockerignore"]),
+    (
+        "vcs",
+        &[
+            ".gitignore",
+            ".gitattributes",
+            ".gitmodules",
+            ".gitkeep",
+            "gitignore",
+            "gitattributes",
+            "gitmodules",
+            "gitkeep",
+        ],
+    ),
+    (
+        "docker",
+        &[
+            "Containerfile",
+            "Dockerfile",
+            ".dockerignore",
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+        ],
+    ),
+    (
+        "gitlab",
+        &[
+            ".gitlab-ci.yml",
+            ".gitlab-ci.yaml",
+            "gitlab-ci.yml",
+            "gitlab-ci.yaml",
+        ],
+    ),
     ("ruby", &["Podfile"]),
     ("heroku", &["Procfile"]),
+    (
+        "php",
+        &[
+            "composer.json",
+            "composer.lock",
+            "composer.phar",
+            "artisan",
+            "rector.php",
+            "requirements.php",
+        ],
+    ),
+    ("lock", &["composer.lock"]),
+    (
+        "settings",
+        &[
+            ".htaccess",
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.development",
+            ".env.staging",
+            ".env.testing",
+            ".env.example",
+        ],
+    ),
+    (
+        "terminal",
+        &[
+            "yii",
+            "yiic",
+            "gradlew",
+            "init",
+            "init.bat",
+            "sync.sh",
+            "get.sh",
+            "deploy.sh",
+            "copy_files.sh",
+            "scan_resources.sh",
+        ],
+    ),
 ];
 
 const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
+    (
+        "archive",
+        &[
+            "7z", "apk", "bz2", "gz", "iso", "jar", "rar", "tar", "tgz", "war", "xz", "zip",
+        ],
+    ),
     ("astro", &["astro"]),
     (
         "audio",
@@ -174,8 +253,8 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     (
         "image",
         &[
-            "avif", "bmp", "gif", "heic", "heif", "ico", "j2k", "jfif", "jp2", "jpeg", "jpg",
-            "jxl", "png", "psd", "qoi", "svg", "tiff", "webp",
+            "avif", "bmp", "gif", "heic", "heif", "icns", "ico", "j2k", "jfif", "jp2", "jpeg",
+            "jpg", "jxl", "png", "psd", "qoi", "svg", "tiff", "webp",
         ],
     ),
     ("ipynb", &["ipynb"]),
@@ -195,7 +274,12 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("nix", &["nix"]),
     ("ocaml", &["ml", "mli", "mlx"]),
     ("odin", &["odin"]),
-    ("php", &["php"]),
+    (
+        "php",
+        &[
+            "php", "phtml", "phar", "php4", "php5", "php7", "php8", "phps", "ctp",
+        ],
+    ),
     (
         "prettier",
         &[
@@ -229,9 +313,9 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     (
         "storage",
         &[
-            "accdb", "csv", "dat", "db", "dbf", "dll", "fmp", "fp7", "frm", "gdb", "ib", "ldf",
-            "mdb", "mdf", "myd", "myi", "pdb", "psv", "RData", "rdata", "sav", "sdf", "sql",
-            "sqlite", "ssv", "tsv",
+            "accdb", "csv", "dat", "db", "db3", "dbf", "dll", "fmp", "fp7", "frm", "gdb", "ib",
+            "ldf", "mdb", "mdf", "myd", "myi", "pdb", "psv", "RData", "rdata", "sav", "sdf",
+            "sql", "sqlite", "sqlite3", "ssv", "tsv",
         ],
     ),
     (
@@ -264,7 +348,10 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
             "bash_logout",
             "bash_profile",
             "bashrc",
+            "bat",
             "brushrc",
+            "cmd",
+            "command",
             "fish",
             "nu",
             "profile",
@@ -312,6 +399,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
 
 /// A mapping of a file type identifier to its corresponding icon.
 const FILE_ICONS: &[(&str, &str)] = &[
+    ("archive", "icons/file_icons/archive.svg"),
     ("astro", "icons/file_icons/astro.svg"),
     ("audio", "icons/file_icons/audio.svg"),
     ("ballerina", "icons/file_icons/ballerina.svg"),

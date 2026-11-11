@@ -53,7 +53,7 @@ pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod phpstorm;
 pub mod project_diff;
-mod push_dialog;
+pub mod push_dialog;
 pub(crate) mod remote_output;
 pub mod repository_selector;
 pub mod solo_diff_view;
@@ -1260,18 +1260,17 @@ mod remote_button {
 
         let left = ButtonLike::new_rounded_left(format!("split-button-left-{}", id))
             .layer(ElevationIndex::ModalSurface)
-            .size(ButtonSize::Compact)
             .disabled(is_in_progress)
             .when(should_render_counts, |this| {
                 this.child(
                     h_flex()
                         .ml_neg_0p5()
                         .when(behind_count > 0, |this| {
-                            this.child(Icon::new(IconName::ArrowDown).size(IconSize::XSmall))
+                            this.child(Icon::new(IconName::ArrowDown).size(IconSize::Small))
                                 .child(count(behind_count))
                         })
                         .when(ahead_count > 0, |this| {
-                            this.child(Icon::new(IconName::ArrowUp).size(IconSize::XSmall))
+                            this.child(Icon::new(IconName::ArrowUp).size(IconSize::Small))
                                 .child(count(ahead_count))
                         }),
                 )
@@ -1281,18 +1280,18 @@ mod remote_button {
                     if is_in_progress {
                         this.child(
                             Icon::new(IconName::LoadCircle)
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(Color::Disabled)
                                 .with_rotate_animation(2),
                         )
                     } else {
-                        this.child(Icon::new(left_icon).size(IconSize::XSmall))
+                        this.child(Icon::new(left_icon).size(IconSize::Small))
                     }
                 })
             })
             .child(
                 Label::new(left_label)
-                    .size(LabelSize::Small)
+                    .size(LabelSize::Default)
                     .when(is_in_progress, |this| this.color(Color::Disabled))
                     .mr_0p5(),
             )

@@ -4,7 +4,7 @@
       "cmd-{": "pane::ActivatePreviousItem",
       "cmd-}": "pane::ActivateNextItem",
       "cmd-0": "git_panel::ToggleFocus", // overrides `cmd-0` zoom reset
-      "shift-escape": null, // Unmap workspace::zoom
+      "shift-escape": "workspace::CloseActiveDock",
       "cmd-~": "git::Branch",
       "ctrl-f2": "debugger::Stop",
       "f6": "debugger::Pause",
@@ -135,6 +135,8 @@
       "cmd-alt-o": "project_symbols::Toggle", // JetBrains: Go to Symbol
       "cmd-o": "project_symbols::Toggle", // JetBrains: Go to Class
       "cmd-1": "project_panel::ToggleFocus",
+      "cmd-0": "git_panel::ToggleFocus",
+      "f12": "workspace::JumpToLastToolWindow",
       "cmd-5": "debug_panel::ToggleFocus",
       "cmd-6": "diagnostics::Deploy",
       "cmd-7": "outline_panel::ToggleFocus",
@@ -211,9 +213,9 @@
     },
   },
   {
-    "context": "Dock || Workspace || OutlinePanel || ProjectPanel || CollabPanel",
+    "context": "Dock || Workspace || OutlinePanel || ProjectPanel || CollabPanel || PhpPanel",
     "bindings": {
-      "escape": "editor::ToggleFocus",
+      "escape": "workspace::FocusActiveEditor",
       "shift-escape": "workspace::CloseActiveDock",
     },
   },

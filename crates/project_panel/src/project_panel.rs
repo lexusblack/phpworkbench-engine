@@ -1189,6 +1189,28 @@ impl ProjectPanel {
             };
 
             let has_pasteable_content = self.has_pasteable_content(cx);
+            let (active_deploy_server, has_deploy_servers) = if cx.has_global::<php_panel::DeployShared>() {
+                let shared = cx.global::<php_panel::DeployShared>();
+                let active = shared.active.clone().or_else(|| shared.servers.first().cloned());
+                (active, !shared.servers.is_empty())
+            } else {
+                let deploy_json = worktree.abs_path().join(".zed/deploy.json");
+                if let Ok(contents) = std::fs::read_to_string(&deploy_json) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
+                        let active = val.get("active").and_then(|v| v.as_str()).map(str::to_string)
+                            .or_else(|| val.get("servers").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|s| s.get("name")).and_then(|v| v.as_str()).map(str::to_string));
+                        let has_servers = val.get("servers").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
+                        (active, has_servers)
+                    } else {
+                        (None, false)
+                    }
+                } else {
+                    (None, false)
+                }
+            };
+            let deploy_file_abs = worktree.abs_path().join(entry.path.as_ref()).to_string_lossy().replace('\\', "/");
+            let deploy_file_rel = entry.path.to_string().replace('\\', "/");
+
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
@@ -1222,6 +1244,57 @@ impl ProjectPanel {
                                         abs_path: sqlite_file_abs_path.clone(),
                                     }),
                                 )
+                            })
+                            .when(has_deploy_servers, |menu| {
+                                let s_label = active_deploy_server.as_deref().unwrap_or("Server").to_string();
+                                let abs = deploy_file_abs.clone();
+                                let rel = deploy_file_rel.clone();
+                                let srv = active_deploy_server.clone();
+                                menu.separator()
+                                    .action(
+                                        format!("Upload to {s_label}"),
+                                        Box::new(php_panel::UploadToDeployServer {
+                                            abs_path: Some(abs.clone()),
+                                            rel_path: Some(rel.clone()),
+                                            server: srv.clone(),
+                                        }),
+                                    )
+                                    .submenu("Deployment", move |menu, _, _| {
+                                        let mut sub = menu
+                                            .action(
+                                                format!("Upload to {s_label}"),
+                                                Box::new(php_panel::UploadToDeployServer {
+                                                    abs_path: Some(abs.clone()),
+                                                    rel_path: Some(rel.clone()),
+                                                    server: srv.clone(),
+                                                }),
+                                            )
+                                            .action(
+                                                format!("Download from {s_label}"),
+                                                Box::new(php_panel::DownloadFromDeployServer {
+                                                    abs_path: Some(abs.clone()),
+                                                    rel_path: Some(rel.clone()),
+                                                    server: srv.clone(),
+                                                }),
+                                            );
+                                        if !is_dir {
+                                            sub = sub.action(
+                                                format!("Compare with Deployed on {s_label}"),
+                                                Box::new(php_panel::CompareWithDeployServer {
+                                                    abs_path: Some(abs.clone()),
+                                                    rel_path: Some(rel.clone()),
+                                                    server: srv.clone(),
+                                                }),
+                                            );
+                                        }
+                                        sub.action(
+                                            format!("Sync with {s_label}…"),
+                                            Box::new(php_panel::SyncWithDeployServer {
+                                                rel_path: Some(rel.clone()),
+                                                server: srv.clone(),
+                                            }),
+                                        )
+                                    })
                             })
                             .when(is_markdown, |menu| {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))

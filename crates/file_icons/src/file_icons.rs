@@ -39,6 +39,17 @@ impl FileIcons {
         //       override these associations
 
         if let Some(mut typ) = path.file_name().and_then(|typ| typ.to_str()) {
+            if typ.starts_with("docker-compose") {
+                if let Some(icon) = this.get_icon_for_type("docker", cx) {
+                    return Some(icon);
+                }
+            }
+            if typ.starts_with(".gitlab-ci") || typ.starts_with("gitlab-ci") {
+                if let Some(icon) = this.get_icon_for_type("gitlab", cx) {
+                    return Some(icon);
+                }
+            }
+
             // check if file name is in suffixes
             // e.g. catch file named `eslint.config.js` instead of `.eslint.config.js`
             let maybe_path = get_icon_from_suffix(typ);

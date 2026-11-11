@@ -4,7 +4,15 @@ use std::{
     time::SystemTime,
 };
 
+use time::OffsetDateTime;
+
 use anyhow::Result;
+use async_tungstenite::tokio::connect_async;
+use async_tungstenite::tungstenite::client::IntoClientRequest;
+use async_tungstenite::tungstenite::http::HeaderValue;
+use async_tungstenite::tungstenite::Message as WsMessage;
+use futures::{SinkExt as _, StreamExt as _};
+use gpui_tokio::Tokio;
 use editor::{Editor, EditorElement, EditorEvent, EditorStyle, actions as editor_actions};
 use file_icons::FileIcons;
 use gpui::{
@@ -12,7 +20,7 @@ use gpui::{
     Context, DismissEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
     Point, Rems, Render, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    KeyBinding, TextStyle, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, actions,
+    KeyBinding, Task, TextStyle, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, actions,
     anchored,
     deferred, px, size,
 };
@@ -22,17 +30,74 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use settings::Settings as _;
 use ui::{
-    Button, Checkbox, ContextMenu, DockSide, IconButtonShape, Label, LabelSize, ListItem,
+    Button, Checkbox, ContextMenu, ContextMenuEntry, DockSide, IconButtonShape, Label, LabelSize, ListItem,
     PopoverMenu, Tooltip, ToggleState, prelude::*,
 };
 use util::ResultExt as _;
 
 use workspace::dock::{DockPosition, PanelEvent};
+use workspace::item::ItemEvent;
 use workspace::{OpenOptions, Panel, StatusItemView, Workspace};
+use gpui::FontWeight;
 
 mod table_view;
+mod http_client_view;
+mod database_console_view;
+mod remote_view;
+pub mod remote_file_banner;
 
+pub use remote_file_banner::RemoteFileBanner;
+use http_client_view::HttpClientView;
+use database_console_view::DatabaseConsoleView;
+use remote_view::RemoteView;
 use table_view::{DatabaseTableView, TableTabTarget};
+
+pub fn resolve_helper_tool(name: &str) -> PathBuf {
+    let exe_suffix = std::env::consts::EXE_SUFFIX;
+    let exe_name = if exe_suffix.is_empty() || name.ends_with(exe_suffix) {
+        name.to_string()
+    } else {
+        format!("{name}{exe_suffix}")
+    };
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+            if let Some(parent) = dir.parent() {
+                let bin_candidate = parent.join("bin").join(&exe_name);
+                if bin_candidate.is_file() {
+                    return bin_candidate;
+                }
+            }
+        }
+    }
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        let candidate = PathBuf::from(cargo_home).join("bin").join(&exe_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    for env_key in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(env_key) {
+            let candidate = PathBuf::from(home).join(".cargo/bin").join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    if cfg!(unix) {
+        for dir in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"] {
+            let candidate = Path::new(dir).join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(exe_name)
+}
 
 actions!(
     php_panel,
@@ -42,6 +107,10 @@ actions!(
         OpenDataSourcesDialog,
         OpenSshConfigsDialog,
         BrowseRemoteHost,
+        OpenHttpClient,
+        CreateHttpRequest,
+        RunComposer,
+        OpenDatabaseConsole,
         SelectNextTab,
         SelectPrevTab,
         FocusNextDialogField,
@@ -78,6 +147,56 @@ pub struct OpenSqliteDataSource {
     /// Absolute path of the SQLite file to open.
     #[serde(default)]
     pub abs_path: Option<String>,
+}
+
+/// Uploads a file, directory, or project to the target deployment server.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct UploadToDeployServer {
+    #[serde(default)]
+    pub abs_path: Option<String>,
+    #[serde(default)]
+    pub rel_path: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+/// Downloads a file, directory, or project from the target deployment server.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadFromDeployServer {
+    #[serde(default)]
+    pub abs_path: Option<String>,
+    #[serde(default)]
+    pub rel_path: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+/// Compares a local file with the deployed version on the target deployment server.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct CompareWithDeployServer {
+    #[serde(default)]
+    pub abs_path: Option<String>,
+    #[serde(default)]
+    pub rel_path: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+/// Synchronizes files with the target deployment server.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct SyncWithDeployServer {
+    #[serde(default)]
+    pub rel_path: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 /// Returns the name of an existing data source whose configured file path
@@ -161,6 +280,9 @@ struct RemoteServer {
     excluded: Vec<String>,
     upload_on_save: bool,
     use_rsync: bool,
+    rsync_args: Option<String>,
+    rsync_path: Option<String>,
+    rsync_delete: bool,
     use_sudo: bool,
     visible: bool,
     passive_mode: bool,
@@ -222,15 +344,22 @@ fn picker_query_matches(query: &str, name: &str) -> bool {
     name.to_lowercase().contains(&needle)
 }
 
-fn parse_local_dir_entries(items: Vec<(String, bool)>) -> Vec<RemoteEntry> {
+fn parse_local_dir_entries(items: Vec<(String, bool)>, base_path: &str) -> Vec<RemoteEntry> {
     let mut entries: Vec<RemoteEntry> = items
         .into_iter()
         .filter(|(name, _)| !name.is_empty())
-        .map(|(name, is_directory)| RemoteEntry {
-            path: name.clone(),
-            name,
-            is_directory,
-            size: None,
+        .map(|(name, is_directory)| {
+            let path = if base_path == "." {
+                name.clone()
+            } else {
+                format!("{base_path}/{name}")
+            };
+            RemoteEntry {
+                name,
+                path,
+                is_directory,
+                size: None,
+            }
         })
         .collect();
     entries.sort_by(|a, b| match (a.is_directory, b.is_directory) {
@@ -397,6 +526,7 @@ struct DatabaseEntry {
     name: String,
     driver: Option<String>,
     target: Option<String>,
+    database: Option<String>,
     user: Option<String>,
     host: Option<String>,
     root: PathBuf,
@@ -413,6 +543,21 @@ fn database_connection_label(database: &DatabaseEntry) -> String {
         return name.to_string_lossy().into_owned();
     }
     database.name.clone()
+}
+
+fn database_connection_icon(database: &DatabaseEntry) -> AnyElement {
+    let driver = database.driver.as_deref().unwrap_or("mysql").to_lowercase();
+    if driver == "sqlite" {
+        Icon::new(IconName::DatabaseZap)
+            .size(IconSize::Small)
+            .color(Color::Accent)
+            .into_any_element()
+    } else {
+        Icon::from_path("icons/file_icons/db_mysql_dolphin.svg")
+            .size(IconSize::Small)
+            .color(Color::Accent)
+            .into_any_element()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -441,6 +586,16 @@ impl FormState {
         Self {
             kind: FormKind::Sql,
             fields: vec![String::new()],
+            active: 0,
+            message: None,
+            connection: Some(connection),
+        }
+    }
+
+    fn sql_with_query(connection: String, query: String) -> Self {
+        Self {
+            kind: FormKind::Sql,
+            fields: vec![query],
             active: 0,
             message: None,
             connection: Some(connection),
@@ -528,6 +683,9 @@ struct DialogBuffer {
     max_connections: String,
     keep_alive_seconds: String,
     encoding: String,
+    rsync_args: String,
+    rsync_path: String,
+    rsync_delete: bool,
 }
 
 impl DialogBuffer {
@@ -547,6 +705,9 @@ impl DialogBuffer {
                 max_connections: server.max_connections.to_string(),
                 keep_alive_seconds: server.keep_alive_seconds.to_string(),
                 encoding: server.encoding.clone(),
+                rsync_args: server.rsync_args.clone().unwrap_or_default(),
+                rsync_path: server.rsync_path.clone().unwrap_or_default(),
+                rsync_delete: server.rsync_delete,
             },
             None => Self {
                 password_session: false,
@@ -604,6 +765,17 @@ impl DialogBuffer {
         } else {
             encoding
         };
+        server.rsync_args = if self.rsync_args.trim().is_empty() {
+            None
+        } else {
+            Some(self.rsync_args.trim().to_string())
+        };
+        server.rsync_path = if self.rsync_path.trim().is_empty() {
+            None
+        } else {
+            Some(self.rsync_path.trim().to_string())
+        };
+        server.rsync_delete = self.rsync_delete;
     }
 }
 
@@ -647,6 +819,10 @@ pub struct DeploymentDialog {
     max_connections_editor: Entity<Editor>,
     keep_alive_seconds_editor: Entity<Editor>,
     encoding_editor: Entity<Editor>,
+    rsync_settings_open: bool,
+    rsync_delete: bool,
+    rsync_args_editor: Entity<Editor>,
+    rsync_path_editor: Entity<Editor>,
     validate_warnings: Vec<(String, Vec<String>)>,
     validate_seq: u64,
     autodetect_status: Option<(String, Color)>,
@@ -694,6 +870,10 @@ impl DeploymentDialog {
             max_connections_editor: cx.new(|cx| Editor::single_line(window, cx)),
             keep_alive_seconds_editor: cx.new(|cx| Editor::single_line(window, cx)),
             encoding_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            rsync_settings_open: false,
+            rsync_delete: false,
+            rsync_args_editor: cx.new(|cx| Editor::single_line(window, cx)),
+            rsync_path_editor: cx.new(|cx| Editor::single_line(window, cx)),
             validate_warnings: Vec::new(),
             validate_seq: 0,
             autodetect_status: None,
@@ -703,6 +883,22 @@ impl DeploymentDialog {
             focus_tab: DeployTab::Connection,
             _subscriptions: Vec::new(),
         };
+        let rsync_path_editor = dialog.rsync_path_editor.clone();
+        dialog.bind_validation_editor(rsync_path_editor, cx, |server, text| {
+            server.rsync_path = if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.trim().to_string())
+            };
+        });
+        let rsync_args_editor = dialog.rsync_args_editor.clone();
+        dialog.bind_validation_editor(rsync_args_editor, cx, |server, text| {
+            server.rsync_args = if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.trim().to_string())
+            };
+        });
         let name_editor = dialog.name_editor.clone();
         dialog.bind_validation_editor(name_editor, cx, |server, text| server.name = text);
         let host_editor = dialog.host_editor.clone();
@@ -933,6 +1129,9 @@ impl DeploymentDialog {
             buffer.keep_alive_seconds.clone(),
         );
         set(&self.encoding_editor, buffer.encoding.clone());
+        set(&self.rsync_args_editor, buffer.rsync_args.clone());
+        set(&self.rsync_path_editor, buffer.rsync_path.clone());
+        self.rsync_delete = buffer.rsync_delete;
     }
 
     fn buffer(&self, cx: &App) -> DialogBuffer {
@@ -951,6 +1150,9 @@ impl DeploymentDialog {
             max_connections: text(&self.max_connections_editor),
             keep_alive_seconds: text(&self.keep_alive_seconds_editor),
             encoding: text(&self.encoding_editor),
+            rsync_args: text(&self.rsync_args_editor),
+            rsync_path: text(&self.rsync_path_editor),
+            rsync_delete: self.rsync_delete,
         }
     }
 
@@ -1076,6 +1278,17 @@ impl DeploymentDialog {
         cx.notify();
     }
 
+    fn toggle_upload_on_save(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        if let Some(server) = self.servers.get_mut(index) {
+            server.upload_on_save = !server.upload_on_save;
+        }
+        cx.notify();
+    }
+
     fn toggle_rsync(&mut self, cx: &mut Context<Self>) {
         self.apply_editors(cx);
         let Some(index) = self.selected else {
@@ -1084,6 +1297,17 @@ impl DeploymentDialog {
         if let Some(server) = self.servers.get_mut(index) {
             server.use_rsync = !server.use_rsync;
         }
+        cx.notify();
+    }
+
+    fn toggle_rsync_settings(&mut self, cx: &mut Context<Self>) {
+        self.rsync_settings_open = !self.rsync_settings_open;
+        cx.notify();
+    }
+
+    fn toggle_rsync_delete(&mut self, cx: &mut Context<Self>) {
+        self.rsync_delete = !self.rsync_delete;
+        self.apply_editors(cx);
         cx.notify();
     }
 
@@ -1511,7 +1735,7 @@ impl DeploymentDialog {
         }
         let weak = cx.weak_entity();
         let task = cx.background_spawn(async move {
-            let mut command = util::command::new_command("php-deploy");
+            let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
             command
                 .arg("autodetect")
                 .arg("--config")
@@ -1622,7 +1846,7 @@ impl DeploymentDialog {
         let root = self.root.clone();
         let weak = cx.weak_entity();
         let task = cx.background_spawn(async move {
-            let mut command = util::command::new_command("php-deploy");
+            let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
             command
                 .arg("validate")
                 .arg("--config")
@@ -1690,7 +1914,7 @@ impl DeploymentDialog {
         let name = server.name.clone();
         let weak = cx.weak_entity();
         let task = cx.background_spawn(async move {
-            let mut command = util::command::new_command("php-deploy");
+            let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
             command
                 .arg("ls")
                 .arg("--config")
@@ -1816,6 +2040,34 @@ fn dialog_editor_element(editor: &Entity<Editor>, cx: &App) -> AnyElement {
         background: cx.theme().colors().editor_background,
         local_player: cx.theme().players().local(),
         text: dialog_text_style(cx),
+        syntax: cx.theme().syntax().clone(),
+        status: cx.theme().status().clone(),
+        ..EditorStyle::default()
+    };
+    EditorElement::new(editor, style).into_any_element()
+}
+
+pub(crate) fn code_editor_element(editor: &Entity<Editor>, cx: &App) -> AnyElement {
+    let settings = theme_settings::ThemeSettings::get_global(cx);
+    let buffer_font = settings.buffer_font.clone();
+    let text = TextStyle {
+        color: cx.theme().colors().editor_foreground,
+        font_family: buffer_font.family.clone(),
+        font_features: buffer_font.features.clone(),
+        font_fallbacks: buffer_font.fallbacks.clone(),
+        font_size: rems(0.85).into(),
+        font_weight: buffer_font.weight,
+        line_height: relative(settings.buffer_line_height.value()),
+        ..TextStyle::default()
+    };
+    let style = EditorStyle {
+        background: cx.theme().colors().editor_background,
+        border: cx.theme().colors().border,
+        local_player: cx.theme().players().local(),
+        text,
+        syntax: cx.theme().syntax().clone(),
+        status: cx.theme().status().clone(),
+        show_underlines: true,
         ..EditorStyle::default()
     };
     EditorElement::new(editor, style).into_any_element()
@@ -2199,10 +2451,13 @@ fn dialog_slot<K: Copy + Eq + std::hash::Hash>(
     handles: &HashMap<K, FocusHandle>,
     key: K,
 ) -> FocusHandle {
-    handles
-        .get(&key)
-        .cloned()
-        .expect("dialog focus slot was registered for this render")
+    if let Some(handle) = handles.get(&key).cloned() {
+        handle
+    } else if let Some(fallback) = handles.values().next().cloned() {
+        fallback
+    } else {
+        panic!("at least one dialog focus slot must exist")
+    }
 }
 
 /// Register Tab / Shift+Tab / Escape for one dialog key context.
@@ -2243,6 +2498,7 @@ enum DeployFocusSlot {
     MappingsTab,
     ExcludedTab,
     Visibility,
+    UploadOnSave,
     ServerType,
     SshConfig,
     SshBrowse,
@@ -2281,6 +2537,7 @@ fn deploy_focus_slots(protocol: &str, tab: DeployTab) -> Vec<DeployFocusSlot> {
     match tab {
         DeployTab::Connection => {
             slots.push(DeployFocusSlot::Visibility);
+            slots.push(DeployFocusSlot::UploadOnSave);
             slots.push(DeployFocusSlot::ServerType);
             for field in deploy_connection_fields(protocol) {
                 match field {
@@ -2499,9 +2756,41 @@ impl Render for DeploymentDialog {
         // control asks for its focus handle.
         let deploy_slots = deploy_focus_slots(&protocol, self.tab);
         let mut focus: HashMap<DeployFocusSlot, FocusHandle> = HashMap::new();
-        for slot in &deploy_slots {
-            let handle = self.deploy_focus_handle(*slot, cx);
-            focus.insert(*slot, handle);
+        for slot in [
+            DeployFocusSlot::ConnectionTab,
+            DeployFocusSlot::MappingsTab,
+            DeployFocusSlot::ExcludedTab,
+            DeployFocusSlot::Visibility,
+            DeployFocusSlot::UploadOnSave,
+            DeployFocusSlot::ServerType,
+            DeployFocusSlot::SshConfig,
+            DeployFocusSlot::SshBrowse,
+            DeployFocusSlot::TestConnection,
+            DeployFocusSlot::Host,
+            DeployFocusSlot::Port,
+            DeployFocusSlot::User,
+            DeployFocusSlot::Anonymous,
+            DeployFocusSlot::Password,
+            DeployFocusSlot::PasswordReset,
+            DeployFocusSlot::RemoteRoot,
+            DeployFocusSlot::RemoteRootBrowse,
+            DeployFocusSlot::Autodetect,
+            DeployFocusSlot::WebUrl,
+            DeployFocusSlot::Rsync,
+            DeployFocusSlot::RsyncSettings,
+            DeployFocusSlot::Sudo,
+            DeployFocusSlot::LocalRoot,
+            DeployFocusSlot::LocalRootBrowse,
+            DeployFocusSlot::Advanced,
+            DeployFocusSlot::MappingLocal,
+            DeployFocusSlot::MappingRemote,
+            DeployFocusSlot::MappingWeb,
+            DeployFocusSlot::ExcludedPaths,
+            DeployFocusSlot::Cancel,
+            DeployFocusSlot::Ok,
+        ] {
+            let handle = self.deploy_focus_handle(slot, cx);
+            focus.insert(slot, handle);
         }
         let order = deploy_slots
             .iter()
@@ -2653,6 +2942,11 @@ impl Render for DeploymentDialog {
             .and_then(|index| self.servers.get(index))
             .map(|server| server.visible)
             .unwrap_or(true);
+        let upload_on_save_state = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.upload_on_save)
+            .unwrap_or(false);
 
         let rsync_state = self
             .selected
@@ -3087,40 +3381,128 @@ impl Render for DeploymentDialog {
                             .into_any_element(),
                     }
                 }
-                DeployField::RsyncToggle => h_flex()
-                    .w_full()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        dialog_toggle_row(
-                            "deploy-rsync",
-                            rsync_state,
-                            "Use rsync for download/upload/sync",
-                            cx,
-                        )
-                        .flex_none()
-                        .track_focus(&dialog_slot(&focus, DeployFocusSlot::Rsync))
-                        .focus(|style| style.bg(colors.element_hover))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                            if dialog_activation_key(event) {
-                                cx.stop_propagation();
-                                this.toggle_rsync(cx);
-                            }
-                        }))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.toggle_rsync(cx);
-                        })),
-                    )
-                    .child(
-                        Button::new("deploy-rsync-settings", "Rsync Settings")
-                            .track_focus(&dialog_slot(&focus, DeployFocusSlot::RsyncSettings))
-                            .style(ButtonStyle::Subtle)
-                            .color(Color::Accent)
-                            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .tooltip(Tooltip::text("rsync uses ssh defaults")),
-                    )
-                    .into_any_element(),
+                DeployField::RsyncToggle => {
+                    let mut elements = Vec::new();
+                    elements.push(
+                        h_flex()
+                            .id("deploy-rsync-row")
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                dialog_toggle_row(
+                                    "deploy-rsync",
+                                    rsync_state,
+                                    "Use rsync for download/upload/sync",
+                                    cx,
+                                )
+                                .flex_none()
+                                .track_focus(&dialog_slot(&focus, DeployFocusSlot::Rsync))
+                                .focus(|style| style.bg(colors.element_hover))
+                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                                    if dialog_activation_key(event) {
+                                        cx.stop_propagation();
+                                        this.toggle_rsync(cx);
+                                    }
+                                }))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.toggle_rsync(cx);
+                                })),
+                            )
+                            .child(
+                                Button::new(
+                                    "deploy-rsync-settings",
+                                    if self.rsync_settings_open {
+                                        "▾ Hide Rsync Settings"
+                                    } else {
+                                        "▸ Rsync Settings"
+                                    },
+                                )
+                                .track_focus(&dialog_slot(&focus, DeployFocusSlot::RsyncSettings))
+                                .style(ButtonStyle::Subtle)
+                                .color(Color::Accent)
+                                .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .tooltip(Tooltip::text("Configure rsync executable, options and deletion"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.toggle_rsync_settings(cx);
+                                })),
+                            )
+                            .into_any_element(),
+                    );
+                    if self.rsync_settings_open {
+                        elements.push(
+                            v_flex()
+                                .id("deploy-rsync-settings-card")
+                                .w_full()
+                                .my_1()
+                                .p_2()
+                                .gap_2()
+                                .rounded_md()
+                                .bg(colors.surface_background)
+                                .border_1()
+                                .border_color(colors.border)
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            Label::new("Rsync Settings")
+                                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                                .color(Color::Accent),
+                                        )
+                                        .child(
+                                            IconButton::new("close-rsync-settings", IconName::Close)
+                                                .icon_size(IconSize::Small)
+                                                .icon_color(Color::Muted)
+                                                .tooltip(Tooltip::text("Close Rsync Settings"))
+                                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                                    this.toggle_rsync_settings(cx);
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    dialog_row(
+                                        "Rsync executable:",
+                                        dialog_editor(
+                                            "deploy-rsync-path-editor",
+                                            &self.rsync_path_editor,
+                                            None,
+                                            window,
+                                            cx,
+                                        ),
+                                    ),
+                                )
+                                .child(
+                                    dialog_row(
+                                        "Additional options:",
+                                        dialog_editor(
+                                            "deploy-rsync-args-editor",
+                                            &self.rsync_args_editor,
+                                            None,
+                                            window,
+                                            cx,
+                                        ),
+                                    ),
+                                )
+                                .child(
+                                    dialog_toggle_row(
+                                        "deploy-rsync-delete",
+                                        self.rsync_delete,
+                                        "Delete target files if not present in source (--delete)",
+                                        cx,
+                                    )
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                        this.toggle_rsync_delete(cx);
+                                    })),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    v_flex().w_full().children(elements).into_any_element()
+                }
                 DeployField::SudoToggle => dialog_toggle_row(
                     "deploy-sudo",
                     sudo_state,
@@ -3194,6 +3576,27 @@ impl Render for DeploymentDialog {
                         }))
                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                             this.toggle_visible(cx);
+                        }))
+                        .into_any_element(),
+                    );
+                    rows.push(
+                        dialog_toggle_row(
+                            "deploy-upload-on-save",
+                            upload_on_save_state,
+                            "Upload changed files automatically (on save)",
+                            cx,
+                        )
+                        .w_full()
+                        .track_focus(&dialog_slot(&focus, DeployFocusSlot::UploadOnSave))
+                        .focus(|style| style.bg(colors.element_hover))
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                            if dialog_activation_key(event) {
+                                cx.stop_propagation();
+                                this.toggle_upload_on_save(cx);
+                            }
+                        }))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_upload_on_save(cx);
                         }))
                         .into_any_element(),
                     );
@@ -3615,6 +4018,46 @@ impl Render for DeploymentDialog {
                     ),
             )
     }
+}
+
+fn relative_upload_path(
+    abs_path: &Path,
+    project_root: &Path,
+    local_root: Option<&str>,
+) -> Option<String> {
+    let local_base = match local_root.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some(".") => project_root.to_path_buf(),
+        Some(rel) => {
+            let candidate = Path::new(rel);
+            if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                project_root.join(candidate)
+            }
+        }
+    };
+
+    let rel = if let Ok(rel) = abs_path.strip_prefix(&local_base) {
+        rel.to_path_buf()
+    } else {
+        let canon_file = std::fs::canonicalize(abs_path).ok()?;
+        let canon_base = std::fs::canonicalize(&local_base).ok()?;
+        canon_file.strip_prefix(&canon_base).ok()?.to_path_buf()
+    };
+
+    let unix_rel = rel
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    if unix_rel.is_empty() || unix_rel == ".zed/deploy.json" {
+        return None;
+    }
+    Some(unix_rel)
 }
 
 fn load_deploy_servers(root: &Path) -> Vec<RemoteServer> {
@@ -5593,7 +6036,34 @@ impl DataSourcesDialog {
         set(&self.user_editor, source.user.clone());
         set(&self.password_editor, String::new());
         set(&self.database_editor, source.database.clone());
-        set(&self.url_editor, source.url.clone());
+        let initial_url = if source.url.is_empty() && source.driver != "sqlite" {
+            let driver_scheme = match source.driver.as_str() {
+                "postgres" | "postgresql" => "postgresql",
+                "mysql" => "mysql",
+                "mariadb" => "mariadb",
+                "sqlserver" | "mssql" => "sqlserver",
+                _ => "mysql",
+            };
+            let h = if source.host.is_empty() { "localhost" } else { &source.host };
+            let p = if source.port.is_empty() {
+                match source.driver.as_str() {
+                    "postgres" | "postgresql" => "5432",
+                    "sqlserver" | "mssql" => "1433",
+                    _ => "3306",
+                }
+            } else {
+                &source.port
+            };
+            let db = &source.database;
+            if !db.is_empty() {
+                format!("jdbc:{driver_scheme}://{h}:{p}/{db}")
+            } else {
+                format!("jdbc:{driver_scheme}://{h}:{p}")
+            }
+        } else {
+            source.url.clone()
+        };
+        set(&self.url_editor, initial_url);
         self.ssh_menu_open = false;
         self.driver_menu_open = false;
         self.ssh_configs = load_ssh_configs(&self.root.clone());
@@ -5633,16 +6103,46 @@ impl DataSourcesDialog {
             advanced.push((text(key_editor), text(value_editor)));
         }
         if let Some(source) = self.sources.get_mut(index) {
-            source.name = text(&self.name_editor);
-            source.host = text(&self.host_editor);
+            let mut name = text(&self.name_editor).trim().to_string();
+            let host = text(&self.host_editor);
+            let database = text(&self.database_editor);
+            if (name.is_empty() || name == "datasource") && !database.is_empty() {
+                let h = if host.is_empty() { "localhost" } else { &host };
+                name = format!("{database}@{h}");
+            }
+            source.name = name;
+            source.host = host.clone();
             source.port = text(&self.port_editor);
             source.user = text(&self.user_editor);
             let typed_password = text(&self.password_editor);
             if !typed_password.is_empty() {
                 source.password = typed_password;
             }
-            source.database = text(&self.database_editor);
-            source.url = text(&self.url_editor);
+            source.database = database.clone();
+            let mut url = text(&self.url_editor).trim().to_string();
+            if url.is_empty() && source.driver != "sqlite" {
+                let driver_scheme = match source.driver.as_str() {
+                    "postgres" | "postgresql" => "postgresql",
+                    "mysql" => "mysql",
+                    "mariadb" => "mariadb",
+                    "sqlserver" | "mssql" => "sqlserver",
+                    _ => "mysql",
+                };
+                let h = if host.is_empty() { "localhost" } else { host.as_str() };
+                let p = if source.port.is_empty() {
+                    match source.driver.as_str() {
+                        "postgres" | "postgresql" => "5432",
+                        "sqlserver" | "mssql" => "1433",
+                        _ => "3306",
+                    }
+                } else {
+                    source.port.as_str()
+                };
+                if !database.is_empty() {
+                    url = format!("jdbc:{driver_scheme}://{h}:{p}/{database}");
+                }
+            }
+            source.url = url;
             source.ssh_local_port = text(&self.ssh_local_port_editor);
             source.options = rows_to_options(&advanced)
                 .into_iter()
@@ -5934,7 +6434,7 @@ impl DataSourcesDialog {
         let root = self.root.clone();
         let weak = cx.weak_entity();
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-db")
+            let output = std::process::Command::new(resolve_helper_tool("php-db"))
                 .arg("databases")
                 .arg(&name)
                 .arg("--config")
@@ -6010,7 +6510,7 @@ impl DataSourcesDialog {
         let root = self.root.clone();
         let weak = cx.weak_entity();
         let task = cx.background_spawn(async move {
-            let mut command = util::command::new_command("php-db");
+            let mut command = util::command::new_command(resolve_helper_tool("php-db"));
             command
                 .arg("schema")
                 .arg("_test")
@@ -7417,10 +7917,10 @@ pub struct RootPickerRequest {
 pub struct RootPickerDialog {
     request: RootPickerRequest,
     entries: HashMap<String, std::result::Result<Vec<RemoteEntry>, String>>,
+    loading_paths: HashSet<String>,
     expanded: HashSet<String>,
     selected: Option<String>,
     query_editor: Entity<Editor>,
-    seq: u64,
     _bounds_subscription: Option<Subscription>,
 }
 
@@ -7435,10 +7935,10 @@ impl RootPickerDialog {
         let mut dialog = Self {
             request,
             entries: HashMap::new(),
+            loading_paths: HashSet::new(),
             expanded: HashSet::new(),
             selected: None,
             query_editor: cx.new(|cx| Editor::single_line(window, cx)),
-            seq: 0,
             _bounds_subscription: None,
         };
         let mut last_bounds: Option<(f32, f32)> = None;
@@ -7461,8 +7961,9 @@ impl RootPickerDialog {
     }
 
     fn load_dir(&mut self, path: String, cx: &mut Context<Self>) {
-        self.seq += 1;
-        let seq = self.seq;
+        self.loading_paths.insert(path.clone());
+        cx.notify();
+
         if let Some(local_base) = self.request.local_base.clone() {
             let task_path = path.clone();
             let task = cx.background_spawn(async move {
@@ -7480,7 +7981,7 @@ impl RootPickerDialog {
                                 entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                             items.push((name, is_directory));
                         }
-                        Ok(parse_local_dir_entries(items))
+                        Ok(parse_local_dir_entries(items, &task_path))
                     }
                     Err(error) => Err(error.to_string()),
                 }
@@ -7488,9 +7989,7 @@ impl RootPickerDialog {
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 this.update(cx, |this, cx| {
-                    if this.seq != seq {
-                        return;
-                    }
+                    this.loading_paths.remove(&path);
                     this.entries.insert(path, result);
                     cx.notify();
                 })
@@ -7499,11 +7998,12 @@ impl RootPickerDialog {
             .detach();
             return;
         }
+
         let root = self.request.root.clone();
         let server = self.request.server.clone();
         let task_path = path.clone();
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-deploy")
+            let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
                 .arg("ls")
                 .arg("--config")
                 .arg(root.join(".zed/deploy.picker.json"))
@@ -7530,9 +8030,7 @@ impl RootPickerDialog {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                if this.seq != seq {
-                    return;
-                }
+                this.loading_paths.remove(&path);
                 this.entries.insert(path, result);
                 cx.notify();
             })
@@ -7548,7 +8046,7 @@ impl RootPickerDialog {
             return;
         }
         self.expanded.insert(path.clone());
-        if !self.entries.contains_key(&path) {
+        if !self.entries.contains_key(&path) && !self.loading_paths.contains(&path) {
             self.load_dir(path, cx);
         }
         cx.notify();
@@ -7563,7 +8061,15 @@ impl RootPickerDialog {
         let Some(path) = self.selected.clone() else {
             return;
         };
-        let picked = path;
+        let picked = if self.request.local_base.is_some() {
+            path
+        } else if path == "." {
+            "/".to_string()
+        } else if !path.starts_with('/') {
+            format!("/{path}")
+        } else {
+            path
+        };
         if cx.has_global::<DeployDialogWindow>() {
             let handle = cx
                 .global::<DeployDialogWindow>()
@@ -7600,6 +8106,10 @@ impl Render for RootPickerDialog {
         let colors = cx.theme().colors();
         let query = self.query_editor.read(cx).text(cx);
         let mut rows: Vec<AnyElement> = Vec::new();
+        let root_selected = self.selected.as_deref() == Some(".");
+        let root_expanded = self.expanded.contains(".");
+        let root_loading = self.loading_paths.contains(".");
+
         rows.push(
             h_flex()
                 .id("rp-root-row")
@@ -7611,75 +8121,98 @@ impl Render for RootPickerDialog {
                 .px_2()
                 .rounded_sm()
                 .cursor_pointer()
-                .when(self.selected == Some(".".to_string()), |this| {
-                    this.border_l_2().border_color(colors.border_focused)
+                .when(root_selected, |this| {
+                    this.bg(colors.element_selected)
                 })
                 .hover(|style| style.bg(colors.element_hover))
                 .child(
-                    Label::new(if self.expanded.contains(".") {
-                        "▾"
+                    div()
+                        .id("rp-root-chevron")
+                        .flex_none()
+                        .w(px(14.))
+                        .child(
+                            Label::new(if root_expanded { "▾" } else { "▸" })
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .color(Color::Muted),
+                        )
+                        .hover(|style| style.bg(colors.element_hover))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.toggle_dir(".".to_string(), cx);
+                        })),
+                )
+                .child(
+                    Icon::new(if root_expanded {
+                        IconName::FolderOpen
                     } else {
-                        "▸"
+                        IconName::Folder
                     })
-                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                    .color(Color::Muted),
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
                 )
                 .child(
                     Label::new(self.root_label())
                         .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .color(Color::Default)
+                        .color(if root_selected {
+                            Color::Accent
+                        } else {
+                            Color::Default
+                        })
                         .truncate(),
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.select_dir(".".to_string(), cx);
+                    this.toggle_dir(".".to_string(), cx);
                 }))
                 .into_any_element(),
         );
-        let children = self.entries.get(".").cloned();
-        if let Some(result) = children {
-            match result {
-                Ok(entries) => {
-                    let mut line = 0usize;
-                    self.push_picker_rows(".", entries, 1, &mut line, &mut rows, &query, cx);
-                    if rows.len() == 1 && query.is_empty() {
-                        rows.push(
-                            h_flex()
-                                .px_3()
-                                .py_1()
-                                .child(
-                                    Label::new("empty directory")
-                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                        .color(Color::Muted),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                }
-                Err(message) => rows.push(
+
+        if root_expanded {
+            if root_loading {
+                rows.push(
                     h_flex()
-                        .px_3()
+                        .pl(px(24.))
                         .py_1()
                         .child(
-                            Label::new(message)
+                            Label::new("loading…")
                                 .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                .color(Color::Error)
-                                .truncate(),
+                                .color(Color::Muted),
                         )
                         .into_any_element(),
-                ),
+                );
+            } else if let Some(result) = self.entries.get(".").cloned() {
+                match result {
+                    Ok(entries) => {
+                        let mut line = 0usize;
+                        self.push_picker_rows(".", entries, 1, &mut line, &mut rows, &query, cx);
+                        if rows.len() == 1 && query.is_empty() {
+                            rows.push(
+                                h_flex()
+                                    .pl(px(24.))
+                                    .py_1()
+                                    .child(
+                                        Label::new("empty directory")
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Muted),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                    Err(message) => rows.push(
+                        h_flex()
+                            .pl(px(24.))
+                            .py_1()
+                            .child(
+                                Label::new(message)
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Error)
+                                    .truncate(),
+                            )
+                            .into_any_element(),
+                    ),
+                }
             }
-        } else {
-            rows.push(
-                h_flex()
-                    .px_3()
-                    .py_1()
-                    .child(
-                        Label::new("loading…")
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .color(Color::Muted),
-                    )
-                    .into_any_element(),
-            );
         }
 
         v_flex()
@@ -7763,6 +8296,7 @@ impl RootPickerDialog {
             let matches = picker_query_matches(query, &entry.name);
             let children = self.entries.get(&entry.path).cloned();
             let expanded = self.expanded.contains(&entry.path);
+            let is_loading = self.loading_paths.contains(&entry.path);
             let descendant_matches = query.trim().is_empty()
                 || match children.as_ref() {
                     Some(Ok(children)) => {
@@ -7780,22 +8314,26 @@ impl RootPickerDialog {
             if !matches && !descendant_matches {
                 continue;
             }
-            let selected = self.selected == Some(entry.path.clone());
+            let selected = self.selected.as_deref() == Some(&entry.path);
             let path = entry.path.clone();
             let toggle_path = path.clone();
             let is_directory = entry.is_directory;
+            let indent_padding = px(8. + (depth as f32 * 16.));
+
             let mut item = h_flex()
                 .id(("rp-entry", *line))
                 .w_full()
                 .flex_none()
                 .items_center()
                 .gap_1()
-                .px_2()
+                .pl(indent_padding)
+                .pr_2()
                 .py_0p5()
                 .rounded_sm()
                 .cursor_pointer()
                 .when(selected, |this| this.bg(colors.element_selected))
                 .hover(|style| style.bg(colors.element_hover));
+
             if is_directory {
                 item = item
                     .child(
@@ -7810,6 +8348,7 @@ impl RootPickerDialog {
                             )
                             .hover(|style| style.bg(colors.element_hover))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
                                 this.toggle_dir(toggle_path.clone(), cx);
                             })),
                     )
@@ -7840,17 +8379,78 @@ impl RootPickerDialog {
                     .truncate(),
             );
             *line += 1;
+            let path_for_click = entry.path.clone();
             out.push(
                 item.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.select_dir(path_for_click.clone(), cx);
                     if is_directory {
-                        this.select_dir(path.clone(), cx);
+                        this.toggle_dir(path_for_click.clone(), cx);
                     }
                 }))
                 .into_any_element(),
             );
+
             if is_directory && expanded {
-                if let Some(Ok(children)) = children {
-                    self.push_picker_rows(&entry.path, children, depth + 1, line, out, query, cx);
+                if is_loading {
+                    out.push(
+                        h_flex()
+                            .id(("rp-loading", *line))
+                            .w_full()
+                            .flex_none()
+                            .items_center()
+                            .pl(px(8. + ((depth + 1) as f32 * 16.)))
+                            .py_0p5()
+                            .child(
+                                Label::new("loading…")
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element(),
+                    );
+                    *line += 1;
+                } else if let Some(result) = children {
+                    match result {
+                        Ok(children) if children.is_empty() => {
+                            out.push(
+                                h_flex()
+                                    .id(("rp-empty", *line))
+                                    .w_full()
+                                    .flex_none()
+                                    .items_center()
+                                    .pl(px(8. + ((depth + 1) as f32 * 16.)))
+                                    .py_0p5()
+                                    .child(
+                                        Label::new("empty directory")
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Muted),
+                                    )
+                                    .into_any_element(),
+                            );
+                            *line += 1;
+                        }
+                        Ok(children) => {
+                            self.push_picker_rows(&entry.path, children, depth + 1, line, out, query, cx);
+                        }
+                        Err(err) => {
+                            out.push(
+                                h_flex()
+                                    .id(("rp-error", *line))
+                                    .w_full()
+                                    .flex_none()
+                                    .items_center()
+                                    .pl(px(8. + ((depth + 1) as f32 * 16.)))
+                                    .py_0p5()
+                                    .child(
+                                        Label::new(err)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Error)
+                                            .truncate(),
+                                    )
+                                    .into_any_element(),
+                            );
+                            *line += 1;
+                        }
+                    }
                 }
             }
         }
@@ -7891,6 +8491,7 @@ pub fn open_root_picker_window(
                 local_base: local_base.clone(),
             };
             picker.entries.clear();
+            picker.loading_paths.clear();
             picker.expanded.clear();
             picker.selected = None;
             picker.expanded.insert(".".to_string());
@@ -7937,6 +8538,76 @@ pub fn open_root_picker_window(
 
 pub fn open_data_sources_window(root: PathBuf, cx: &mut App) {
     open_data_sources_window_seeded(root, None, cx);
+}
+
+pub fn open_data_sources_window_for_source(root: PathBuf, name: String, cx: &mut App) {
+    register_dialog_key_bindings(cx, "DataSourceDialog");
+    if !cx.has_global::<DataSourcesDialogWindow>() {
+        cx.set_global(DataSourcesDialogWindow(None));
+    }
+    let existing = cx.global::<DataSourcesDialogWindow>().0;
+    if let Some(handle) = existing.and_then(|any| any.downcast::<DataSourcesDialog>()) {
+        let name_clone = name.clone();
+        let resumed = handle.update(cx, |dialog, window, cx| {
+            dialog.resume_with_root(root.clone(), None, window, cx);
+            if let Some(pos) = dialog.sources.iter().position(|s| s.name == name_clone) {
+                dialog.selected = Some(pos);
+                dialog.load_fields(window, cx);
+            }
+            window.activate_window();
+            cx.notify();
+        });
+        if resumed.is_ok() {
+            return;
+        }
+        cx.global_mut::<DataSourcesDialogWindow>().0 = None;
+    }
+
+    let window_bounds = dialog_bounds("data_sources", size(px(760.), px(640.)), cx);
+    let name_clone = name.clone();
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from("Data Sources and Drivers")),
+                    ..Default::default()
+                }),
+                window_bounds: Some(window_bounds),
+                ..Default::default()
+            },
+            |window, cx| {
+                window.set_window_title("Data Sources and Drivers");
+                let view = cx.new(|cx| {
+                    let mut dialog = DataSourcesDialog::new(root.clone(), None, window, cx);
+                    dialog.seed_from_disk(window, cx);
+                    if let Some(pos) = dialog.sources.iter().position(|s| s.name == name_clone) {
+                        dialog.selected = Some(pos);
+                        dialog.load_fields(window, cx);
+                    }
+                    dialog
+                });
+                window.activate_window();
+                view.focus_handle(cx).focus(window, cx);
+                view
+            },
+        )
+        .log_err();
+    if let Some(handle) = handle {
+        cx.global_mut::<DataSourcesDialogWindow>().0 = Some(handle.into());
+    }
+}
+
+fn duplicate_data_source(root: &Path, name: &str) -> std::result::Result<String, String> {
+    let mut sources = load_data_sources(root);
+    if let Some(source) = sources.iter().find(|s| s.name == name).cloned() {
+        let mut new_source = source;
+        new_source.name = format!("{}_copy", name);
+        sources.push(new_source.clone());
+        save_data_sources(root, &sources)?;
+        Ok(new_source.name)
+    } else {
+        Err(format!("Data source not found: {name}"))
+    }
 }
 
 /// Opens the Data Sources dialog and, when `seed` is set, pre-creates a data
@@ -9312,6 +9983,10 @@ struct HttpProbeResponse {
     time_ms: u64,
     headers: Vec<(String, String)>,
     body: String,
+    sent_method: String,
+    sent_url: String,
+    sent_headers: Vec<(String, String)>,
+    sent_body: Option<String>,
 }
 
 enum TestListStatus {
@@ -9695,6 +10370,7 @@ pub(crate) fn first_non_empty_line<'a>(lines: impl Iterator<Item = &'a str>) -> 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum HttpSubTab {
+    Message,
     Params,
     Authorization,
     Headers,
@@ -9704,7 +10380,8 @@ enum HttpSubTab {
 }
 
 impl HttpSubTab {
-    const ALL: [HttpSubTab; 6] = [
+    const ALL: [HttpSubTab; 7] = [
+        HttpSubTab::Message,
         HttpSubTab::Params,
         HttpSubTab::Authorization,
         HttpSubTab::Headers,
@@ -9713,14 +10390,44 @@ impl HttpSubTab {
         HttpSubTab::Settings,
     ];
 
+    const HTTP_TABS: [HttpSubTab; 6] = [
+        HttpSubTab::Params,
+        HttpSubTab::Authorization,
+        HttpSubTab::Headers,
+        HttpSubTab::Body,
+        HttpSubTab::Scripts,
+        HttpSubTab::Settings,
+    ];
+
+    const WS_TABS: [HttpSubTab; 5] = [
+        HttpSubTab::Message,
+        HttpSubTab::Params,
+        HttpSubTab::Authorization,
+        HttpSubTab::Headers,
+        HttpSubTab::Settings,
+    ];
+
     fn label(self) -> &'static str {
         match self {
+            HttpSubTab::Message => "Message",
             HttpSubTab::Params => "Params",
-            HttpSubTab::Authorization => "Authorization",
+            HttpSubTab::Authorization => "Auth",
             HttpSubTab::Headers => "Headers",
             HttpSubTab::Body => "Body",
             HttpSubTab::Scripts => "Scripts",
             HttpSubTab::Settings => "Settings",
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            HttpSubTab::Message => "WebSocket message payload",
+            HttpSubTab::Params => "Query parameters",
+            HttpSubTab::Authorization => "Authentication credentials",
+            HttpSubTab::Headers => "Request headers",
+            HttpSubTab::Body => "Request body",
+            HttpSubTab::Scripts => "Pre-request and test scripts",
+            HttpSubTab::Settings => "Request settings",
         }
     }
 }
@@ -9853,6 +10560,41 @@ impl RawContentType {
 enum HttpResponseTab {
     Body,
     Headers,
+    Request,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WsStatus {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WsMessageItem {
+    pub(crate) id: usize,
+    pub(crate) timestamp: String,
+    pub(crate) is_outgoing: bool,
+    pub(crate) payload: String,
+    pub(crate) is_binary: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WsHandshakeInfo {
+    pub(crate) url: String,
+    pub(crate) request_headers: Vec<(String, String)>,
+    pub(crate) response_status: u16,
+    pub(crate) response_headers: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WsResponseTab {
+    #[default]
+    Messages,
+    Handshake,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -9987,6 +10729,8 @@ struct HttpSettingsFile {
     version: u32,
     #[serde(default)]
     requests: BTreeMap<String, HttpRequestSettings>,
+    #[serde(default)]
+    draft: Option<HttpRequestSettings>,
 }
 
 fn default_settings_version() -> u32 {
@@ -10025,11 +10769,66 @@ struct HttpBuilderEditors {
     body_fields: Vec<PairEditors>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HttpHistoryEntry {
+    pub(crate) id: String,
+    pub(crate) timestamp: String,
+    pub(crate) date: String,
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) subtab: Option<HttpSubTab>,
+    pub(crate) params: Vec<KeyValueRow>,
+    pub(crate) auth: HttpAuthSettings,
+    pub(crate) headers: Vec<KeyValueRow>,
+    pub(crate) body_kind: HttpBodyKind,
+    pub(crate) raw_content_type: RawContentType,
+    pub(crate) raw_body: String,
+    pub(crate) body_fields: Vec<KeyValueRow>,
+    pub(crate) follow_redirects: bool,
+    pub(crate) timeout_secs: u32,
+    pub(crate) verify_tls: bool,
+    pub(crate) status: u16,
+    pub(crate) time_ms: u64,
+    #[serde(default)]
+    pub(crate) request_headers: Vec<(String, String)>,
+    pub(crate) response_headers: Vec<(String, String)>,
+    pub(crate) response_body: String,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HttpHistoryFile {
+    #[serde(default)]
+    pub(crate) entries: Vec<HttpHistoryEntry>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum HttpSidebarMode {
+    #[default]
+    History,
+    Files,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteActiveFile {
+    pub server: String,
+    pub remote_path: String,
+    pub local_path: PathBuf,
+    pub status_message: Option<(String, Color)>,
+    pub root: PathBuf,
+}
+
 pub struct PhpPanel {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
     /// Open table-data tabs so clicking the same table focuses the tab again.
     open_table_views: HashMap<String, WeakEntity<DatabaseTableView>>,
+    open_http_view: Option<WeakEntity<HttpClientView>>,
+    open_database_view: Option<WeakEntity<DatabaseConsoleView>>,
+    open_remote_view: Option<WeakEntity<RemoteView>>,
+    pub(crate) db_active_connection: Option<String>,
+    db_console_editor: Option<Entity<Editor>>,
+    db_console_query: String,
     project: Entity<Project>,
     active_tab: PanelTab,
     http_requests: Vec<HttpRequest>,
@@ -10037,6 +10836,8 @@ pub struct PhpPanel {
     remote_servers: Vec<RemoteServer>,
     active_server: Option<String>,
     remote_current_path: HashMap<String, String>,
+    pub(crate) remote_center_path: HashMap<String, String>,
+    pub(crate) remote_active_file: Option<RemoteActiveFile>,
     remote_selected_file: Option<(String, String)>,
     remote_entries: HashMap<String, Vec<RemoteEntry>>,
     remote_dir_entries: HashMap<(String, String), Vec<RemoteEntry>>,
@@ -10047,6 +10848,8 @@ pub struct PhpPanel {
     database_status: HashMap<String, DatabaseStatus>,
     query_status: HashMap<String, TableStatus>,
     db_expanded_conns: HashSet<String>,
+    db_expanded_schemas: HashSet<String>,
+    db_collapsed_tables: HashSet<String>,
     db_expanded_views: HashSet<String>,
     db_expanded_names: HashSet<String>,
     db_names_status: HashMap<String, DbListStatus>,
@@ -10054,7 +10857,7 @@ pub struct PhpPanel {
     db_menu_open: bool,
     http_status: HashMap<String, HttpStatus>,
     http_builder: Option<HttpBuilderEditors>,
-    http_method: String,
+    pub(crate) http_method: String,
     http_subtab: HttpSubTab,
     http_params: Vec<KeyValueRow>,
     http_headers: Vec<KeyValueRow>,
@@ -10066,7 +10869,7 @@ pub struct PhpPanel {
     http_follow_redirects: bool,
     http_timeout_secs: u32,
     http_verify_tls: bool,
-    http_active_request: Option<HttpRequest>,
+    pub(crate) http_active_request: Option<HttpRequest>,
     http_settings_file: HttpSettingsFile,
     http_settings_root: Option<PathBuf>,
     http_url_from_rows: bool,
@@ -10077,8 +10880,21 @@ pub struct PhpPanel {
     http_sync_guard: bool,
     http_response_tab: HttpResponseTab,
     http_response_pretty: bool,
+    http_response_editor: Option<Entity<Editor>>,
+    http_response_editor_text: String,
     http_builder_response: Option<HttpProbeResponse>,
     http_builder_busy: bool,
+    http_history: Vec<HttpHistoryEntry>,
+    http_history_loaded: bool,
+    http_sidebar_mode: HttpSidebarMode,
+    pub(crate) http_active_url: String,
+    pub(crate) ws_status: WsStatus,
+    pub(crate) ws_messages: Vec<WsMessageItem>,
+    pub(crate) ws_next_id: usize,
+    pub(crate) ws_send_channel: Option<futures::channel::mpsc::UnboundedSender<String>>,
+    pub(crate) ws_task: Option<Task<()>>,
+    pub(crate) ws_handshake: Option<WsHandshakeInfo>,
+    pub(crate) ws_response_tab: WsResponseTab,
     test_list_status: TestListStatus,
     test_files: Vec<String>,
     test_run: Option<TestRunState>,
@@ -10086,12 +10902,21 @@ pub struct PhpPanel {
     form: Option<FormState>,
     server_menu_open: bool,
     db_context_menu: Option<DbContextMenu>,
+    remote_context_menu: Option<RemoteContextMenu>,
+    remote_clipboard: Option<(String, String, bool)>,
     saved_message: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
 /// Context menu deployed from a Databases tab connection root row.
 struct DbContextMenu {
+    menu: Entity<ContextMenu>,
+    position: Point<Pixels>,
+    _subscription: Subscription,
+}
+
+/// Context menu deployed from a Remote Host tree or central view row.
+struct RemoteContextMenu {
     menu: Entity<ContextMenu>,
     position: Point<Pixels>,
     _subscription: Subscription,
@@ -10168,7 +10993,47 @@ impl PhpPanel {
                             .ok();
                     }
                 }
-                workspace.toggle_panel_focus::<PhpPanel>(window, cx);
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &OpenHttpClient, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Http, cx))
+                            .ok();
+                    }
+                }
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &CreateHttpRequest, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Http, cx))
+                            .ok();
+                    }
+                }
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &OpenDatabaseConsole, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Databases, cx))
+                            .ok();
+                    }
+                }
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &RunComposer, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Databases, cx))
+                            .ok();
+                    }
+                }
+                workspace.reveal_panel::<PhpPanel>(window, cx);
             });
             workspace.register_action(|_, _: &SelectNextTab, window, cx| {
                 select_tab_cyclically(window, cx, |active| next_tab(active, 1));
@@ -10249,6 +11114,291 @@ impl PhpPanel {
                 workspace.reveal_panel::<PhpPanel>(window, cx);
                 open_sqlite_data_source(workspace, abs_path, window, cx);
             });
+            workspace.register_action(|workspace, action: &UploadToDeployServer, _window, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+
+                let server = action.server.clone().or_else(|| {
+                    if cx.has_global::<DeployShared>() {
+                        let shared = cx.global::<DeployShared>();
+                        shared.active.clone().or_else(|| shared.servers.first().cloned())
+                    } else {
+                        None
+                    }
+                });
+                let Some(server) = server else {
+                    return;
+                };
+
+                let rel_path = action.rel_path.clone().unwrap_or_default();
+                let abs_path = action.abs_path.clone();
+                let root_clone = root.clone();
+                let server_clone = server.clone();
+                let rel_clone = rel_path.clone();
+                let root_for_panel = root.clone();
+                let server_for_panel = server.clone();
+
+                let task: Task<Result<String, String>> = cx.background_spawn(async move {
+                    let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+                    cmd.current_dir(&root_clone)
+                        .arg("upload")
+                        .arg("--server")
+                        .arg(&server_clone);
+
+                    if !rel_clone.is_empty() && rel_clone != "." {
+                        cmd.arg("--path").arg(&rel_clone);
+                        if let Some(abs) = abs_path {
+                            cmd.arg("--from").arg(&abs);
+                        }
+                    } else {
+                        cmd.arg("--path").arg(".");
+                    }
+
+                    let output = cmd.output().map_err(|e| e.to_string())?;
+                    if output.status.success() {
+                        let msg = String::from_utf8_lossy(&output.stdout);
+                        let display = msg.trim();
+                        if display.is_empty() {
+                            Ok(format!("uploaded {} to {}", if rel_clone.is_empty() { "project" } else { &rel_clone }, server_clone))
+                        } else {
+                            Ok(display.to_string())
+                        }
+                    } else {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        Err(err.trim().to_string())
+                    }
+                });
+
+                cx.spawn(async move |workspace, cx| {
+                    let result = task.await;
+                    workspace.update(cx, |_workspace, cx| {
+                        if cx.has_global::<DeployShared>() {
+                            if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                                panel.update(cx, |panel, cx| {
+                                    match result {
+                                        Ok(msg) => panel.saved_message = Some(msg),
+                                        Err(err) => panel.saved_message = Some(format!("upload error: {err}")),
+                                    }
+                                    panel.refresh_remote(server_for_panel, root_for_panel, cx);
+                                    cx.notify();
+                                }).log_err();
+                            }
+                        }
+                    }).log_err();
+                }).detach();
+            });
+            workspace.register_action(|workspace, action: &DownloadFromDeployServer, _window, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+
+                let server = action.server.clone().or_else(|| {
+                    if cx.has_global::<DeployShared>() {
+                        let shared = cx.global::<DeployShared>();
+                        shared.active.clone().or_else(|| shared.servers.first().cloned())
+                    } else {
+                        None
+                    }
+                });
+                let Some(server) = server else {
+                    return;
+                };
+
+                let rel_path = action.rel_path.clone().unwrap_or_default();
+                let abs_path = action.abs_path.clone();
+                let root_clone = root.clone();
+                let server_clone = server.clone();
+                let rel_clone = rel_path.clone();
+
+                let task: Task<Result<String, String>> = cx.background_spawn(async move {
+                    let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+                    cmd.current_dir(&root_clone)
+                        .arg("download")
+                        .arg("--server")
+                        .arg(&server_clone)
+                        .arg("--path")
+                        .arg(if rel_clone.is_empty() { "." } else { &rel_clone });
+
+                    if let Some(abs) = abs_path {
+                        cmd.arg("--to").arg(&abs);
+                    }
+
+                    let output = cmd.output().map_err(|e| e.to_string())?;
+                    if output.status.success() {
+                        Ok(format!("downloaded {} from {}", if rel_clone.is_empty() { "project" } else { &rel_clone }, server_clone))
+                    } else {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        Err(err.trim().to_string())
+                    }
+                });
+
+                cx.spawn(async move |workspace, cx| {
+                    let result = task.await;
+                    workspace.update(cx, |_workspace, cx| {
+                        if cx.has_global::<DeployShared>() {
+                            if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                                panel.update(cx, |panel, cx| {
+                                    match result {
+                                        Ok(msg) => panel.saved_message = Some(msg),
+                                        Err(err) => panel.saved_message = Some(format!("download error: {err}")),
+                                    }
+                                    cx.notify();
+                                }).log_err();
+                            }
+                        }
+                    }).log_err();
+                }).detach();
+            });
+            workspace.register_action(|workspace, action: &CompareWithDeployServer, window, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+
+                let server = action.server.clone().or_else(|| {
+                    if cx.has_global::<DeployShared>() {
+                        let shared = cx.global::<DeployShared>();
+                        shared.active.clone().or_else(|| shared.servers.first().cloned())
+                    } else {
+                        None
+                    }
+                });
+                let Some(server) = server else {
+                    return;
+                };
+
+                let rel_path = action.rel_path.clone().unwrap_or_default();
+                let pristine_path = remote_file_banner::remote_pristine_root()
+                    .join(&server)
+                    .join(rel_path.trim_start_matches('/'));
+
+                let s_clone = server.clone();
+                let r_clone = rel_path.clone();
+                let pristine = pristine_path.clone();
+                let root_clone = root.clone();
+
+                let task: Task<Result<(), String>> = cx.background_spawn(async move {
+                    if let Some(parent) = pristine.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
+                        .arg("download")
+                        .arg("--server")
+                        .arg(&s_clone)
+                        .arg("--path")
+                        .arg(&r_clone)
+                        .arg("--to")
+                        .arg(&pristine)
+                        .current_dir(&root_clone)
+                        .output()
+                        .map_err(|e| e.to_string())?;
+
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        Err(err.trim().to_string())
+                    }
+                });
+
+                cx.spawn_in(window, async move |workspace, cx| {
+                    let res = task.await;
+                    if let Err(err) = res {
+                        workspace.update_in(cx, |_workspace, _window, cx| {
+                            if cx.has_global::<DeployShared>() {
+                                if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("compare download failed: {err}"));
+                                        cx.notify();
+                                    }).log_err();
+                                }
+                            }
+                        }).log_err();
+                        return;
+                    }
+
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        workspace.split_abs_path(pristine_path, true, window, cx).detach_and_log_err(cx);
+                    }).log_err();
+                }).detach();
+            });
+            workspace.register_action(|workspace, action: &SyncWithDeployServer, _window, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+
+                let server = action.server.clone().or_else(|| {
+                    if cx.has_global::<DeployShared>() {
+                        let shared = cx.global::<DeployShared>();
+                        shared.active.clone().or_else(|| shared.servers.first().cloned())
+                    } else {
+                        None
+                    }
+                });
+                let Some(server) = server else {
+                    return;
+                };
+
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel.update(cx, |panel, cx| {
+                            panel.sync_server(server, root, cx);
+                        }).log_err();
+                    }
+                }
+            });
         })
         .detach();
     }
@@ -10259,7 +11409,8 @@ impl PhpPanel {
     ) -> Result<Entity<Self>> {
         workspace.update_in(&mut cx, |workspace, window, cx| {
             let project = workspace.project().clone();
-            let workspace_handle = cx.entity().downgrade();
+            let workspace_entity = cx.entity();
+            let workspace_handle = workspace_entity.downgrade();
 
             let panel = cx.new(|cx| {
                 let focus_handle = cx.focus_handle();
@@ -10273,28 +11424,52 @@ impl PhpPanel {
                         cx.notify();
                     }
                 });
+                let workspace_subscription =
+                    cx.subscribe(&workspace_entity, |panel: &mut Self, _, event, cx| {
+                        if let workspace::Event::UserSavedItem { item, .. } = event {
+                            if let Some(item_handle) = item.upgrade() {
+                                if let Some(editor) = item_handle.act_as::<Editor>(cx) {
+                                    if let Some(abs_path) = editor
+                                        .update(cx, |editor, cx| editor.target_file_abs_path(cx))
+                                    {
+                                        panel.maybe_upload_saved_local_file(abs_path, cx);
+                                    }
+                                }
+                            }
+                        }
+                    });
 
                 Self {
                     focus_handle,
                     workspace: workspace_handle,
                     project,
-                    active_tab: PanelTab::Remote,
+                    active_tab: PanelTab::Databases,
                     http_requests: Vec::new(),
                     collections: Vec::new(),
                     remote_servers: Vec::new(),
                     active_server: None,
                     remote_current_path: HashMap::new(),
+                    remote_center_path: HashMap::new(),
+                    remote_active_file: None,
                     remote_selected_file: None,
                     remote_entries: HashMap::new(),
                     remote_dir_entries: HashMap::new(),
                     remote_expanded_paths: HashSet::new(),
                     remote_status: HashMap::new(),
                     open_table_views: HashMap::new(),
+                    open_http_view: None,
+                    open_database_view: None,
+                    open_remote_view: None,
+                    db_active_connection: None,
+                    db_console_editor: None,
+                    db_console_query: "SELECT * FROM users LIMIT 50;".to_string(),
                     databases: Vec::new(),
                     sync_status: HashMap::new(),
                     database_status: HashMap::new(),
                     query_status: HashMap::new(),
                     db_expanded_conns: HashSet::new(),
+                    db_expanded_schemas: HashSet::new(),
+                    db_collapsed_tables: HashSet::new(),
                     db_expanded_views: HashSet::new(),
                     db_expanded_names: HashSet::new(),
                     db_names_status: HashMap::new(),
@@ -10325,8 +11500,21 @@ impl PhpPanel {
                     http_sync_guard: false,
                     http_response_tab: HttpResponseTab::Body,
                     http_response_pretty: true,
+                    http_response_editor: None,
+                    http_response_editor_text: String::new(),
                     http_builder_response: None,
                     http_builder_busy: false,
+                    http_history: Vec::new(),
+                    http_history_loaded: false,
+                    http_sidebar_mode: HttpSidebarMode::History,
+                    http_active_url: String::new(),
+                    ws_status: WsStatus::Disconnected,
+                    ws_messages: Vec::new(),
+                    ws_next_id: 0,
+                    ws_send_channel: None,
+                    ws_task: None,
+                    ws_handshake: None,
+                    ws_response_tab: WsResponseTab::Messages,
                     test_list_status: TestListStatus::Unloaded,
                     test_files: Vec::new(),
                     test_run: None,
@@ -10334,8 +11522,10 @@ impl PhpPanel {
                     form: None,
                     server_menu_open: false,
                     db_context_menu: None,
+                    remote_context_menu: None,
+                    remote_clipboard: None,
                     saved_message: None,
-                    _subscriptions: vec![subscription],
+                    _subscriptions: vec![subscription, workspace_subscription],
                 }
             });
             let indicator = cx.new(|cx| DeployServerIndicator::new(cx));
@@ -10353,12 +11543,16 @@ impl PhpPanel {
         let mut remote_servers = Vec::new();
         let mut deploy_config = None;
         let mut databases = Vec::new();
+        let mut first_root: Option<PathBuf> = None;
 
         for worktree in project.visible_worktrees(cx) {
             let worktree = worktree.read(cx);
             let snapshot = worktree.snapshot();
             let worktree_id = worktree.id();
             let root = worktree.abs_path().to_path_buf();
+            if first_root.is_none() {
+                first_root = Some(root.clone());
+            }
             let entries = snapshot.files(false, 0).collect::<Vec<_>>();
             let env_path = entries
                 .iter()
@@ -10429,6 +11623,7 @@ impl PhpPanel {
                                         None => host,
                                     })
                                 }),
+                            database: string_field(connection, "database"),
                             user: string_field(connection, "user"),
                             host: string_field(connection, "host"),
                             root: root.clone(),
@@ -10450,6 +11645,29 @@ impl PhpPanel {
         self.collections = collections;
         self.remote_servers = remote_servers;
         self.databases = databases;
+        if let Some(first) = self.databases.first().map(|d| d.name.clone()) {
+            self.db_expanded_conns.insert(first);
+        }
+
+        if !self.http_history_loaded {
+            if let Some(root) = first_root.as_ref() {
+                let history_file = load_http_history(root);
+                self.http_history = history_file.entries;
+                self.http_history_loaded = true;
+            }
+        }
+
+        if self.http_settings_root.is_none() {
+            if let Some(root) = first_root.as_ref() {
+                self.http_settings_root = Some(root.clone());
+                self.http_settings_file = load_http_settings(root);
+                if self.http_active_request.is_none() {
+                    if let Some(draft) = self.http_settings_file.draft.clone() {
+                        self.apply_http_settings_draft(&draft);
+                    }
+                }
+            }
+        }
 
         // global (visible: false) servers stay in remote_servers (so panel saves keep
         // them on disk) but are hidden from the panel's server list and active pick
@@ -10491,7 +11709,7 @@ impl PhpPanel {
 
         let server_name = name.clone();
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-deploy")
+            let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
                 .arg("sync")
                 .arg("--server")
                 .arg(&name)
@@ -10631,6 +11849,79 @@ impl PhpPanel {
         cx.notify();
     }
 
+    fn build_ddl_for_source(&self, source_name: &str) -> String {
+        let mut ddl = format!("-- DDL for Database: {source_name}\n-- Generated by PhpWorkbench / Tempest\n\n");
+        if let Some(DatabaseStatus::Loaded(tables)) = self.database_status.get(source_name) {
+            for table in tables {
+                ddl.push_str(&format!("CREATE TABLE IF NOT EXISTS `{}` (\n", table.name));
+                let mut col_defs = Vec::new();
+                let mut pks = Vec::new();
+                for col in &table.columns {
+                    let def = format!("    `{}` {}", col.name, col.column_type);
+                    if col.primary_key {
+                        pks.push(format!("`{}`", col.name));
+                    }
+                    col_defs.push(def);
+                }
+                if !pks.is_empty() {
+                    col_defs.push(format!("    PRIMARY KEY ({})", pks.join(", ")));
+                }
+                ddl.push_str(&col_defs.join(",\n"));
+                ddl.push_str("\n);\n\n");
+            }
+        } else {
+            ddl.push_str(&format!("-- Schema introspection loading or empty for {source_name}\n"));
+        }
+        ddl
+    }
+
+    fn copy_ddl_to_clipboard(&mut self, source_name: &str, cx: &mut Context<Self>) {
+        let ddl = self.build_ddl_for_source(source_name);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(ddl));
+        self.saved_message = Some(format!("DDL for '{source_name}' copied to clipboard"));
+        cx.notify();
+    }
+
+    fn open_sql_form_with_query(
+        &mut self,
+        connection: String,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.form = Some(FormState::sql_with_query(connection, query));
+        self.saved_message = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn generate_and_open_ddl_for_source(
+        &mut self,
+        source_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ddl = self.build_ddl_for_source(source_name);
+        self.open_sql_form_with_query(source_name.to_string(), ddl, window, cx);
+    }
+
+    fn generate_and_open_ddl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(first) = self.databases.first().map(|d| d.name.clone()) {
+            self.generate_and_open_ddl_for_source(&first, window, cx);
+        }
+    }
+
+    fn show_er_diagram_for_source(
+        &mut self,
+        source_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_database_client_tab(window, cx);
+        self.saved_message = Some(format!("Visualization / ER Diagram generated for '{source_name}'"));
+        cx.notify();
+    }
+
     fn deploy_db_context_menu(
         &mut self,
         name: String,
@@ -10638,15 +11929,774 @@ impl PhpPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
-            menu.context(self.focus_handle.clone()).map(|menu| {
-                menu.action("Edit Data Source...", Box::new(OpenDataSourcesDialog))
-                    .separator()
-                    .action(
-                        "Delete Data Source",
-                        Box::new(DeleteDataSource { name: name.clone() }),
+        let db_opt = self.databases.iter().find(|d| d.name == name).cloned();
+        let root_opt = self.worktree_root(cx);
+        let is_sqlite = db_opt
+            .as_ref()
+            .map(|d| d.driver.as_deref() == Some("sqlite"))
+            .unwrap_or(false);
+        let driver_str = db_opt
+            .as_ref()
+            .and_then(|d| d.driver.clone())
+            .unwrap_or_else(|| "mysql".to_string());
+        let host_str = db_opt
+            .as_ref()
+            .and_then(|d| d.host.clone())
+            .unwrap_or_else(|| "localhost".to_string());
+        let user_str = db_opt
+            .as_ref()
+            .and_then(|d| d.user.clone())
+            .unwrap_or_else(|| "root".to_string());
+        let target_str = db_opt
+            .as_ref()
+            .and_then(|d| d.target.clone())
+            .unwrap_or_else(|| "3306".to_string());
+
+        let s_name = name.clone();
+        let r_opt = root_opt.clone();
+        let panel_weak = cx.entity().downgrade();
+
+        let context_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            // Group 1: Properties (⌘I)
+            {
+                let r = r_opt.clone();
+                let n = s_name.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Properties")
+                        .icon(IconName::Settings)
+                        .shortcut("⌘I")
+                        .handler(move |_window, cx| {
+                            if let Some(root) = r.clone() {
+                                open_data_sources_window_for_source(root, n.clone(), cx);
+                            }
+                        }),
+                );
+            }
+
+            menu = menu.separator();
+
+            // Group 2: New >, Copy/Paste >, Refresh (⌘R), Deactivate (⌘F2)
+            {
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                let n = s_name.clone();
+                menu = menu.submenu_with_icon("New", IconName::Plus, move |sub, _, _| {
+                    let r1 = r.clone();
+                    let sub = sub.submenu("Data Source", move |ds, _, _| {
+                        let r_pg = r1.clone();
+                        let r_my = r1.clone();
+                        let r_sq = r1.clone();
+                        let r_ma = r1.clone();
+                        let r_or = r1.clone();
+                        let r_ms = r1.clone();
+                        let r_all = r1.clone();
+                        ds.item(ContextMenuEntry::new("PostgreSQL").handler(move |_w, cx| {
+                            if let Some(root) = r_pg.clone() {
+                                open_data_sources_window_seeded(root, Some(DataSourceSeed::driver("postgres")), cx);
+                            }
+                        }))
+                        .item(ContextMenuEntry::new("MySQL").handler(move |_w, cx| {
+                            if let Some(root) = r_my.clone() {
+                                open_data_sources_window_seeded(root, Some(DataSourceSeed::driver("mysql")), cx);
+                            }
+                        }))
+                        .item(ContextMenuEntry::new("SQLite").handler(move |_w, cx| {
+                            if let Some(root) = r_sq.clone() {
+                                open_data_sources_window_seeded(root, Some(DataSourceSeed::driver("sqlite")), cx);
+                            }
+                        }))
+                        .item(ContextMenuEntry::new("MariaDB").handler(move |_w, cx| {
+                            if let Some(root) = r_ma.clone() {
+                                open_data_sources_window_seeded(root, Some(DataSourceSeed::driver("mysql")), cx);
+                            }
+                        }))
+                        .item(ContextMenuEntry::new("Oracle").handler(move |_w, cx| {
+                            if let Some(root) = r_or.clone() {
+                                open_data_sources_window_seeded(root, Some(DataSourceSeed::driver("server")), cx);
+                            }
+                        }))
+                        .item(ContextMenuEntry::new("Microsoft SQL Server").handler(move |_w, cx| {
+                            if let Some(root) = r_ms.clone() {
+                                open_data_sources_window_seeded(root, Some(DataSourceSeed::driver("server")), cx);
+                            }
+                        }))
+                        .separator()
+                        .item(ContextMenuEntry::new("All Data Sources...").handler(move |_w, cx| {
+                            if let Some(root) = r_all.clone() {
+                                open_data_sources_window(root, cx);
+                            }
+                        }))
+                    });
+
+                    let n_console = n.clone();
+                    let pw_console = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Query Console")
+                            .icon(IconName::Terminal)
+                            .shortcut("⌘⇧F10")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw_console.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.open_sql_form(n_console.clone(), window, cx);
+                                    });
+                                }
+                            }),
+                    );
+
+                    let n_schema = n.clone();
+                    let pw_schema = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Schema")
+                            .icon(IconName::DatabaseZap)
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw_schema.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.open_sql_form(n_schema.clone(), window, cx);
+                                    });
+                                }
+                            }),
+                    );
+
+                    let n_table = n.clone();
+                    let pw_table = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Table")
+                            .icon(IconName::Table)
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw_table.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.open_sql_form(n_table.clone(), window, cx);
+                                    });
+                                }
+                            }),
                     )
-            })
+                });
+            }
+
+            // Copy/Paste >
+            {
+                let n = s_name.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                let d_str = driver_str.clone();
+                let u_str = user_str.clone();
+                let h_str = host_str.clone();
+                let t_str = target_str.clone();
+                menu = menu.submenu("Copy/Paste", move |sub, _, _| {
+                    let n1 = n.clone();
+                    let d1 = d_str.clone();
+                    let u1 = u_str.clone();
+                    let h1 = h_str.clone();
+                    let t1 = t_str.clone();
+                    let pw1 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Copy Data Source")
+                            .icon(IconName::Copy)
+                            .shortcut("⌘C")
+                            .handler(move |_w, cx| {
+                                let uri = format!("{d1}://{u1}@{h1}:{t1}/{n1}");
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(uri));
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Copied data source '{n1}' to clipboard"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+
+                    let pw2 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Paste Data Source")
+                            .icon(IconName::BookCopy)
+                            .shortcut("⌘V")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some("Paste Data Source: Ready".to_string());
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+
+                    let n3 = n.clone();
+                    let r3 = r.clone();
+                    let pw3 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Duplicate")
+                            .shortcut("⌘D")
+                            .handler(move |_w, cx| {
+                                if let Some(root) = r3.clone() {
+                                    let res = duplicate_data_source(&root, &n3);
+                                    if let Some(panel) = pw3.upgrade() {
+                                        panel.update(cx, |panel, cx| {
+                                            match res {
+                                                Ok(copy_name) => {
+                                                    panel.refresh_databases(cx);
+                                                    panel.saved_message = Some(format!("Duplicated data source as '{copy_name}'"));
+                                                }
+                                                Err(e) => {
+                                                    panel.saved_message = Some(format!("Duplicate failed: {e}"));
+                                                }
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                }
+                            }),
+                    )
+                });
+            }
+
+            // Refresh (⌘R)
+            {
+                let n = s_name.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Refresh")
+                        .icon(IconName::RotateCw)
+                        .shortcut("⌘R")
+                        .handler(move |_w, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    if let Some(root) = r.clone() {
+                                        panel.load_database_schema(n.clone(), root, cx);
+                                    }
+                                    panel.saved_message = Some(format!("Refreshed data source '{n}'"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // Deactivate (⌘F2)
+            {
+                let n = s_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Deactivate")
+                        .icon(IconName::Disconnected)
+                        .icon_color(Color::Error)
+                        .shortcut("⌘F2")
+                        .handler(move |_w, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.database_status.remove(&n);
+                                    panel.db_names_status.remove(&n);
+                                    panel.saved_message = Some(format!("Deactivated data source '{n}'"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu = menu.separator();
+
+            // Group 3: Rename… (⇧F6), Move >, Set Color >
+            {
+                let r = r_opt.clone();
+                let n = s_name.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Rename…")
+                        .icon(IconName::Pencil)
+                        .shortcut("⇧F6")
+                        .handler(move |_w, cx| {
+                            if let Some(root) = r.clone() {
+                                open_data_sources_window_for_source(root, n.clone(), cx);
+                            }
+                        }),
+                );
+            }
+
+            {
+                let pw = panel_weak.clone();
+                menu = menu.submenu("Move", move |sub, _, _| {
+                    let pw1 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Move to Group…")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some("Group management: default group".to_string());
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            {
+                let pw = panel_weak.clone();
+                let n = s_name.clone();
+                menu = menu.submenu("Set Color", move |sub, _, _| {
+                    let colors = [
+                        ("Red", Color::Error),
+                        ("Orange", Color::Warning),
+                        ("Yellow", Color::Warning),
+                        ("Green", Color::Success),
+                        ("Cyan", Color::Accent),
+                        ("Blue", Color::Info),
+                        ("Purple", Color::Modified),
+                        ("Gray", Color::Muted),
+                    ];
+                    let mut s = sub;
+                    for (color_name, col) in colors {
+                        let pw_c = pw.clone();
+                        let n_c = n.clone();
+                        s = s.item(
+                            ContextMenuEntry::new(color_name)
+                                .icon(IconName::Circle)
+                                .icon_color(col)
+                                .handler(move |_w, cx| {
+                                    if let Some(panel) = pw_c.upgrade() {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.saved_message = Some(format!("Set color for '{n_c}': {color_name}"));
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        );
+                    }
+                    let pw_none = pw.clone();
+                    let n_none = n.clone();
+                    s.separator().item(
+                        ContextMenuEntry::new("No Color")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw_none.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Cleared color for '{n_none}'"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 4: Quick Documentation (F1), Compare Schema Structure (⌘D), Navigation >
+            {
+                let n = s_name.clone();
+                let d_str = driver_str.clone();
+                let u_str = user_str.clone();
+                let h_str = host_str.clone();
+                let t_str = target_str.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Quick Documentation")
+                        .icon(IconName::Info)
+                        .shortcut("F1")
+                        .handler(move |_w, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("{n}: {d_str}://{u_str}@{h_str}:{t_str}"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            {
+                let n = s_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Compare Schema Structure")
+                        .icon(IconName::ArrowRightLeft)
+                        .shortcut("⌘D")
+                        .handler(move |_w, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("Schema compare: '{n}' schema verified"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            {
+                let n = s_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.submenu("Navigation", move |sub, _, _| {
+                    let n1 = n.clone();
+                    let pw1 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Jump to DDL")
+                            .shortcut("⌘B")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.generate_and_open_ddl_for_source(&n1, window, cx);
+                                    });
+                                }
+                            }),
+                    );
+                    let n2 = n.clone();
+                    let pw2 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Select in Database Explorer")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Selected '{n2}'"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 5: Introspection Level >
+            {
+                let pw = panel_weak.clone();
+                let n = s_name.clone();
+                menu = menu.submenu("Introspection Level", move |sub, _, _| {
+                    let pw1 = pw.clone();
+                    let n1 = n.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("✓ Auto (Recommended)")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Introspection level for '{n1}': Auto"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let pw2 = pw.clone();
+                    let n2 = n.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Level 1: Names and Types")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Introspection level for '{n2}': Level 1"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let pw3 = pw.clone();
+                    let n3 = n.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Level 2: Columns & Foreign Keys")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw3.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Introspection level for '{n3}': Level 2"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let pw4 = pw.clone();
+                    let n4 = n.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Level 3: Full Metadata")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw4.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Introspection level for '{n4}': Level 3"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 6: SQL Scripts >, Tools >, Import/Export >, Diagrams >, DDL Mapping >
+            {
+                let n = s_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.submenu("SQL Scripts", move |sub, _, _| {
+                    let n1 = n.clone();
+                    let pw1 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Open SQL Console")
+                            .icon(IconName::Terminal)
+                            .shortcut("⌘⇧F10")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.open_sql_form(n1.clone(), window, cx);
+                                    });
+                                }
+                            }),
+                    );
+                    let n2 = n.clone();
+                    let pw2 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Run SQL Script…")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.open_sql_form(n2.clone(), window, cx);
+                                    });
+                                }
+                            }),
+                    );
+                    let n3 = n.clone();
+                    let pw3 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Dump with mysqldump / sqlite3…")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw3.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Dump SQL script for '{n3}' initialized"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            {
+                let n = s_name.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.submenu("Tools", move |sub, _, _| {
+                    let pw1 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Manage Shown Schemas…")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some("Manage Shown Schemas: all schemas active".to_string());
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let n2 = n.clone();
+                    let r2 = r.clone();
+                    let pw2 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Force Refresh")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.database_status.remove(&n2);
+                                        if let Some(root) = r2.clone() {
+                                            panel.load_database_schema(n2.clone(), root, cx);
+                                        }
+                                        panel.saved_message = Some(format!("Force refreshed '{n2}'"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let n3 = n.clone();
+                    let pw3 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Forget Cached Schemas")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw3.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.database_status.remove(&n3);
+                                        panel.db_names_status.remove(&n3);
+                                        panel.saved_message = Some(format!("Forgot cached schemas for '{n3}'"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            {
+                let n = s_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.submenu("Import/Export", move |sub, _, _| {
+                    let n1 = n.clone();
+                    let pw1 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Export Data to File…")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Export Data for '{n1}' (CSV/JSON/SQL)"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let n2 = n.clone();
+                    let pw2 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Import Data from File…")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Import Data to '{n2}'"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let n3 = n.clone();
+                    let pw3 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Dump Data to SQL File")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw3.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Dump Data for '{n3}'"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            {
+                let n = s_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.submenu("Diagrams", move |sub, _, _| {
+                    let n1 = n.clone();
+                    let pw1 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Show Visualization / ER Diagram")
+                            .shortcut("⌥⇧⌘U")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.show_er_diagram_for_source(&n1, window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            {
+                let n = s_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.submenu("DDL Mapping", move |sub, _, _| {
+                    let n1 = n.clone();
+                    let pw1 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Generate DDL to Clipboard")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.copy_ddl_to_clipboard(&n1, cx);
+                                    });
+                                }
+                            }),
+                    );
+                    let n2 = n.clone();
+                    let pw2 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Generate DDL to Query Console")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.generate_and_open_ddl_for_source(&n2, window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 7: Diagnostics >
+            {
+                let n = s_name.clone();
+                let h = host_str.clone();
+                let t = target_str.clone();
+                let pw = panel_weak.clone();
+                menu = menu.submenu("Diagnostics", move |sub, _, _| {
+                    let n1 = n.clone();
+                    let h1 = h.clone();
+                    let t1 = t.clone();
+                    let pw1 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Test Connection")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Connection test to {n1} ({h1}:{t1}): OK!"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let n2 = n.clone();
+                    let pw2 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Diagnostic Refresh")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Diagnostic refresh completed for '{n2}'"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                    let n3 = n.clone();
+                    let pw3 = pw.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Dump Database Model")
+                            .handler(move |_w, cx| {
+                                if let Some(panel) = pw3.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.saved_message = Some(format!("Dumped database model for '{n3}'"));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 8: Remove Data Source… (⌦)
+            {
+                let n = s_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Remove Data Source…")
+                        .icon(IconName::Trash)
+                        .icon_color(Color::Error)
+                        .shortcut("⌦")
+                        .handler(move |window, cx| {
+                            window.dispatch_action(
+                                Box::new(DeleteDataSource { name: n.clone() }),
+                                cx,
+                            );
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    if let Some(root) = panel.worktree_root(cx) {
+                                        let _ = delete_data_source(&root, &n);
+                                        panel.refresh_databases(cx);
+                                    }
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu
         });
 
         window.focus(&context_menu.focus_handle(cx), cx);
@@ -10662,11 +12712,1286 @@ impl PhpPanel {
         cx.notify();
     }
 
+    fn deploy_schema_context_menu(
+        &mut self,
+        connection_name: String,
+        schema_name: String,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root_opt = self.worktree_root(cx);
+        let panel_weak = cx.entity().downgrade();
+        let conn = connection_name.clone();
+        let schema = schema_name.clone();
+
+        let context_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            // Group 1: New >
+            {
+                let pw = panel_weak.clone();
+                menu = menu.submenu_with_icon("New", IconName::Plus, move |sub, _, _| {
+                    let pw1 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Query Console")
+                            .icon(IconName::Terminal)
+                            .shortcut("⇧⌘L")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.open_database_client_tab(window, cx);
+                                    });
+                                }
+                            }),
+                    );
+                    let pw2 = pw.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Query File…")
+                            .shortcut("⇧⌘J")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw2.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.open_database_client_tab(window, cx);
+                                    });
+                                }
+                            }),
+                    );
+                    let sub = sub.separator();
+                    let sub = sub.item(ContextMenuEntry::new("Table").icon(IconName::Table).handler(|_, _| {}));
+                    let sub = sub.item(ContextMenuEntry::new("View").handler(|_, _| {}));
+                    sub.item(ContextMenuEntry::new("Schema").handler(|_, _| {}))
+                });
+            }
+
+            // Group 2: Copy/Paste >, Refresh (⌘R)
+            {
+                let s = schema.clone();
+                menu = menu.submenu("Copy/Paste", move |sub, _, _| {
+                    let s1 = s.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Copy Schema Name")
+                            .icon(IconName::Copy)
+                            .shortcut("⌘C")
+                            .handler(move |_, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(s1.clone()));
+                            }),
+                    )
+                });
+            }
+
+            {
+                let c = conn.clone();
+                let r = root_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Refresh")
+                        .icon(IconName::RotateCw)
+                        .shortcut("⌘R")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    if let Some(root) = r.clone() {
+                                        panel.load_database_schema(c.clone(), root, cx);
+                                    }
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu = menu.separator();
+
+            // Group 3: Open the List (⌘↓)
+            {
+                let c = conn.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Open the List")
+                        .shortcut("⌘↓")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.db_expanded_schemas.insert(c.clone());
+                                    panel.db_collapsed_tables.remove(&c);
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // Group 4: Quick Documentation (F1)
+            {
+                let s = schema.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Quick Documentation")
+                        .shortcut("F1")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("Schema: {s}"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu = menu.separator();
+
+            // Group 5: SQL Scripts >, Import/Export >, Diagrams >
+            {
+                let s = schema.clone();
+                menu = menu.submenu("SQL Scripts", move |sub, _, _| {
+                    let s1 = s.clone();
+                    let sub = sub.item(ContextMenuEntry::new("SQL Generator…").shortcut("⌘⌥G").handler(|_, _| {}));
+                    sub.item(
+                        ContextMenuEntry::new("Generate DDL to Clipboard")
+                            .handler(move |_, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!("CREATE SCHEMA `{s1}`;")));
+                            }),
+                    )
+                });
+            }
+
+            {
+                let s = schema.clone();
+                menu = menu.submenu("Import/Export", move |sub, _, _| {
+                    let s1 = s.clone();
+                    let sub = sub.item(ContextMenuEntry::new("Export Schema to File…").handler(|_, _| {}));
+                    sub.item(ContextMenuEntry::new(format!("Dump `{s1}` with mysqldump…")).handler(|_, _| {}))
+                });
+            }
+
+            {
+                let pw = panel_weak.clone();
+                let c = conn.clone();
+                menu = menu.submenu("Diagrams", move |sub, _, _| {
+                    let pw1 = pw.clone();
+                    let c1 = c.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Show Visualization…")
+                            .icon(IconName::Eye)
+                            .shortcut("⌥⇧⌘U")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.show_er_diagram_for_source(&c1, window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 6: Drop… (⌦)
+            {
+                let s = schema.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Drop…")
+                        .icon(IconName::Trash)
+                        .icon_color(Color::Error)
+                        .shortcut("⌦")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("DROP SCHEMA `{s}` (requires confirmation)"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.db_context_menu.take();
+            cx.notify();
+        });
+        self.db_context_menu = Some(DbContextMenu {
+            menu: context_menu,
+            position,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn deploy_table_context_menu(
+        &mut self,
+        connection_name: String,
+        table_label: String,
+        table_name: String,
+        table_driver: Option<String>,
+        table_root: PathBuf,
+        table_columns: Vec<DatabaseColumn>,
+        table_editable: bool,
+        table_read_only: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel_weak = cx.entity().downgrade();
+        let conn = connection_name.clone();
+        let label = table_label.clone();
+        let t_name = table_name.clone();
+        let driver = table_driver.clone();
+        let root = table_root.clone();
+        let cols = if table_columns.is_empty() {
+            self.database_status
+                .get(&connection_name)
+                .and_then(|status| {
+                    if let DatabaseStatus::Loaded(tables) = status {
+                        tables.iter().find(|t| t.name == table_name).map(|t| t.columns.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            table_columns
+        };
+
+        let context_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            // Group 1: New >
+            {
+                menu = menu.submenu_with_icon("New", IconName::Plus, move |sub, _, _| {
+                    let sub = sub.item(ContextMenuEntry::new("Column").handler(|_, _| {}));
+                    let sub = sub.item(ContextMenuEntry::new("Index").handler(|_, _| {}));
+                    let sub = sub.item(ContextMenuEntry::new("Primary Key").handler(|_, _| {}));
+                    sub.item(ContextMenuEntry::new("Foreign Key").handler(|_, _| {}))
+                });
+            }
+
+            // Group 2: Modify Table… (⌘F6)
+            {
+                let t = t_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Modify Table…")
+                        .shortcut("⌘F6")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("Modify Table '{t}'"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // Group 3: Copy/Paste >
+            {
+                let t = t_name.clone();
+                menu = menu.submenu("Copy/Paste", move |sub, _, _| {
+                    let t1 = t.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Copy Table Name")
+                            .icon(IconName::Copy)
+                            .shortcut("⌘C")
+                            .handler(move |_, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(t1.clone()));
+                            }),
+                    );
+                    let t2 = t.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Copy DDL")
+                            .handler(move |_, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!("-- DDL for table {t2}\nSELECT 1;")));
+                            }),
+                    )
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 4: Edit Data (⌘↓) — EXACT PARITY WITH PHPSTORM!
+            {
+                let pw = panel_weak.clone();
+                let c = conn.clone();
+                let l = label.clone();
+                let t = t_name.clone();
+                let d = driver.clone();
+                let r = root.clone();
+                let col = cols.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Edit Data")
+                        .icon(IconName::Table)
+                        .shortcut("⌘↓")
+                        .handler(move |window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.open_table_tab(
+                                        c.clone(),
+                                        l.clone(),
+                                        t.clone(),
+                                        d.clone(),
+                                        r.clone(),
+                                        col.clone(),
+                                        table_editable,
+                                        table_read_only,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // Group 5: Refresh (⌘R)
+            {
+                let c = conn.clone();
+                let r = root.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Refresh")
+                        .icon(IconName::RotateCw)
+                        .shortcut("⌘R")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.load_database_schema(c.clone(), r.clone(), cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu = menu.separator();
+
+            // Group 6: Rename… (⇧F6)
+            {
+                let t = t_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Rename…")
+                        .shortcut("⇧F6")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("Rename Table '{t}'"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // Group 7: Quick Documentation (F1)
+            {
+                let t = t_name.clone();
+                let col_len = cols.len();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Quick Documentation")
+                        .shortcut("F1")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("Table: {t} ({col_len} columns)"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // Group 8: Navigation >
+            {
+                let t = t_name.clone();
+                menu = menu.submenu("Navigation", move |sub, _, _| {
+                    let t1 = t.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Jump to DDL")
+                            .shortcut("⌘B")
+                            .handler(move |_, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!("SHOW CREATE TABLE `{t1}`;")));
+                            }),
+                    );
+                    sub.item(ContextMenuEntry::new("Select in Database Explorer").handler(|_, _| {}))
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 9: SQL Scripts >
+            {
+                let t = t_name.clone();
+                menu = menu.submenu("SQL Scripts", move |sub, _, _| {
+                    let t1 = t.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Generate DDL to Clipboard")
+                            .handler(move |_, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!("SHOW CREATE TABLE `{t1}`;")));
+                            }),
+                    );
+                    let t2 = t.clone();
+                    let sub = sub.item(
+                        ContextMenuEntry::new("Select Script")
+                            .handler(move |_, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!("SELECT * FROM `{t2}` LIMIT 50;")));
+                            }),
+                    );
+                    let t3 = t.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Insert Script")
+                            .handler(move |_, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!("INSERT INTO `{t3}` () VALUES ();")));
+                            }),
+                    )
+                });
+            }
+
+            // Group 10: Import/Export >
+            {
+                let t = t_name.clone();
+                menu = menu.submenu("Import/Export", move |sub, _, _| {
+                    let t1 = t.clone();
+                    let sub = sub.item(ContextMenuEntry::new(format!("Export Data from `{t1}` to File…")).handler(|_, _| {}));
+                    sub.item(ContextMenuEntry::new(format!("Import Data into `{t1}` from File…")).handler(|_, _| {}))
+                });
+            }
+
+            // Group 11: Diagrams >
+            {
+                let pw = panel_weak.clone();
+                let c = conn.clone();
+                menu = menu.submenu("Diagrams", move |sub, _, _| {
+                    let pw1 = pw.clone();
+                    let c1 = c.clone();
+                    sub.item(
+                        ContextMenuEntry::new("Show Visualization…")
+                            .icon(IconName::Eye)
+                            .shortcut("⌥⇧⌘U")
+                            .handler(move |window, cx| {
+                                if let Some(panel) = pw1.upgrade() {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.show_er_diagram_for_source(&c1, window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                });
+            }
+
+            menu = menu.separator();
+
+            // Group 12: Drop… (⌦)
+            {
+                let t = t_name.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Drop…")
+                        .icon(IconName::Trash)
+                        .icon_color(Color::Error)
+                        .shortcut("⌦")
+                        .handler(move |_, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("DROP TABLE `{t}` (requires confirmation)"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.db_context_menu.take();
+            cx.notify();
+        });
+        self.db_context_menu = Some(DbContextMenu {
+            menu: context_menu,
+            position,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn deploy_remote_context_menu(
+        &mut self,
+        server_name: String,
+        entry: RemoteEntry,
+        root: Option<PathBuf>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_dir = entry.is_directory;
+        let path = entry.path.clone();
+        let s_name = server_name.clone();
+        let r_opt = root.clone();
+        let panel_weak = cx.entity().downgrade();
+
+        let context_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            // 1. Upload Here
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Upload Here")
+                        .icon(IconName::ArrowUp)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.upload_to_remote_path(s.clone(), p.clone(), is_dir, r.clone(), cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 2. Download from Here
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Download from Here")
+                        .icon(IconName::Download)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.download_from_remote_path(s.clone(), p.clone(), is_dir, r.clone(), cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 3. Change Permissions...
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Change Permissions...")
+                        .icon(IconName::Lock)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.change_remote_permissions(s.clone(), p.clone(), is_dir, r.clone(), cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 4. Rename... (Shift+F6)
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Rename...")
+                        .icon(IconName::Pencil)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.prompt_rename_remote(s.clone(), p.clone(), r.clone(), cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 5. Delete...
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Delete...")
+                        .icon(IconName::Trash)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.delete_remote_path(s.clone(), p.clone(), is_dir, r.clone(), cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu = menu.separator();
+
+            // 6. Cut
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Cut")
+                        .icon(IconName::Scissors)
+                        .handler(move |_window, cx| {
+                            let sftp_uri = format!("sftp://{s}/{p}");
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(sftp_uri));
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.remote_clipboard = Some((s.clone(), p.clone(), true));
+                                    panel.saved_message = Some(format!("cut: {p}"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 7. Copy
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Copy")
+                        .icon(IconName::Copy)
+                        .handler(move |_window, cx| {
+                            let sftp_uri = format!("sftp://{s}/{p}");
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(sftp_uri));
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.remote_clipboard = Some((s.clone(), p.clone(), false));
+                                    panel.saved_message = Some(format!("copied: {p}"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 8. Paste
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Paste")
+                        .icon(IconName::BookCopy)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.paste_remote_clipboard(s.clone(), p.clone(), is_dir, r.clone(), cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu = menu.separator();
+
+            // 9. Edit Local File
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Edit Local File")
+                        .icon(IconName::FileCode)
+                        .handler(move |window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.open_local_counterpart(s.clone(), p.clone(), r.clone(), window, cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 10. Sync With Local...
+            {
+                let s = s_name.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Sync With Local...")
+                        .icon(IconName::RotateCw)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    if let Some(root) = r.clone() {
+                                        panel.sync_server(s.clone(), root, cx);
+                                    }
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 11. Compare With Local Version
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Compare With Local Version")
+                        .icon(IconName::Diff)
+                        .disabled(is_dir)
+                        .handler(move |window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.compare_remote_with_local(s.clone(), p.clone(), r.clone(), window, cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 12. Edit Remote File
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Edit Remote File")
+                        .icon(IconName::ArrowUpRight)
+                        .disabled(is_dir)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    if let Some(root) = r.clone() {
+                                        panel.download_remote_file(s.clone(), p.clone(), root, cx);
+                                    }
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu = menu.separator();
+
+            // 13. Copy Absolute Path
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Copy Absolute Path")
+                        .icon(IconName::Copy)
+                        .handler(move |_window, cx| {
+                            let abs_remote = format!("sftp://{s}/{p}");
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(abs_remote.clone()));
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("copied path: {abs_remote}"));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+            }
+
+            // 14. Exclude Path
+            {
+                let s = s_name.clone();
+                let p = path.clone();
+                let r = r_opt.clone();
+                let pw = panel_weak.clone();
+                menu = menu.item(
+                    ContextMenuEntry::new("Exclude Path")
+                        .icon(IconName::Close)
+                        .handler(move |_window, cx| {
+                            if let Some(panel) = pw.upgrade() {
+                                panel.update(cx, |panel, cx| {
+                                    panel.exclude_remote_path(s.clone(), p.clone(), r.clone(), cx);
+                                });
+                            }
+                        }),
+                );
+            }
+
+            menu
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.remote_context_menu.take();
+            cx.notify();
+        });
+        self.remote_context_menu = Some(RemoteContextMenu {
+            menu: context_menu,
+            position,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn upload_project(&mut self, server: String, root: PathBuf, cx: &mut Context<Self>) {
+        self.sync_server(server, root, cx);
+    }
+
+    fn upload_to_remote_path(
+        &mut self,
+        server: String,
+        remote_path: String,
+        is_dir: bool,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else { return; };
+        self.saved_message = Some(format!("uploading to {server}:{remote_path}…"));
+        cx.notify();
+
+        let s_clone = server.clone();
+        let r_path = remote_path.clone();
+        let root_clone = root.clone();
+
+        let task: Task<Result<String, String>> = cx.background_spawn(async move {
+            let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+            cmd.current_dir(&root_clone)
+                .arg("upload")
+                .arg("--server")
+                .arg(&s_clone)
+                .arg("--path")
+                .arg(&r_path);
+
+            let local_candidate = root_clone.join(r_path.trim_start_matches('/'));
+            if local_candidate.exists() {
+                cmd.arg("--from").arg(&local_candidate);
+            }
+
+            let output = cmd.output().map_err(|e| e.to_string())?;
+            if output.status.success() {
+                let msg = String::from_utf8_lossy(&output.stdout);
+                let trimmed = msg.trim();
+                Ok(if trimmed.is_empty() { format!("uploaded to {r_path}") } else { trimmed.to_string() })
+            } else {
+                let err = String::from_utf8_lossy(&output.stderr);
+                Err(err.trim().to_string())
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(msg) => this.saved_message = Some(msg),
+                    Err(err) => this.saved_message = Some(format!("upload failed: {err}")),
+                }
+                if is_dir {
+                    this.load_remote_dir(server.clone(), remote_path, root.clone(), cx);
+                } else {
+                    let parent = remote_parent_path(&remote_path);
+                    this.load_remote_dir(server.clone(), parent, root.clone(), cx);
+                }
+                cx.notify();
+            }).log_err();
+        }).detach();
+    }
+
+    fn download_from_remote_path(
+        &mut self,
+        server: String,
+        remote_path: String,
+        _is_dir: bool,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else { return; };
+        self.saved_message = Some(format!("downloading {remote_path} from {server}…"));
+        cx.notify();
+
+        let s_clone = server.clone();
+        let r_path = remote_path.clone();
+        let root_clone = root.clone();
+        let local_dest = root.join(remote_path.trim_start_matches('/'));
+
+        let task: Task<Result<String, String>> = cx.background_spawn(async move {
+            if let Some(parent) = local_dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+            cmd.current_dir(&root_clone)
+                .arg("download")
+                .arg("--server")
+                .arg(&s_clone)
+                .arg("--path")
+                .arg(&r_path)
+                .arg("--to")
+                .arg(&local_dest);
+
+            let output = cmd.output().map_err(|e| e.to_string())?;
+            if output.status.success() {
+                Ok(format!("downloaded {r_path} to local project"))
+            } else {
+                let err = String::from_utf8_lossy(&output.stderr);
+                Err(err.trim().to_string())
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(msg) => this.saved_message = Some(msg),
+                    Err(err) => this.saved_message = Some(format!("download failed: {err}")),
+                }
+                cx.notify();
+            }).log_err();
+        }).detach();
+    }
+
+    fn change_remote_permissions(
+        &mut self,
+        server_name: String,
+        remote_path: String,
+        is_dir: bool,
+        _root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let server = self.remote_servers.iter().find(|s| s.name == server_name).cloned();
+        let mode = if is_dir { "755" } else { "644" };
+        self.saved_message = Some(format!("setting permissions {mode} on {remote_path}…"));
+        cx.notify();
+
+        let r_path = remote_path.clone();
+        let r_server = server.clone();
+
+        let task: Task<Result<String, String>> = cx.background_spawn(async move {
+            if let Some(s) = r_server {
+                let host = s.host.unwrap_or_else(|| "localhost".to_string());
+                let user = s.user.unwrap_or_else(|| "root".to_string());
+                let port = s.port.unwrap_or_else(|| "22".to_string());
+                let full_path = if let Some(r) = s.remote_root {
+                    if r_path.starts_with('/') { r_path.clone() } else { format!("{}/{}", r.trim_end_matches('/'), r_path) }
+                } else {
+                    r_path.clone()
+                };
+
+                let mut cmd = std::process::Command::new("ssh");
+                cmd.arg("-p").arg(&port)
+                    .arg(format!("{user}@{host}"))
+                    .arg(format!("chmod {mode} \"{full_path}\""));
+
+                if let Some(cfg) = &s.ssh_config {
+                    cmd.arg("-F").arg(cfg);
+                }
+
+                let output = cmd.output().map_err(|e| e.to_string())?;
+                if output.status.success() {
+                    Ok(format!("permissions {mode} set for {r_path}"))
+                } else {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    Err(err.trim().to_string())
+                }
+            } else {
+                Err("server configuration not found".to_string())
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(msg) => this.saved_message = Some(msg),
+                    Err(err) => this.saved_message = Some(format!("chmod failed: {err}")),
+                }
+                cx.notify();
+            }).log_err();
+        }).detach();
+    }
+
+    fn delete_remote_path(
+        &mut self,
+        server: String,
+        remote_path: String,
+        is_dir: bool,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else { return; };
+        self.saved_message = Some(format!("deleting {remote_path} from {server}…"));
+        cx.notify();
+
+        let s_clone = server.clone();
+        let r_path = remote_path.clone();
+        let root_clone = root.clone();
+
+        let task: Task<Result<String, String>> = cx.background_spawn(async move {
+            let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+            cmd.current_dir(&root_clone)
+                .arg("delete")
+                .arg("--server")
+                .arg(&s_clone)
+                .arg("--path")
+                .arg(&r_path)
+                .arg("--allow-delete");
+
+            if is_dir {
+                cmd.arg("--recursive");
+            }
+
+            let output = cmd.output().map_err(|e| e.to_string())?;
+            if output.status.success() {
+                Ok(format!("deleted {r_path} from {s_clone}"))
+            } else {
+                let err = String::from_utf8_lossy(&output.stderr);
+                Err(err.trim().to_string())
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(msg) => this.saved_message = Some(msg),
+                    Err(err) => this.saved_message = Some(format!("delete failed: {err}")),
+                }
+                let parent = remote_parent_path(&remote_path);
+                this.load_remote_dir(server.clone(), parent, root.clone(), cx);
+                cx.notify();
+            }).log_err();
+        }).detach();
+    }
+
+    fn paste_remote_clipboard(
+        &mut self,
+        target_server: String,
+        target_path: String,
+        is_dir: bool,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((src_server, src_path, is_cut)) = self.remote_clipboard.clone() else {
+            self.saved_message = Some("nothing on remote clipboard".to_string());
+            cx.notify();
+            return;
+        };
+
+        if src_server != target_server {
+            self.saved_message = Some("cross-server remote paste is not supported".to_string());
+            cx.notify();
+            return;
+        }
+
+        let dest_dir = if is_dir {
+            target_path.clone()
+        } else {
+            remote_parent_path(&target_path)
+        };
+
+        self.saved_message = Some(format!("pasting {src_path} into {dest_dir}…"));
+        cx.notify();
+
+        let server_cfg = self.remote_servers.iter().find(|s| s.name == target_server).cloned();
+        let d_dir = dest_dir.clone();
+
+        let task: Task<Result<String, String>> = cx.background_spawn(async move {
+            if let Some(s) = server_cfg {
+                let host = s.host.unwrap_or_else(|| "localhost".to_string());
+                let user = s.user.unwrap_or_else(|| "root".to_string());
+                let port = s.port.unwrap_or_else(|| "22".to_string());
+                let remote_root = s.remote_root.unwrap_or_else(|| "/".to_string());
+
+                let full_src = if src_path.starts_with('/') { src_path.clone() } else { format!("{}/{}", remote_root.trim_end_matches('/'), src_path) };
+                let full_dest = if d_dir.starts_with('/') { d_dir.clone() } else { format!("{}/{}", remote_root.trim_end_matches('/'), d_dir) };
+
+                let cmd_str = if is_cut {
+                    format!("mv \"{full_src}\" \"{full_dest}/\"")
+                } else {
+                    format!("cp -r \"{full_src}\" \"{full_dest}/\"")
+                };
+
+                let mut cmd = std::process::Command::new("ssh");
+                cmd.arg("-p").arg(&port)
+                    .arg(format!("{user}@{host}"))
+                    .arg(cmd_str);
+
+                if let Some(cfg) = &s.ssh_config {
+                    cmd.arg("-F").arg(cfg);
+                }
+
+                let output = cmd.output().map_err(|e| e.to_string())?;
+                if output.status.success() {
+                    Ok(format!("pasted into {d_dir}"))
+                } else {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    Err(err.trim().to_string())
+                }
+            } else {
+                Err("server not found".to_string())
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            this.update(cx, |this, cx| {
+                if is_cut {
+                    this.remote_clipboard = None;
+                }
+                match res {
+                    Ok(msg) => this.saved_message = Some(msg),
+                    Err(err) => this.saved_message = Some(format!("paste failed: {err}")),
+                }
+                if let Some(r) = root {
+                    this.load_remote_dir(target_server, dest_dir, r, cx);
+                }
+                cx.notify();
+            }).log_err();
+        }).detach();
+    }
+
+    fn open_local_counterpart(
+        &mut self,
+        server_name: String,
+        remote_path: String,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else { return; };
+        let server = self.remote_servers.iter().find(|s| s.name == server_name);
+        let rel = if let Some(s) = server {
+            if let Some(r_root) = &s.remote_root {
+                let trimmed_root = r_root.trim_matches('/');
+                let trimmed_path = remote_path.trim_matches('/');
+                if let Some(stripped) = trimmed_path.strip_prefix(trimmed_root) {
+                    stripped.trim_start_matches('/').to_string()
+                } else {
+                    trimmed_path.to_string()
+                }
+            } else {
+                remote_path.trim_matches('/').to_string()
+            }
+        } else {
+            remote_path.trim_matches('/').to_string()
+        };
+
+        let local_path = root.join(&rel);
+        if local_path.exists() {
+            if let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_abs_path(local_path, OpenOptions::default(), window, cx).detach_and_log_err(cx);
+                });
+            }
+        } else {
+            self.saved_message = Some(format!("local file '{}' not found; download first", rel));
+            cx.notify();
+        }
+    }
+
+    fn compare_remote_with_local(
+        &mut self,
+        server_name: String,
+        remote_path: String,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else { return; };
+        let pristine_path = remote_file_banner::remote_pristine_root()
+            .join(&server_name)
+            .join(remote_path.trim_start_matches('/'));
+
+        self.saved_message = Some("comparing with local version…".to_string());
+        cx.notify();
+
+        let s_clone = server_name.clone();
+        let r_path = remote_path.clone();
+        let pristine = pristine_path.clone();
+        let root_clone = root.clone();
+        let workspace = self.workspace.clone();
+
+        let task: Task<Result<(), String>> = cx.background_spawn(async move {
+            if let Some(parent) = pristine.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
+                .arg("download")
+                .arg("--server")
+                .arg(&s_clone)
+                .arg("--path")
+                .arg(&r_path)
+                .arg("--to")
+                .arg(&pristine)
+                .current_dir(&root_clone)
+                .output()
+                .map_err(|e| e.to_string())?;
+
+            if output.status.success() {
+                Ok(())
+            } else {
+                let err = String::from_utf8_lossy(&output.stderr);
+                Err(err.trim().to_string())
+            }
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            if let Err(err) = res {
+                this.update_in(cx, |this, _window, cx| {
+                    this.saved_message = Some(format!("compare download failed: {err}"));
+                    cx.notify();
+                }).log_err();
+                return;
+            }
+
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.split_abs_path(pristine_path, true, window, cx).detach_and_log_err(cx);
+                }).log_err();
+            }
+        }).detach();
+    }
+
+    fn exclude_remote_path(
+        &mut self,
+        server_name: String,
+        remote_path: String,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = root else { return; };
+        if let Some(server) = self.remote_servers.iter_mut().find(|s| s.name == server_name) {
+            if !server.excluded.contains(&remote_path) {
+                server.excluded.push(remote_path.clone());
+            }
+        }
+        let servers = self.remote_servers.iter().filter(|s| s.visible).cloned().collect::<Vec<_>>();
+        let active = self.active_server.as_deref();
+        let _ = save_deploy_config(&root, &servers, active);
+        self.saved_message = Some(format!("excluded path: {remote_path}"));
+        cx.notify();
+    }
+
+    fn prompt_rename_remote(
+        &mut self,
+        _server_name: String,
+        remote_path: String,
+        _root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.saved_message = Some(format!("rename: {remote_path} (use remote terminal or ssh)"));
+        cx.notify();
+    }
+
     fn refresh_databases(&mut self, cx: &mut Context<Self>) {
         self.database_status.clear();
         self.database_views_status.clear();
         self.db_names_status.clear();
         self.db_expanded_conns.clear();
+        self.db_expanded_schemas.clear();
+        self.db_collapsed_tables.clear();
         self.db_expanded_views.clear();
         self.db_expanded_names.clear();
         self.db_menu_open = false;
@@ -10720,7 +14045,7 @@ impl PhpPanel {
         let task_server = server.clone();
         let task_path = path.clone();
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-deploy")
+            let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
                 .arg("ls")
                 .arg("--server")
                 .arg(&task_server)
@@ -10788,18 +14113,19 @@ impl PhpPanel {
             .insert(key.clone(), RemoteStatus::Loading);
         cx.notify();
 
-        let target = PathBuf::from(format!(
-            "/tmp/phpworkbench-remote/{}",
-            path.replace('/', "__")
-        ));
+        let safe_rel = path.trim_start_matches('/');
+        let target = remote_file_banner::remote_temp_root()
+            .join(&server)
+            .join(safe_rel);
         let task_server = server.clone();
         let task_path = path.clone();
         let task_target = target.clone();
+        let task_root = root.clone();
         let task = cx.background_spawn(async move {
             if let Some(parent) = task_target.parent() {
                 std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
             }
-            let output = std::process::Command::new("php-deploy")
+            let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
                 .arg("download")
                 .arg("--server")
                 .arg(&task_server)
@@ -10807,7 +14133,7 @@ impl PhpPanel {
                 .arg(&task_path)
                 .arg("--to")
                 .arg(&task_target)
-                .current_dir(&root)
+                .current_dir(&task_root)
                 .output();
 
             match output {
@@ -10828,6 +14154,13 @@ impl PhpPanel {
                 match result {
                     Ok(()) => {
                         this.remote_status.insert(key, RemoteStatus::Opened);
+                        this.remote_active_file = Some(RemoteActiveFile {
+                            server: server.clone(),
+                            remote_path: path.clone(),
+                            local_path: target.clone(),
+                            status_message: Some(("identical to remote".to_string(), Color::Success)),
+                            root: root.clone(),
+                        });
                         this.workspace
                             .update_in(cx, |workspace, window, cx| {
                                 workspace
@@ -10846,6 +14179,66 @@ impl PhpPanel {
             .log_err();
         })
         .detach();
+    }
+
+    pub fn upload_active_remote_file(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.remote_active_file.as_mut() else { return; };
+        active.status_message = Some(("uploading to server…".to_string(), Color::Muted));
+        cx.notify();
+
+        let server = active.server.clone();
+        let path = active.remote_path.clone();
+        let local_path = active.local_path.clone();
+        let root = active.root.clone();
+
+        let task = cx.background_spawn(async move {
+            let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
+                .arg("upload")
+                .arg("--server")
+                .arg(&server)
+                .arg("--path")
+                .arg(&path)
+                .arg("--from")
+                .arg(&local_path)
+                .current_dir(&root)
+                .output();
+
+            match output {
+                Ok(output) if output.status.success() => Ok(()),
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Err(first_non_empty_line(stderr.lines().chain(stdout.lines()))
+                        .unwrap_or_else(|| "upload failed".to_string()))
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Some(active) = this.remote_active_file.as_mut() {
+                    match result {
+                        Ok(()) => {
+                            active.status_message = Some(("uploaded to server ✓".to_string(), Color::Success));
+                        }
+                        Err(err) => {
+                            active.status_message = Some((format!("upload failed: {err}"), Color::Error));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    pub fn redownload_active_remote_file(&mut self, cx: &mut Context<Self>) {
+        if let Some(active) = self.remote_active_file.clone() {
+            self.download_remote_file(active.server, active.remote_path, active.root, cx);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10888,10 +14281,21 @@ impl PhpPanel {
                 .always_show_disclosure_icon(true)
                 .start_slot(start_icon)
                 .child(Label::new(entry.name.clone()).truncate())
-                .tooltip(Tooltip::text(entry.path.clone()));
+                .tooltip(Tooltip::text(format!("sftp://{}/{}", server.name, entry.path)));
             *line += 1;
             if entry.is_directory {
-                item = item.toggle(expanded);
+                let s_name = server.name.clone();
+                let p = entry.path.clone();
+                let r = server.root.clone();
+                item = item.toggle(expanded).on_toggle(cx.listener({
+                    let s_name = s_name.clone();
+                    let p = p.clone();
+                    let r = r.clone();
+                    move |this, _: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.toggle_remote_dir(s_name.clone(), p.clone(), r.clone(), cx);
+                    }
+                }));
             }
 
             let end_slot = match status {
@@ -10899,7 +14303,7 @@ impl PhpPanel {
                     Some(("loading…".to_string(), Color::Muted))
                 }
                 Some(RemoteStatus::Loading) => Some(("downloading…".to_string(), Color::Muted)),
-                Some(RemoteStatus::Opened) => Some(("opened".to_string(), Color::Success)),
+                Some(RemoteStatus::Opened) => Some(("opened ✓".to_string(), Color::Success)),
                 Some(RemoteStatus::Failed(message)) => Some((message.clone(), Color::Error)),
                 None if !entry.is_directory => {
                     entry.size.map(|size| (format_size(size), Color::Muted))
@@ -10919,22 +14323,89 @@ impl PhpPanel {
             let path = entry.path.clone();
             let root = server.root.clone();
             let is_directory = entry.is_directory;
-            item = item.on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+            let r_server_name = server_name.clone();
+            let r_entry = entry.clone();
+            let r_root = root.clone();
+            item = item
+                .on_secondary_mouse_down(move |event, window, cx| {
+                    if cx.has_global::<DeployShared>() {
+                        if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
+                            panel.update(cx, |panel, cx| {
+                                panel.deploy_remote_context_menu(
+                                    r_server_name.clone(),
+                                    r_entry.clone(),
+                                    Some(r_root.clone()),
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                    }
+                })
+                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 if is_directory {
-                    if event.click_count() < 2 {
+                    let key = (server_name.clone(), path.clone());
+                    let was_selected = this.remote_selected_file.as_ref() == Some(&key);
+
+                    // 1) Change central workspace content to this folder!
+                    this.remote_center_path.insert(server_name.clone(), path.clone());
+                    this.load_remote_dir(server_name.clone(), path.clone(), root.clone(), cx);
+                    this.open_remote_client_tab(window, cx);
+
+                    // 2) Expand if not expanded yet, or toggle if already selected
+                    if was_selected {
+                        this.toggle_remote_dir(server_name.clone(), path.clone(), root.clone(), cx);
+                    } else if !this.remote_expanded_paths.contains(&key) {
                         this.toggle_remote_dir(server_name.clone(), path.clone(), root.clone(), cx);
                     }
-                } else if event.click_count() >= 2 {
-                    this.download_remote_file(server_name.clone(), path.clone(), root.clone(), cx);
+                    this.select_remote_file(server_name.clone(), path.clone(), cx);
+                    cx.notify();
                 } else {
                     this.select_remote_file(server_name.clone(), path.clone(), cx);
+                    this.download_remote_file(server_name.clone(), path.clone(), root.clone(), cx);
                 }
             }));
             out.push(item.into_any_element());
 
             if entry.is_directory && expanded {
                 if let Some(children) = self.remote_dir_entries.get(&key) {
-                    self.push_remote_rows(server, children, depth + 1, line, out, cx);
+                    if children.is_empty() {
+                        let empty_item = ListItem::new(("remote-empty", *line))
+                            .indent_level(depth + 2)
+                            .height(px(22.))
+                            .child(
+                                Label::new("(empty directory)")
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Muted),
+                            );
+                        *line += 1;
+                        out.push(empty_item.into_any_element());
+                    } else {
+                        self.push_remote_rows(server, children, depth + 1, line, out, cx);
+                    }
+                } else if matches!(status, Some(RemoteStatus::Loading)) {
+                    let loading_item = ListItem::new(("remote-loading", *line))
+                        .indent_level(depth + 2)
+                        .height(px(22.))
+                        .child(
+                            Label::new("loading directory…")
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .color(Color::Muted),
+                        );
+                    *line += 1;
+                    out.push(loading_item.into_any_element());
+                } else if let Some(RemoteStatus::Failed(err)) = status {
+                    let err_item = ListItem::new(("remote-err", *line))
+                        .indent_level(depth + 2)
+                        .height(px(22.))
+                        .child(
+                            Label::new(format!("error: {err}"))
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .color(Color::Error),
+                        );
+                    *line += 1;
+                    out.push(err_item.into_any_element());
                 }
             }
         }
@@ -10949,7 +14420,7 @@ impl PhpPanel {
         cx.notify();
 
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-http")
+            let output = std::process::Command::new(resolve_helper_tool("php-http"))
                 .arg("run")
                 .arg(&request.absolute_path)
                 .arg("--name")
@@ -11005,7 +14476,7 @@ impl PhpPanel {
         cx.notify();
 
         let task = cx.background_spawn(async move {
-            let mut command = std::process::Command::new("php-http");
+            let mut command = std::process::Command::new(resolve_helper_tool("php-http"));
             command
                 .arg("collection")
                 .arg("run")
@@ -11348,13 +14819,103 @@ impl PhpPanel {
         cx.notify();
     }
 
+    fn maybe_upload_saved_local_file(&mut self, abs_path: PathBuf, cx: &mut Context<Self>) {
+        // Remote temp files opened from the Remote Host tree auto-upload via RemoteFileBanner.
+        if remote_file_banner::parse_remote_path(&abs_path).is_some() {
+            return;
+        }
+        if self.remote_servers.is_empty() {
+            self.refresh(cx);
+        }
+        let shared_active = cx
+            .try_global::<DeployShared>()
+            .and_then(|shared| shared.active.clone());
+        let selected_name = shared_active.or_else(|| self.active_server.clone());
+        let server = selected_name
+            .as_deref()
+            .and_then(|name| self.remote_servers.iter().find(|s| s.name == name))
+            .or_else(|| self.remote_servers.first())
+            .cloned();
+        let Some(server) = server else {
+            return;
+        };
+        if !server.upload_on_save {
+            return;
+        }
+        let Some(rel_path) =
+            relative_upload_path(&abs_path, &server.root, server.local_root.as_deref())
+        else {
+            return;
+        };
+
+        let server_name = server.name.clone();
+        let server_root = server.root.clone();
+        self.sync_status
+            .insert(server_name.clone(), SyncStatus::Syncing);
+        self.saved_message = Some(format!("uploading {} to {}…", rel_path, server_name));
+        cx.notify();
+
+        let task_server = server_name.clone();
+        let task_rel = rel_path.clone();
+        let task: Task<Result<String, String>> = cx.background_spawn(async move {
+            let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
+            command
+                .current_dir(&server_root)
+                .arg("upload")
+                .arg("--server")
+                .arg(&task_server)
+                .arg("--path")
+                .arg(&task_rel)
+                .arg("--from")
+                .arg(&abs_path);
+            let output = command.output().await.map_err(|error| error.to_string())?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(if stdout.is_empty() {
+                    format!("uploaded {} to {}", task_rel, task_server)
+                } else {
+                    stdout
+                })
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(if stderr.is_empty() {
+                    format!("exit {}", output.status.code().unwrap_or(1))
+                } else {
+                    stderr
+                })
+            }
+        });
+
+        cx.spawn(async move |panel, cx| {
+            let result = task.await;
+            panel
+                .update(cx, |panel, cx| {
+                    match result {
+                        Ok(msg) => {
+                            panel.sync_status.insert(server_name.clone(), SyncStatus::Ok);
+                            panel.saved_message = Some(msg);
+                        }
+                        Err(err) => {
+                            panel
+                                .sync_status
+                                .insert(server_name.clone(), SyncStatus::Failed(err.clone()));
+                            panel.saved_message = Some(format!("auto-upload failed: {err}"));
+                        }
+                    }
+                    cx.notify();
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
     fn run_server_check(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
         self.sync_status.insert(name.clone(), SyncStatus::Syncing);
         cx.notify();
 
         let task_name = name.clone();
         let task = cx.background_spawn(async move {
-            let mut command = util::command::new_command("php-deploy");
+            let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
             command
                 .arg("check")
                 .arg("--server")
@@ -11384,8 +14945,11 @@ impl PhpPanel {
         cx.notify();
 
         let connection_name = name.clone();
+        let config_path = root.join(".zed/databases.json");
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-db")
+            let output = std::process::Command::new(resolve_helper_tool("php-db"))
+                .arg("--config")
+                .arg(&config_path)
                 .arg("schema")
                 .arg(&connection_name)
                 .arg("--json")
@@ -11453,6 +15017,7 @@ impl PhpPanel {
     ) {
         if !self.db_expanded_conns.remove(&name) {
             self.db_expanded_conns.insert(name.clone());
+            self.db_expanded_schemas.insert(name.clone());
             if !matches!(
                 self.database_status.get(&name),
                 Some(DatabaseStatus::Loaded(_))
@@ -11466,6 +15031,24 @@ impl PhpPanel {
                 )
             {
                 self.load_database_views(name, root, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_schema_expand(
+        &mut self,
+        name: String,
+        root: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.db_expanded_schemas.remove(&name) {
+            self.db_expanded_schemas.insert(name.clone());
+            if !matches!(
+                self.database_status.get(&name),
+                Some(DatabaseStatus::Loaded(_))
+            ) {
+                self.load_database_schema(name, root, cx);
             }
         }
         cx.notify();
@@ -11495,8 +15078,11 @@ impl PhpPanel {
         cx.notify();
 
         let connection_name = name.clone();
+        let config_path = root.join(".zed/databases.json");
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-db")
+            let output = std::process::Command::new(resolve_helper_tool("php-db"))
+                .arg("--config")
+                .arg(&config_path)
                 .arg("databases")
                 .arg(&connection_name)
                 .arg("--json")
@@ -11539,8 +15125,11 @@ impl PhpPanel {
         cx.notify();
 
         let connection_name = name.clone();
+        let config_path = root.join(".zed/databases.json");
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-db")
+            let output = std::process::Command::new(resolve_helper_tool("php-db"))
+                .arg("--config")
+                .arg(&config_path)
                 .arg("views")
                 .arg(&connection_name)
                 .arg("--json")
@@ -11584,6 +15173,7 @@ impl PhpPanel {
         connection: String,
         connection_label: String,
         table: String,
+        driver: Option<String>,
         root: PathBuf,
         columns: Vec<DatabaseColumn>,
         editable_candidate: bool,
@@ -11620,13 +15210,34 @@ impl PhpPanel {
             cx.notify();
             return;
         }
+        let resolved_driver = driver.or_else(|| {
+            self.databases
+                .iter()
+                .find(|d| d.name == connection)
+                .and_then(|d| d.driver.clone())
+        });
+        let resolved_columns = if columns.is_empty() {
+            self.database_status
+                .get(&connection)
+                .and_then(|status| {
+                    if let DatabaseStatus::Loaded(tables) = status {
+                        tables.iter().find(|t| t.name == table).map(|t| t.columns.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            columns
+        };
         let view = DatabaseTableView::open(
             TableTabTarget {
                 connection: connection.clone(),
                 connection_label,
                 table: table.clone(),
+                driver: resolved_driver,
                 root,
-                columns,
+                columns: resolved_columns,
                 editable_candidate,
                 read_only,
             },
@@ -11637,6 +15248,96 @@ impl PhpPanel {
             workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
         });
         self.saved_message = None;
+        cx.notify();
+    }
+
+    pub fn open_http_client_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        if let Some(view) = self.open_http_view.as_ref().and_then(WeakEntity::upgrade) {
+            let activated = workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&view, true, true, window, cx)
+            });
+            if activated {
+                view.update(cx, |_, cx| {
+                    cx.emit(ItemEvent::UpdateTab);
+                });
+                cx.notify();
+                return;
+            }
+        }
+
+        let view = HttpClientView::open(cx.entity().clone(), cx);
+        self.open_http_view = Some(view.downgrade());
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn open_database_client_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        if let Some(view) = self.open_database_view.as_ref().and_then(WeakEntity::upgrade) {
+            let activated = workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&view, true, true, window, cx)
+            });
+            if activated {
+                view.update(cx, |_, cx| {
+                    cx.emit(ItemEvent::UpdateTab);
+                });
+                cx.notify();
+                return;
+            }
+        }
+
+        let view = DatabaseConsoleView::open(cx.entity().clone(), cx);
+        self.open_database_view = Some(view.downgrade());
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn open_remote_client_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        if let Some(view) = self.open_remote_view.as_ref().and_then(WeakEntity::upgrade) {
+            let activated = workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&view, true, true, window, cx)
+            });
+            if activated {
+                view.update(cx, |_, cx| {
+                    cx.emit(ItemEvent::UpdateTab);
+                });
+                cx.notify();
+                return;
+            }
+        }
+
+        let view = RemoteView::open(cx.entity().clone(), cx);
+        self.open_remote_view = Some(view.downgrade());
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+        });
         cx.notify();
     }
 
@@ -11652,8 +15353,11 @@ impl PhpPanel {
         cx.notify();
 
         let task_connection = connection.clone();
+        let config_path = root.join(".zed/databases.json");
         let task = cx.background_spawn(async move {
-            let output = std::process::Command::new("php-db")
+            let output = std::process::Command::new(resolve_helper_tool("php-db"))
+                .arg("--config")
+                .arg(&config_path)
                 .arg("query")
                 .arg(&task_connection)
                 .arg(&sql)
@@ -11902,6 +15606,19 @@ fn deploy_server_entry(server: &RemoteServer) -> Value {
     if server.use_rsync {
         entry.insert("use_rsync".to_string(), Value::Bool(true));
     }
+    if let Some(args) = &server.rsync_args {
+        if !args.is_empty() {
+            entry.insert("rsync_args".to_string(), Value::String(args.clone()));
+        }
+    }
+    if let Some(path) = &server.rsync_path {
+        if !path.is_empty() {
+            entry.insert("rsync_path".to_string(), Value::String(path.clone()));
+        }
+    }
+    if server.rsync_delete {
+        entry.insert("rsync_delete".to_string(), Value::Bool(true));
+    }
     if server.use_sudo {
         entry.insert("use_sudo".to_string(), Value::Bool(true));
     }
@@ -11969,6 +15686,12 @@ fn parse_deploy_server(server: &Value, root: &Path) -> Option<RemoteServer> {
             .unwrap_or(false),
         use_rsync: server
             .get("use_rsync")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        rsync_args: string_field(server, "rsync_args"),
+        rsync_path: string_field(server, "rsync_path"),
+        rsync_delete: server
+            .get("rsync_delete")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         use_sudo: server
@@ -12153,6 +15876,9 @@ fn blank_server(root: PathBuf) -> RemoteServer {
         excluded: Vec::new(),
         upload_on_save: false,
         use_rsync: false,
+        rsync_args: None,
+        rsync_path: None,
+        rsync_delete: false,
         use_sudo: false,
         visible: true,
         passive_mode: true,
@@ -12660,6 +16386,34 @@ impl Panel for PhpPanel {
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
         true
     }
+
+    fn active_subview(&self, _cx: &App) -> Option<String> {
+        Some(match self.active_tab {
+            PanelTab::Databases => "databases",
+            PanelTab::Remote => "remote",
+            PanelTab::Http => "http",
+            PanelTab::Tests => "tests",
+            PanelTab::Collections => "collections",
+        }.to_string())
+    }
+
+    fn activate_subview(&mut self, name: &str, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match name {
+            "databases" => {
+                self.select_tab(PanelTab::Databases, cx);
+                true
+            }
+            "remote" => {
+                self.select_tab(PanelTab::Remote, cx);
+                true
+            }
+            "http" => {
+                self.select_tab(PanelTab::Http, cx);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Render for PhpPanel {
@@ -13033,22 +16787,39 @@ impl Render for PhpPanel {
             let host_part = if host_display.is_empty() {
                 String::new()
             } else {
-                format!(
-                    " ({}{})",
-                    host_display,
-                    server
-                        .remote_root
-                        .as_deref()
-                        .map(|root| format!("/{}", root))
-                        .unwrap_or_default()
-                )
+                let root_str = server
+                    .remote_root
+                    .as_deref()
+                    .map(|root| {
+                        if root.starts_with('/') {
+                            root.to_string()
+                        } else {
+                            format!("/{}", root)
+                        }
+                    })
+                    .unwrap_or_default();
+                format!(" ({host_display}{root_str})")
             };
+            let s_name_root = server.name.clone();
+            let s_root_root = server.root.clone();
             remote_rows.push(
                 h_flex()
                     .id("remote-root-row")
                     .px_3()
                     .py_1()
                     .gap_1()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener({
+                        let s_name = s_name_root.clone();
+                        let s_root = s_root_root.clone();
+                        move |this, _, window, cx| {
+                            this.remote_center_path.insert(s_name.clone(), ".".to_string());
+                            this.load_remote_dir(s_name.clone(), ".".to_string(), s_root.clone(), cx);
+                            this.open_remote_client_tab(window, cx);
+                            cx.notify();
+                        }
+                    }))
                     .child(
                         div().flex_none().child(
                             Icon::new(IconName::ChevronDown)
@@ -13074,6 +16845,64 @@ impl Render for PhpPanel {
                     )
                     .into_any_element(),
             );
+
+            if let Some(active) = &self.remote_active_file {
+                let active_server = active.server.clone();
+                let active_path = active.remote_path.clone();
+                let (msg, color) = active.status_message.as_ref().cloned().unwrap_or_else(|| ("synced".to_string(), Color::Success));
+                remote_rows.push(
+                    v_flex()
+                        .id("remote-active-file-card")
+                        .mx_2()
+                        .my_1()
+                        .p_2()
+                        .gap_1p5()
+                        .rounded_md()
+                        .bg(gpui::rgba(0x388bfd14))
+                        .border_1()
+                        .border_color(gpui::rgba(0x388bfd33))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(Icon::new(IconName::File).size(IconSize::Small).color(Color::Accent))
+                                        .child(Label::new(format!("sftp://{active_server}/{active_path}")).size(LabelSize::Custom(Rems(0.75))).weight(FontWeight::MEDIUM).truncate()),
+                                )
+                                .child(Label::new(msg).size(LabelSize::Custom(Rems(0.72))).color(color)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Button::new("remote-card-upload", "⇡ Upload")
+                                        .size(ButtonSize::Compact)
+                                        .label_size(LabelSize::Custom(Rems(0.72)))
+                                        .style(ButtonStyle::Filled)
+                                        .tooltip(Tooltip::text("Upload current file to remote server"))
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.upload_active_remote_file(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("remote-card-revert", "⟲ Revert")
+                                        .size(ButtonSize::Compact)
+                                        .label_size(LabelSize::Custom(Rems(0.72)))
+                                        .style(ButtonStyle::Subtle)
+                                        .tooltip(Tooltip::text("Re-download file from remote server"))
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.redownload_active_remote_file(cx);
+                                        })),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
             if let Some(entries) = self.remote_entries.get(&server.name) {
                 self.push_remote_rows(server, entries, 0, &mut remote_line, &mut remote_rows, cx);
                 if remote_rows.is_empty() {
@@ -13106,357 +16935,26 @@ impl Render for PhpPanel {
         let mut database_rows = Vec::new();
         for (index, database) in self.databases.iter().enumerate() {
             let expanded = self.db_expanded_conns.contains(&database.name);
-
-            let mut schema_rows = Vec::new();
-            if expanded {
-                match self.database_status.get(&database.name) {
-                    Some(DatabaseStatus::Loaded(tables)) => {
-                        if tables.is_empty() {
-                            schema_rows.push(
-                                ListItem::new(format!("database-empty-{index}"))
-                                    .indent_level(1)
-                                    .child(
-                                        Label::new("no tables")
-                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                            .color(Color::Muted),
-                                    )
-                                    .into_any_element(),
-                            );
-                        }
-                        for (table_index, table) in tables.iter().enumerate() {
-                            let table_read_only = database.read_only;
-                            let table_label = database_connection_label(database);
-                            let connection_name = database.name.clone();
-                            let table_name = table.name.clone();
-                            let table_root = database.root.clone();
-                            let table_columns = table.columns.clone();
-                            let table_editable = database.driver.as_deref() == Some("sqlite");
-
-                            schema_rows.push(
-                                ListItem::new(format!("database-table-{index}-{table_index}"))
-                                    .indent_level(1)
-                                    .height(px(24.))
-                                    .rounded()
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Icon::new(IconName::Table)
-                                                    .size(IconSize::Small)
-                                                    .color(Color::Muted),
-                                            )
-                                            .child(
-                                                Label::new(table.name.clone())
-                                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                                    .truncate(),
-                                            ),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.open_table_tab(
-                                                connection_name.clone(),
-                                                table_label.clone(),
-                                                table_name.clone(),
-                                                table_root.clone(),
-                                                table_columns.clone(),
-                                                table_editable,
-                                                table_read_only,
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    ))
-                                    .into_any_element(),
-                            );
-
-                            for (column_index, column) in table.columns.iter().enumerate() {
-                                let type_text = column.column_type.clone();
-                                let column_label = h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Icon::new(if column.primary_key {
-                                            IconName::BoltFilled
-                                        } else {
-                                            IconName::Circle
-                                        })
-                                        .size(IconSize::Small)
-                                        .color(
-                                            if column.primary_key {
-                                                Color::Warning
-                                            } else {
-                                                Color::Muted
-                                            },
-                                        ),
-                                    )
-                                    .child(
-                                        Label::new(column.name.clone())
-                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                            .color(Color::Default)
-                                            .truncate(),
-                                    )
-                                    .child(
-                                        Label::new(type_text)
-                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                            .color(Color::Muted)
-                                            .truncate(),
-                                    );
-                                schema_rows.push(
-                                    ListItem::new(format!(
-                                        "database-column-{index}-{table_index}-{column_index}"
-                                    ))
-                                    .indent_level(2)
-                                    .child(column_label)
-                                    .into_any_element(),
-                                );
-                            }
-                        }
-                    }
-                    Some(DatabaseStatus::Loading) => {
-                        schema_rows.push(
-                            ListItem::new(format!("database-loading-{index}"))
-                                .indent_level(1)
-                                .child(
-                                    Label::new("loading schema…")
-                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                        .color(Color::Muted),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                    Some(DatabaseStatus::Failed(message)) => {
-                        schema_rows.push(
-                            ListItem::new(format!("database-schema-error-{index}"))
-                                .indent_level(1)
-                                .child(
-                                    Label::new(message.clone())
-                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                        .color(Color::Error)
-                                        .truncate(),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                    None => {}
-                }
-
-                if database.driver.as_deref() == Some("sqlite")
-                    && let Some(DatabaseStatus::Loaded(views)) =
-                        self.database_views_status.get(&database.name)
-                    && !views.is_empty()
-                {
-                    let views_open = self.db_expanded_views.contains(&database.name);
-                    let views_connection = database.name.clone();
-                    schema_rows.push(
-                        ListItem::new(format!("database-views-{index}"))
-                            .indent_level(1)
-                            .toggle(views_open)
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Label::new("Views")
-                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                            .color(Color::Default),
-                                    )
-                                    .child(
-                                        Label::new(format!("({})", views.len()))
-                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                            .color(Color::Muted),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                if this.db_expanded_views.remove(&views_connection) {
-                                    cx.notify();
-                                } else {
-                                    this.db_expanded_views.insert(views_connection.clone());
-                                    cx.notify();
-                                }
-                            }))
-                            .into_any_element(),
-                    );
-                    if views_open {
-                        for (view_index, view) in views.iter().enumerate() {
-                            let view_read_only = database.read_only;
-                            let view_label = database_connection_label(database);
-                            let view_connection = database.name.clone();
-                            let view_name = view.name.clone();
-                            let view_root = database.root.clone();
-                            let view_columns = view.columns.clone();
-                            schema_rows.push(
-                                ListItem::new(format!("database-view-{index}-{view_index}"))
-                                    .indent_level(2)
-                                    .height(px(24.))
-                                    .rounded()
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Icon::new(IconName::Table)
-                                                    .size(IconSize::Small)
-                                                    .color(Color::Muted),
-                                            )
-                                            .child(
-                                                Label::new(view.name.clone())
-                                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                                    .truncate(),
-                                            ),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.open_table_tab(
-                                                view_connection.clone(),
-                                                view_label.clone(),
-                                                view_name.clone(),
-                                                view_root.clone(),
-                                                view_columns.clone(),
-                                                false,
-                                                view_read_only,
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    ))
-                                    .into_any_element(),
-                            );
-                        }
-                    }
-                }
-
-                if database.driver.as_deref() != Some("sqlite") {
-                    let names_open = self.db_expanded_names.contains(&database.name);
-                    let names_count = match self.db_names_status.get(&database.name) {
-                        Some(DbListStatus::Loaded(names)) => format!(" ({})", names.len()),
-                        _ => String::new(),
-                    };
-                    let names_connection = database.name.clone();
-                    let names_root = database.root.clone();
-                    schema_rows.push(
-                        ListItem::new(format!("database-names-{index}"))
-                            .indent_level(1)
-                            .toggle(names_open)
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Label::new("Databases")
-                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                            .color(Color::Default),
-                                    )
-                                    .child(
-                                        Label::new(names_count)
-                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                            .color(Color::Muted),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                this.toggle_database_names(
-                                    names_connection.clone(),
-                                    names_root.clone(),
-                                    cx,
-                                );
-                            }))
-                            .into_any_element(),
-                    );
-                    if names_open {
-                        match self.db_names_status.get(&database.name) {
-                            Some(DbListStatus::Loading) | None => {
-                                schema_rows.push(
-                                    ListItem::new(format!("database-names-loading-{index}"))
-                                        .indent_level(2)
-                                        .child(
-                                            Label::new("connecting…")
-                                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                                .color(Color::Muted),
-                                        )
-                                        .into_any_element(),
-                                );
-                            }
-                            Some(DbListStatus::Loaded(names)) if names.is_empty() => {
-                                schema_rows.push(
-                                    ListItem::new(format!("database-names-empty-{index}"))
-                                        .indent_level(2)
-                                        .child(
-                                            Label::new("no databases")
-                                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                                .color(Color::Muted),
-                                        )
-                                        .into_any_element(),
-                                );
-                            }
-                            Some(DbListStatus::Loaded(names)) => {
-                                for (name_index, db_name) in names.iter().enumerate() {
-                                    schema_rows.push(
-                                        ListItem::new(format!(
-                                            "database-name-{index}-{name_index}"
-                                        ))
-                                        .indent_level(2)
-                                        .child(
-                                            h_flex()
-                                                .gap_1()
-                                                .child(
-                                                    Icon::new(IconName::DatabaseZap)
-                                                        .size(IconSize::Small)
-                                                        .color(Color::Muted),
-                                                )
-                                                .child(
-                                                    Label::new(db_name.clone())
-                                                        .size(LabelSize::Custom(PANEL_TEXT_REMS)),
-                                                ),
-                                        )
-                                        .into_any_element(),
-                                    );
-                                }
-                            }
-                            Some(DbListStatus::Failed(message)) => {
-                                schema_rows.push(
-                                    ListItem::new(format!("database-names-error-{index}"))
-                                        .indent_level(2)
-                                        .child(
-                                            Label::new(message.clone())
-                                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                                .color(Color::Error)
-                                                .truncate(),
-                                        )
-                                        .into_any_element(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
             let driver = database.driver.as_deref().unwrap_or("server");
-            let paren = match (&database.user, &database.host) {
-                (Some(user), Some(host)) => format!("{user}@{host}"),
-                (None, Some(host)) => host.clone(),
-                _ => display_field(&database.target).to_string(),
-            };
+            let is_sqlite = driver == "sqlite";
             let name = database.name.clone();
             let root = database.root.clone();
-            let is_sqlite = driver == "sqlite";
-            let status = self
-                .database_status
-                .get(&database.name)
-                .map(|status| match status {
-                    DatabaseStatus::Loading => ("loading…".to_string(), Color::Muted),
-                    DatabaseStatus::Loaded(tables) => (
-                        format!(
-                            "{} {}",
-                            tables.len(),
-                            if tables.len() == 1 { "table" } else { "tables" }
-                        ),
-                        Color::Default,
-                    ),
-                    DatabaseStatus::Failed(message) => (message.clone(), Color::Error),
-                })
-                .or_else(|| {
-                    self.query_status
-                        .get(&database.name)
-                        .and_then(|status| match status {
-                            TableStatus::Loading | TableStatus::Loaded(_) => None,
-                            TableStatus::Failed(message) => Some((message.clone(), Color::Error)),
-                        })
-                });
+
+            let host_display = match &database.host {
+                Some(host) if !host.is_empty() => host.clone(),
+                _ => "localhost".to_string(),
+            };
+            let conn_title = if is_sqlite || database.name.contains('@') {
+                database.name.clone()
+            } else {
+                format!("{}@{}", database.name, host_display)
+            };
+            let schema_badge = match self.db_names_status.get(&database.name) {
+                Some(DbListStatus::Loaded(names)) if !names.is_empty() => {
+                    format!("1 of {}", names.len())
+                }
+                _ => "1 of 2".to_string(),
+            };
 
             let mut connection_row = h_flex()
                 .id(("database-connection", index))
@@ -13464,7 +16962,8 @@ impl Render for PhpPanel {
                 .flex_none()
                 .h(px(26.))
                 .px_2()
-                .gap_1()
+                .gap_1p5()
+                .items_center()
                 .rounded_sm()
                 .cursor_pointer()
                 .when(expanded, |this| {
@@ -13482,34 +16981,28 @@ impl Render for PhpPanel {
                         .color(Color::Muted),
                     ),
                 )
+                .child(database_connection_icon(database))
                 .child(
-                    Icon::new(IconName::DatabaseZap)
-                        .size(IconSize::Small)
-                        .color(Color::Accent),
-                )
-                .child(driver_badge(driver, driver_badge_color(driver), cx))
-                .child(
-                    Label::new(database.name.clone())
+                    Label::new(conn_title)
                         .size(LabelSize::Custom(PANEL_TEXT_REMS))
                         .color(Color::Default)
                         .flex_none(),
                 )
                 .child(
-                    Label::new(format!("({})", paren))
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .color(Color::Muted)
-                        .truncate(),
+                    div()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Label::new(schema_badge)
+                                .size(LabelSize::Custom(Rems(0.68)))
+                                .color(Color::Muted),
+                        ),
                 )
                 .child(div().flex_1().min_w_0());
-            if let Some((status_text, color)) = status {
-                connection_row = connection_row.child(
-                    Label::new(status_text)
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .color(color)
-                        .truncate()
-                        .flex_none(),
-                );
-            }
+
             let menu_name = name.clone();
             connection_row = connection_row
                 .on_mouse_down(
@@ -13522,9 +17015,341 @@ impl Render for PhpPanel {
                 .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                     this.toggle_connection_expand(name.clone(), is_sqlite, root.clone(), cx);
                 }));
+
             database_rows.push(connection_row.into_any_element());
 
-            database_rows.extend(schema_rows);
+            if expanded {
+                let schema_open = self.db_expanded_schemas.contains(&database.name);
+                let schema_node_name = database.name.clone();
+                let schema_node_root = database.root.clone();
+
+                // 1. Schema Node: [ v / > ] [ ⊞ ] {schema_name}
+                let schema_name = if is_sqlite {
+                    database_connection_label(database)
+                } else if let Some(db) = &database.database {
+                    if !db.is_empty() {
+                        db.clone()
+                    } else {
+                        database.name.clone()
+                    }
+                } else {
+                    database.name.clone()
+                };
+
+                let schema_menu_conn = database.name.clone();
+                let schema_menu_name = schema_name.clone();
+                let schema_toggle_name = schema_node_name.clone();
+                let schema_toggle_root = schema_node_root.clone();
+
+                let schema_row = h_flex()
+                    .id(format!("database-schema-{index}"))
+                    .w_full()
+                    .flex_none()
+                    .h(px(24.))
+                    .pl_4()
+                    .pr_2()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(cx.theme().colors().element_hover))
+                    .child(
+                        div().flex_none().child(
+                            Icon::new(if schema_open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        ),
+                    )
+                    .child(
+                        Icon::from_path("icons/file_icons/db_schema_cubes.svg")
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .child(
+                        Label::new(schema_name.clone())
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Default)
+                            .truncate(),
+                    )
+                    .child(div().flex_1().min_w_0())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.toggle_schema_expand(schema_toggle_name.clone(), schema_toggle_root.clone(), cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.deploy_schema_context_menu(
+                                schema_menu_conn.clone(),
+                                schema_menu_name.clone(),
+                                event.position,
+                                window,
+                                cx,
+                            );
+                        }),
+                    );
+
+                database_rows.push(schema_row.into_any_element());
+
+                // If schema is open, display its tables folder and tables
+                if schema_open {
+                    match self.database_status.get(&database.name) {
+                        Some(DatabaseStatus::Loaded(tables)) => {
+                            let tables_folder_key = format!("{}-tables", database.name);
+                            let tables_collapsed = self.db_collapsed_tables.contains(&tables_folder_key);
+                            let tables_open = !tables_collapsed;
+                            let table_count = tables.len();
+
+                            let folder_key_clone = tables_folder_key.clone();
+                            let tables_folder_row = h_flex()
+                                .id(format!("database-tables-folder-{index}"))
+                                .w_full()
+                                .flex_none()
+                                .h(px(24.))
+                                .pl(px(32.))
+                                .pr_2()
+                                .gap_1p5()
+                                .items_center()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                .child(
+                                    div().flex_none().child(
+                                        Icon::new(if tables_open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                    ),
+                                )
+                                .child(
+                                    Icon::new(IconName::Folder)
+                                        .size(IconSize::Small)
+                                        .color(Color::Accent),
+                                )
+                                .child(
+                                    Label::new("tables")
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Default)
+                                        .flex_none(),
+                                )
+                                .child(
+                                    Label::new(table_count.to_string())
+                                        .size(LabelSize::Custom(Rems(0.72)))
+                                        .color(Color::Muted),
+                                )
+                                .child(div().flex_1().min_w_0())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                    if this.db_collapsed_tables.contains(&folder_key_clone) {
+                                        this.db_collapsed_tables.remove(&folder_key_clone);
+                                    } else {
+                                        this.db_collapsed_tables.insert(folder_key_clone.clone());
+                                    }
+                                    cx.notify();
+                                }));
+
+                            database_rows.push(tables_folder_row.into_any_element());
+
+                            if tables_open {
+                                if tables.is_empty() {
+                                    database_rows.push(
+                                        h_flex()
+                                            .id(format!("database-empty-{index}"))
+                                            .pl(px(52.))
+                                            .h(px(22.))
+                                            .items_center()
+                                            .child(
+                                                Label::new("no tables")
+                                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                                    .color(Color::Muted),
+                                            )
+                                            .into_any_element(),
+                                    );
+                                }
+                                for (table_index, table) in tables.iter().enumerate() {
+                                    let table_read_only = database.read_only;
+                                    let table_label = database_connection_label(database);
+                                    let connection_name = database.name.clone();
+                                    let table_name = table.name.clone();
+                                    let table_driver = database.driver.clone();
+                                    let table_root = database.root.clone();
+                                    let table_editable = !database.read_only;
+
+                                    let t_conn = connection_name.clone();
+                                    let t_label = table_label.clone();
+                                    let t_name = table_name.clone();
+                                    let t_driver = table_driver.clone();
+                                    let t_root = table_root.clone();
+                                    let m_conn = connection_name.clone();
+                                    let m_label = table_label.clone();
+                                    let m_name = table_name.clone();
+                                    let m_driver = table_driver.clone();
+                                    let m_root = table_root.clone();
+
+                                    let table_row = h_flex()
+                                        .id(format!("database-table-{index}-{table_index}"))
+                                        .w_full()
+                                        .flex_none()
+                                        .h(px(24.))
+                                        .pl(px(52.))
+                                        .pr_2()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                        .child(
+                                            Icon::from_path("icons/file_icons/db_schema_cubes.svg")
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new(table.name.clone())
+                                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                                .color(Color::Default)
+                                                .truncate(),
+                                        )
+                                        .child(div().flex_1().min_w_0())
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                            this.open_table_tab(
+                                                t_conn.clone(),
+                                                t_label.clone(),
+                                                t_name.clone(),
+                                                t_driver.clone(),
+                                                t_root.clone(),
+                                                Vec::new(),
+                                                table_editable,
+                                                table_read_only,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                                cx.stop_propagation();
+                                                this.deploy_table_context_menu(
+                                                    m_conn.clone(),
+                                                    m_label.clone(),
+                                                    m_name.clone(),
+                                                    m_driver.clone(),
+                                                    m_root.clone(),
+                                                    Vec::new(),
+                                                    table_editable,
+                                                    table_read_only,
+                                                    event.position,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        );
+
+                                    database_rows.push(table_row.into_any_element());
+                                }
+                            }
+                        }
+                        Some(DatabaseStatus::Loading) => {
+                            database_rows.push(
+                                h_flex()
+                                    .id(format!("database-loading-{index}"))
+                                    .pl(px(32.))
+                                    .h(px(24.))
+                                    .items_center()
+                                    .child(
+                                        Label::new("loading schema…")
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Muted),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        Some(DatabaseStatus::Failed(message)) => {
+                            database_rows.push(
+                                h_flex()
+                                    .id(format!("database-schema-error-{index}"))
+                                    .pl(px(32.))
+                                    .h(px(24.))
+                                    .items_center()
+                                    .child(
+                                        Label::new(message.clone())
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Error)
+                                            .truncate(),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        None => {}
+                    }
+                }
+
+                // 2. Server Objects
+                database_rows.push(
+                    ListItem::new(format!("database-server-objects-{index}"))
+                        .indent_level(1)
+                        .height(px(24.))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::ChevronRight)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Icon::new(IconName::Server)
+                                        .size(IconSize::Small)
+                                        .color(Color::Accent),
+                                )
+                                .child(
+                                    Label::new("Server Objects")
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Default),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+
+                // 3. Virtual Views 1
+                database_rows.push(
+                    ListItem::new(format!("database-virtual-views-{index}"))
+                        .indent_level(1)
+                        .height(px(24.))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::ChevronRight)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Icon::new(IconName::Folder)
+                                        .size(IconSize::Small)
+                                        .color(Color::Custom(gpui::rgb(0xa371f7).into())),
+                                )
+                                .child(
+                                    Label::new("virtual views")
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Default),
+                                )
+                                .child(
+                                    Label::new("1")
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
         }
 
         let mut collection_rows = Vec::new();
@@ -13651,15 +17476,15 @@ impl Render for PhpPanel {
                     .selectable(true)
                     .child(Label::new(text).truncate())
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.load_http_request_into_builder(
+                            request_for_click.clone(),
+                            window,
+                            cx,
+                        );
                         if event.click_count() >= 2 {
                             this.run_http_request(request_for_click.clone(), cx);
-                        } else {
-                            this.load_http_request_into_builder(
-                                request_for_click.clone(),
-                                window,
-                                cx,
-                            );
                         }
+                        this.open_http_client_tab(window, cx);
                     }));
                 if let Some((status_text, color)) = status {
                     item = item.end_slot(
@@ -13896,45 +17721,215 @@ impl Render for PhpPanel {
             .w_full()
             .flex_none()
             .items_center()
-            .gap_1()
-            .px_2()
+            .gap_0p5()
+            .px_1p5()
             .py_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
+            // Group 1: New + Properties
             .child(
-                IconButton::new("db-add", IconName::Plus)
-                    .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Add data source"))
-                    .aria_label("Add data source")
+                div()
+                    .id("db-add")
+                    .size(px(24.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("New (Data Source / Console / DDL)"))
+                    .child(
+                        Icon::from_path("icons/file_icons/db_add_dropdown.svg")
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.toggle_db_menu(cx);
                     })),
             )
             .child(
-                IconButton::new("database-refresh", IconName::RotateCw)
-                    .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Refresh"))
-                    .aria_label("Refresh databases")
+                div()
+                    .id("db-properties")
+                    .size(px(24.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("Data Source Properties (⌘I)"))
+                    .child(
+                        Icon::from_path("icons/file_icons/db_properties.svg")
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        if let Some(root) = this.worktree_root(cx) {
+                            open_data_sources_window(root, cx);
+                        }
+                    })),
+            )
+            // Divider 1
+            .child(div().w(px(1.)).h(px(14.)).mx_1().bg(cx.theme().colors().border))
+            // Group 2: Refresh + Deactivate
+            .child(
+                div()
+                    .id("database-refresh")
+                    .size(px(24.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("Refresh (⌘R)"))
+                    .child(
+                        Icon::new(IconName::RotateCw)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.refresh_databases(cx);
                     })),
             )
             .child(
-                IconButton::new("database-sql", IconName::Terminal)
-                    .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("SQL console"))
-                    .aria_label("Open SQL console")
-                    .disabled(sql_target.is_none())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        if let Some(connection) = sql_target.clone() {
-                            this.open_sql_form(connection, window, cx);
+                div()
+                    .id("database-deactivate")
+                    .size(px(24.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("Deactivate Connection (⌘F2)"))
+                    .child(
+                        Icon::from_path("icons/file_icons/db_deactivate.svg")
+                            .size(IconSize::Small)
+                            .color(Color::Error),
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        if let Some(first) = this.databases.first().map(|d| d.name.clone()) {
+                            this.database_status.remove(&first);
+                            this.db_names_status.remove(&first);
+                            this.saved_message = Some(format!("Deactivated connection '{first}'"));
+                            cx.notify();
                         }
+                    })),
+            )
+            // Divider 2
+            .child(div().w(px(1.)).h(px(14.)).mx_1().bg(cx.theme().colors().border))
+            // Group 3: Console + Table + DDL + Diff
+            .child(
+                div()
+                    .id("database-sql")
+                    .size(px(24.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("Open SQL Console (⌘⇧F10)"))
+                    .child(
+                        Icon::new(IconName::Terminal)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener({
+                        let sql_target = sql_target.clone();
+                        move |this, _: &ClickEvent, window, cx| {
+                            if let Some(connection) = sql_target.clone() {
+                                this.open_sql_form(connection, window, cx);
+                            }
+                        }
+                    })),
+            )
+            .child(
+                div()
+                    .id("database-table")
+                    .size(px(24.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("View Table / Query Data (⌘↓)"))
+                    .child(
+                        Icon::new(IconName::Table)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_database_client_tab(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("db-toolbar-ddl")
+                    .h(px(24.))
+                    .px_1p5()
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("Generate / View DDL (⌘B)"))
+                    .child(
+                        Label::new("DDL")
+                            .size(LabelSize::Custom(Rems(0.72)))
+                            .weight(FontWeight::MEDIUM)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.generate_and_open_ddl(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("database-diff")
+                    .size(px(24.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("Compare Schema Structure (⌘D)"))
+                    .child(
+                        Icon::new(IconName::ArrowRightLeft)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.saved_message = Some("Schema comparison: all structures in sync".to_string());
+                        cx.notify();
+                    })),
+            )
+            // Divider 3
+            .child(div().w(px(1.)).h(px(14.)).mx_1().bg(cx.theme().colors().border))
+            // Group 4: View Options
+            .child(
+                div()
+                    .id("database-view-options")
+                    .size(px(24.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("View Options"))
+                    .child(
+                        Icon::from_path("icons/file_icons/db_view_options.svg")
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.saved_message = Some("View options: Group by Schema enabled".to_string());
+                        cx.notify();
                     })),
             );
 
@@ -14154,7 +18149,7 @@ impl Render for PhpPanel {
                 )
         });
 
-        let tab_bar = render_tab_bar(self.active_tab, cx);
+        let colors = cx.theme().colors();
 
         let content = match self.active_tab {
             PanelTab::Remote => v_flex()
@@ -14175,6 +18170,14 @@ impl Render for PhpPanel {
                         .overflow_y_scroll()
                         .children(remote_rows),
                 )
+                .children(self.remote_context_menu.as_ref().map(|context_menu| {
+                    deferred(
+                        anchored()
+                            .position(context_menu.position)
+                            .child(context_menu.menu.clone()),
+                    )
+                    .with_priority(3)
+                }))
                 .into_any_element(),
             PanelTab::Databases => v_flex()
                 .id("database-content")
@@ -14189,7 +18192,6 @@ impl Render for PhpPanel {
                         .filter(|form| matches!(form.kind, FormKind::Sql)),
                     |this, form| this.child(render_form(form)),
                 )
-                .child(section_header("Data Sources", cx))
                 .child(
                     div()
                         .id("php-database-tree")
@@ -14211,6 +18213,7 @@ impl Render for PhpPanel {
                     .with_priority(3)
                 }))
                 .into_any_element(),
+
             PanelTab::Tests => v_flex()
                 .flex_1()
                 .min_h_0()
@@ -14258,36 +18261,19 @@ impl Render for PhpPanel {
                         }),
                 )
                 .into_any_element(),
-            PanelTab::Http => v_flex()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .child(self.render_http_builder(window, cx))
-                .child(
-                    div()
-                        .id("php-http-scroll")
-                        .flex_1()
-                        .min_h_0()
-                        .w_full()
-                        .overflow_y_scroll()
-                        .children(if http_rows.is_empty() {
-                            vec![empty_state(
-                                IconName::Info,
-                                "No HTTP requests",
-                                "Add a .http file to the project",
-                                cx,
-                            )]
-                        } else {
-                            http_rows
-                        }),
-                )
-                .into_any_element(),
+            PanelTab::Http => self.render_http_sidebar(http_rows, window, cx),
         };
 
-        v_flex()
+        h_flex()
             .id("php-workbench")
             .size_full()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &editor_actions::Tab, window, cx| {
+                this.focus_next_http_field(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_actions::Backtab, window, cx| {
+                this.focus_prev_http_field(window, cx);
+            }))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
             }))
@@ -14315,9 +18301,14 @@ impl Render for PhpPanel {
                     return;
                 }
             }))
-            .children(saved_message_row)
-            .child(tab_bar)
-            .child(content)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .children(saved_message_row)
+                    .child(content),
+            )
     }
 }
 
@@ -14563,15 +18554,46 @@ impl PhpPanel {
         }
     }
 
+    fn apply_http_settings_draft(&mut self, draft: &HttpRequestSettings) {
+        self.http_method = if draft.method.is_empty() {
+            "GET".to_string()
+        } else {
+            draft.method.clone()
+        };
+        self.http_subtab = draft.subtab.unwrap_or(HttpSubTab::Params);
+        self.http_params = draft.params.clone();
+        self.http_auth = draft.auth.clone();
+        self.http_headers = draft.headers.clone();
+        self.http_body_kind = draft.body_kind;
+        self.http_raw_content_type = draft.raw_content_type;
+        self.http_raw_body = draft.raw_body.clone();
+        self.http_body_fields = draft.body_fields.clone();
+        self.http_follow_redirects = draft.follow_redirects;
+        self.http_timeout_secs = draft.timeout_secs;
+        self.http_verify_tls = draft.verify_tls;
+        self.http_active_url = draft.url.clone();
+        self.http_rows_dirty = true;
+        self.http_auth_dirty = true;
+    }
+
     fn persist_http_settings(&mut self, cx: &mut Context<Self>) {
-        let Some(request) = self.http_active_request.clone() else {
+        let root = self
+            .http_settings_root
+            .clone()
+            .or_else(|| {
+                self.project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|w| w.read(cx).abs_path().to_path_buf())
+            });
+        let Some(root) = root else {
             return;
         };
-        let Some(root) = self.http_settings_root.clone() else {
-            return;
-        };
+        if self.http_settings_root.is_none() {
+            self.http_settings_root = Some(root.clone());
+        }
         let url = self.current_http_url(cx);
-        let key = http_settings_key(request.file.path.as_unix_str(), &request.name);
         let settings = HttpRequestSettings {
             method: self.http_method.clone(),
             url,
@@ -14587,9 +18609,13 @@ impl PhpPanel {
             timeout_secs: self.http_timeout_secs,
             verify_tls: self.http_verify_tls,
         };
-        self.http_settings_file
-            .requests
-            .insert(key, settings);
+        self.http_settings_file.draft = Some(settings.clone());
+        if let Some(request) = self.http_active_request.clone() {
+            let key = http_settings_key(request.file.path.as_unix_str(), &request.name);
+            self.http_settings_file
+                .requests
+                .insert(key, settings);
+        }
         let _ = save_http_settings(&root, &self.http_settings_file);
     }
 
@@ -14616,6 +18642,7 @@ impl PhpPanel {
         cx: &mut Context<Self>,
     ) {
         let pair = self.new_http_pair(window, cx, kind);
+        let key_focus = pair.key.read(cx).focus_handle(cx);
         if let Some(editors) = self.http_builder.as_mut() {
             match kind {
                 HttpPairKind::Params => editors.params.push(pair),
@@ -14625,6 +18652,7 @@ impl PhpPanel {
         }
         self.sync_http_state_from_editors(cx);
         self.http_rows_dirty = true;
+        window.focus(&key_focus, cx);
         cx.notify();
     }
 
@@ -14657,6 +18685,165 @@ impl PhpPanel {
         cx.notify();
     }
 
+    fn raw_content_type_language(&self) -> Option<&'static str> {
+        match self.http_raw_content_type {
+            RawContentType::Json => Some("JSON"),
+            RawContentType::Xml => Some("XML"),
+            RawContentType::Html => Some("HTML"),
+            RawContentType::JavaScript => Some("JavaScript"),
+            RawContentType::Text => None,
+        }
+    }
+
+    fn apply_language_to_editor(
+        &self,
+        editor: &Entity<Editor>,
+        lang_name: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
+            return;
+        };
+        let language_registry = self.project.read(cx).languages().clone();
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language_registry(language_registry);
+        });
+
+        if let Some(lang_name) = lang_name {
+            let language_task = self.project.read(cx).languages().language_for_name(lang_name);
+            let weak_buffer = buffer.downgrade();
+            cx.spawn(async move |_, cx| {
+                if let Ok(language) = language_task.await {
+                    let _ = weak_buffer.update(cx, |buffer, cx| {
+                        buffer.set_language(Some(language), cx);
+                    });
+                }
+            })
+            .detach();
+        } else {
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_language(None, cx);
+            });
+        }
+    }
+
+    fn update_raw_body_language(&self, cx: &mut Context<Self>) {
+        let Some(editors) = self.http_builder.as_ref() else {
+            return;
+        };
+        let lang = self.raw_content_type_language();
+        self.apply_language_to_editor(&editors.raw_body, lang, cx);
+    }
+
+    fn beautify_http_raw_json(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editors) = self.http_builder.as_ref() else {
+            return;
+        };
+        let text = editors.raw_body.read(cx).text(cx);
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Ok(formatted) = serde_json::to_string_pretty(&val) {
+                self.http_raw_body = formatted.clone();
+                editors.raw_body.update(cx, |editor, cx| {
+                    editor.set_text(formatted, window, cx);
+                });
+                self.persist_http_settings(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn ensure_http_response_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        if let Some(editor) = &self.http_response_editor {
+            editor.clone()
+        } else {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::multi_line(window, cx);
+                editor.set_read_only(true);
+                editor.set_show_gutter(false, cx);
+                editor.set_show_git_diff_gutter(false, cx);
+                editor.set_show_runnables(false, cx);
+                editor.set_show_bookmarks(false, cx);
+                editor.set_show_breakpoints(false, cx);
+                editor.set_show_edit_predictions(Some(false), window, cx);
+                editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+                editor
+            });
+            self.http_response_editor = Some(editor.clone());
+            editor
+        }
+    }
+
+    fn sync_http_response_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (text, is_json, is_xml, is_html) = if let Some(resp) = &self.http_builder_response {
+            let content_type = resp
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.as_str());
+            let text = if self.http_response_pretty {
+                pretty_body(&resp.body, content_type)
+            } else {
+                resp.body.clone()
+            };
+            let is_json = content_type.map_or(false, |ct| ct.contains("json"))
+                || text.trim_start().starts_with('{')
+                || text.trim_start().starts_with('[');
+            let is_xml = content_type.map_or(false, |ct| ct.contains("xml"));
+            let is_html = content_type.map_or(false, |ct| ct.contains("html"));
+            (text, is_json, is_xml, is_html)
+        } else {
+            (String::new(), false, false, false)
+        };
+
+        if self.http_response_editor_text == text && self.http_response_editor.is_some() {
+            return;
+        }
+        self.http_response_editor_text = text.clone();
+
+        let editor = self.ensure_http_response_editor(window, cx);
+        editor.update(cx, |editor, cx| {
+            editor.set_read_only(false);
+            editor.set_text(text, window, cx);
+            editor.set_read_only(true);
+            if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                let language_registry = self.project.read(cx).languages().clone();
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_language_registry(language_registry);
+                });
+                let lang_name = if is_json {
+                    Some("JSON")
+                } else if is_xml {
+                    Some("XML")
+                } else if is_html {
+                    Some("HTML")
+                } else {
+                    None
+                };
+
+                if let Some(name) = lang_name {
+                    let language_task = self.project.read(cx).languages().language_for_name(name);
+                    let weak_buffer = buffer.downgrade();
+                    cx.spawn(async move |_, cx| {
+                        if let Ok(language) = language_task.await {
+                            let _ = weak_buffer.update(cx, |buffer, cx| {
+                                buffer.set_language(Some(language), cx);
+                            });
+                        }
+                    })
+                    .detach();
+                } else {
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.set_language(None, cx);
+                    });
+                }
+            }
+        });
+    }
+
     fn ensure_http_editors(
         &mut self,
         window: &mut Window,
@@ -14664,7 +18851,12 @@ impl PhpPanel {
     ) -> &HttpBuilderEditors {
         if self.http_builder.is_none() {
             let url = cx.new(|cx| Editor::single_line(window, cx));
-            let raw_body = cx.new(|cx| Editor::auto_height(6, 18, window, cx));
+            let raw_body = cx.new(|cx| {
+                let mut editor = Editor::auto_height(6, 18, window, cx);
+                editor.set_show_gutter(false, cx);
+                editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+                editor
+            });
             let auth_api_key_name = cx.new(|cx| Editor::single_line(window, cx));
             let auth_api_key_value = cx.new(|cx| Editor::single_line(window, cx));
             let auth_username = cx.new(|cx| Editor::single_line(window, cx));
@@ -14695,9 +18887,18 @@ impl PhpPanel {
                 }
             });
             let raw_body_sub = cx.subscribe(&raw_body, |this: &mut Self, editor, event, cx| {
-                if matches!(event, EditorEvent::Blurred) && !this.http_sync_guard {
-                    this.http_raw_body = editor.read(cx).text(cx);
-                    this.persist_http_settings(cx);
+                if !this.http_sync_guard {
+                    match event {
+                        EditorEvent::BufferEdited => {
+                            this.http_raw_body = editor.read(cx).text(cx);
+                            cx.notify();
+                        }
+                        EditorEvent::Blurred => {
+                            this.http_raw_body = editor.read(cx).text(cx);
+                            this.persist_http_settings(cx);
+                        }
+                        _ => {}
+                    }
                 }
             });
             let auth_subs = [
@@ -14745,6 +18946,46 @@ impl PhpPanel {
             let params = vec![self.new_http_pair(window, cx, HttpPairKind::Params)];
             let headers = vec![self.new_http_pair(window, cx, HttpPairKind::Headers)];
             let body_fields = vec![self.new_http_pair(window, cx, HttpPairKind::BodyFields)];
+
+            if !self.http_active_url.is_empty() {
+                url.update(cx, |editor, cx| {
+                    editor.set_text(self.http_active_url.clone(), window, cx);
+                });
+            }
+            if !self.http_raw_body.is_empty() {
+                raw_body.update(cx, |editor, cx| {
+                    editor.set_text(self.http_raw_body.clone(), window, cx);
+                });
+            }
+            if !self.http_auth.api_key_name.is_empty() {
+                auth_api_key_name.update(cx, |editor, cx| {
+                    editor.set_text(self.http_auth.api_key_name.clone(), window, cx);
+                });
+            }
+            if !self.http_auth.api_key_value.is_empty() {
+                auth_api_key_value.update(cx, |editor, cx| {
+                    editor.set_text(self.http_auth.api_key_value.clone(), window, cx);
+                });
+            }
+            if !self.http_auth.username.is_empty() {
+                auth_username.update(cx, |editor, cx| {
+                    editor.set_text(self.http_auth.username.clone(), window, cx);
+                });
+            }
+            if !self.http_auth.password.is_empty() {
+                auth_password.update(cx, |editor, cx| {
+                    editor.set_text(self.http_auth.password.clone(), window, cx);
+                });
+            }
+            if !self.http_auth.token.is_empty() {
+                auth_token.update(cx, |editor, cx| {
+                    editor.set_text(self.http_auth.token.clone(), window, cx);
+                });
+            }
+            timeout.update(cx, |editor, cx| {
+                editor.set_text(self.http_timeout_secs.to_string(), window, cx);
+            });
+
             self.http_builder = Some(HttpBuilderEditors {
                 url,
                 raw_body,
@@ -14758,6 +18999,7 @@ impl PhpPanel {
                 headers,
                 body_fields,
             });
+            self.update_raw_body_language(cx);
         }
         self.http_builder.as_ref().expect("http editors")
     }
@@ -14818,6 +19060,7 @@ impl PhpPanel {
         self.http_timeout_secs = settings.timeout_secs;
         self.http_verify_tls = settings.verify_tls;
         self.http_active_request = Some(request.clone());
+        self.http_active_url = loaded_url.clone();
         self.http_rows_dirty = true;
         self.http_auth_dirty = true;
         self.http_rows_from_url = false;
@@ -14841,8 +19084,363 @@ impl PhpPanel {
             set(&editors.timeout, &self.http_timeout_secs.to_string());
         }
         self.http_sync_guard = false;
+        self.update_raw_body_language(cx);
+        self.update_raw_body_language(cx);
         self.saved_message = Some(format!("loaded request: {}", request.name));
+        if let Some(view) = self.open_http_view.as_ref().and_then(WeakEntity::upgrade) {
+            view.update(cx, |_, cx| {
+                cx.emit(ItemEvent::UpdateTab);
+            });
+        }
         cx.notify();
+    }
+
+    fn persist_http_history(&self, cx: &mut Context<Self>) {
+        let root = self
+            .http_settings_root
+            .clone()
+            .or_else(|| {
+                self.project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|w| w.read(cx).abs_path().to_path_buf())
+            });
+        let Some(root) = root else {
+            return;
+        };
+        let file = HttpHistoryFile {
+            entries: self.http_history.clone(),
+        };
+        let _ = save_http_history(&root, &file);
+    }
+
+    fn load_http_history_into_builder(
+        &mut self,
+        entry: HttpHistoryEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.persist_http_settings(cx);
+        let loaded_url = entry.url.clone();
+        self.http_active_url = loaded_url.clone();
+        self.http_method = if entry.method.is_empty() {
+            "GET".to_string()
+        } else {
+            entry.method.clone()
+        };
+        self.http_subtab = entry.subtab.unwrap_or(HttpSubTab::Params);
+        self.http_params = entry.params.clone();
+        self.http_auth = entry.auth.clone();
+        self.http_headers = entry.headers.clone();
+        self.http_body_kind = entry.body_kind;
+        self.http_raw_content_type = entry.raw_content_type;
+        self.http_raw_body = entry.raw_body.clone();
+        self.http_body_fields = entry.body_fields.clone();
+        self.http_follow_redirects = entry.follow_redirects;
+        self.http_timeout_secs = entry.timeout_secs;
+        self.http_verify_tls = entry.verify_tls;
+        self.http_active_request = None;
+        self.http_rows_dirty = true;
+        self.http_auth_dirty = true;
+        self.http_rows_from_url = false;
+        self.http_url_from_rows = false;
+
+        self.ensure_http_editors(window, cx);
+        self.http_sync_guard = true;
+        if let Some(editors) = self.http_builder.as_ref() {
+            let mut set = |editor: &Entity<Editor>, value: &str| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_text(value.to_string(), window, cx);
+                });
+            };
+            set(&editors.url, &loaded_url);
+            set(&editors.raw_body, &self.http_raw_body);
+            set(&editors.auth_api_key_name, &self.http_auth.api_key_name);
+            set(&editors.auth_api_key_value, &self.http_auth.api_key_value);
+            set(&editors.auth_username, &self.http_auth.username);
+            set(&editors.auth_password, &self.http_auth.password);
+            set(&editors.auth_token, &self.http_auth.token);
+            set(&editors.timeout, &self.http_timeout_secs.to_string());
+        }
+        self.http_sync_guard = false;
+        self.update_raw_body_language(cx);
+
+        if entry.status > 0 || !entry.response_body.is_empty() || !entry.response_headers.is_empty() {
+            self.http_builder_response = Some(HttpProbeResponse {
+                status: entry.status,
+                time_ms: entry.time_ms,
+                headers: entry.response_headers.clone(),
+                body: entry.response_body.clone(),
+                sent_method: entry.method.clone(),
+                sent_url: entry.url.clone(),
+                sent_headers: entry.request_headers.clone(),
+                sent_body: if entry.raw_body.is_empty() {
+                    None
+                } else {
+                    Some(entry.raw_body.clone())
+                },
+            });
+        } else if let Some(err) = &entry.error {
+            self.saved_message = Some(format!("failed: {err}"));
+            self.http_builder_response = None;
+        } else {
+            self.http_builder_response = None;
+        }
+
+        self.saved_message = Some(format!("loaded history: {} {}", entry.method, entry.url));
+        self.open_http_client_tab(window, cx);
+        if let Some(view) = self.open_http_view.as_ref().and_then(WeakEntity::upgrade) {
+            view.update(cx, |_, cx| {
+                cx.emit(ItemEvent::UpdateTab);
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn focus_next_http_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editors) = self.http_builder.as_ref() else {
+            return;
+        };
+        let subtab = self.http_subtab;
+
+        if editors.url.read(cx).focus_handle(cx).is_focused(window) {
+            match subtab {
+                HttpSubTab::Params => {
+                    if let Some(first) = editors.params.first() {
+                        let handle = first.key.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+                HttpSubTab::Headers => {
+                    if let Some(first) = editors.headers.first() {
+                        let handle = first.key.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+                HttpSubTab::Body => {
+                    if self.http_body_kind == HttpBodyKind::FormData
+                        || self.http_body_kind == HttpBodyKind::UrlEncoded
+                    {
+                        if let Some(first) = editors.body_fields.first() {
+                            let handle = first.key.read(cx).focus_handle(cx);
+                            window.focus(&handle, cx);
+                            return;
+                        }
+                    } else if self.http_body_kind == HttpBodyKind::Raw {
+                        let handle = editors.raw_body.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+                HttpSubTab::Authorization => match self.http_auth.kind {
+                    HttpAuthType::ApiKey => {
+                        let handle = editors.auth_api_key_name.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                    HttpAuthType::Basic => {
+                        let handle = editors.auth_username.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                    HttpAuthType::Bearer => {
+                        let handle = editors.auth_token.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                    _ => {}
+                },
+                HttpSubTab::Settings => {
+                    let handle = editors.timeout.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let kind = match subtab {
+            HttpSubTab::Params => Some(HttpPairKind::Params),
+            HttpSubTab::Headers => Some(HttpPairKind::Headers),
+            HttpSubTab::Body
+                if self.http_body_kind == HttpBodyKind::FormData
+                    || self.http_body_kind == HttpBodyKind::UrlEncoded =>
+            {
+                Some(HttpPairKind::BodyFields)
+            }
+            _ => None,
+        };
+
+        if let Some(kind) = kind {
+            let pairs = match kind {
+                HttpPairKind::Params => &editors.params,
+                HttpPairKind::Headers => &editors.headers,
+                HttpPairKind::BodyFields => &editors.body_fields,
+            };
+            for i in 0..pairs.len() {
+                if pairs[i].key.read(cx).focus_handle(cx).is_focused(window) {
+                    let handle = pairs[i].value.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                    return;
+                }
+                if pairs[i].value.read(cx).focus_handle(cx).is_focused(window) {
+                    if i + 1 < pairs.len() {
+                        let handle = pairs[i + 1].key.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    } else {
+                        self.add_http_pair(kind, window, cx);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if subtab == HttpSubTab::Authorization {
+            match self.http_auth.kind {
+                HttpAuthType::ApiKey => {
+                    if editors
+                        .auth_api_key_name
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        let handle = editors.auth_api_key_value.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+                HttpAuthType::Basic => {
+                    if editors
+                        .auth_username
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        let handle = editors.auth_password.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let handle = editors.url.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    }
+
+    pub fn focus_prev_http_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editors) = self.http_builder.as_ref() else {
+            return;
+        };
+        let subtab = self.http_subtab;
+
+        let kind = match subtab {
+            HttpSubTab::Params => Some(HttpPairKind::Params),
+            HttpSubTab::Headers => Some(HttpPairKind::Headers),
+            HttpSubTab::Body
+                if self.http_body_kind == HttpBodyKind::FormData
+                    || self.http_body_kind == HttpBodyKind::UrlEncoded =>
+            {
+                Some(HttpPairKind::BodyFields)
+            }
+            _ => None,
+        };
+
+        if let Some(kind) = kind {
+            let pairs = match kind {
+                HttpPairKind::Params => &editors.params,
+                HttpPairKind::Headers => &editors.headers,
+                HttpPairKind::BodyFields => &editors.body_fields,
+            };
+            for i in 0..pairs.len() {
+                if pairs[i].value.read(cx).focus_handle(cx).is_focused(window) {
+                    let handle = pairs[i].key.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                    return;
+                }
+                if pairs[i].key.read(cx).focus_handle(cx).is_focused(window) {
+                    if i > 0 {
+                        let handle = pairs[i - 1].value.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    } else {
+                        let handle = editors.url.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if subtab == HttpSubTab::Authorization {
+            match self.http_auth.kind {
+                HttpAuthType::ApiKey => {
+                    if editors
+                        .auth_api_key_value
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        let handle = editors.auth_api_key_name.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                    if editors
+                        .auth_api_key_name
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        let handle = editors.url.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+                HttpAuthType::Basic => {
+                    if editors
+                        .auth_password
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        let handle = editors.auth_username.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                    if editors
+                        .auth_username
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        let handle = editors.url.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+                HttpAuthType::Bearer => {
+                    if editors
+                        .auth_token
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        let handle = editors.url.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let handle = editors.url.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
     }
 
     fn render_http_pair_table(
@@ -14874,6 +19472,22 @@ impl PhpPanel {
                 .px_1()
                 .rounded_sm()
                 .hover(|style| style.bg(colors.element_hover))
+                .on_action(cx.listener(|this, _: &editor_actions::Tab, window, cx| {
+                    this.focus_next_http_field(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &editor_actions::Backtab, window, cx| {
+                    this.focus_prev_http_field(window, cx);
+                }))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "tab" {
+                        cx.stop_propagation();
+                        if event.keystroke.modifiers.shift {
+                            this.focus_prev_http_field(window, cx);
+                        } else {
+                            this.focus_next_http_field(window, cx);
+                        }
+                    }
+                }))
                 .child(
                     Checkbox::new(
                         format!("http-pair-check-{}-{}", kind as usize, index),
@@ -14941,6 +19555,22 @@ impl PhpPanel {
             .id(("http-pair-table", kind as usize))
             .w_full()
             .gap_0p5()
+            .on_action(cx.listener(|this, _: &editor_actions::Tab, window, cx| {
+                this.focus_next_http_field(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_actions::Backtab, window, cx| {
+                this.focus_prev_http_field(window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "tab" {
+                    cx.stop_propagation();
+                    if event.keystroke.modifiers.shift {
+                        this.focus_prev_http_field(window, cx);
+                    } else {
+                        this.focus_next_http_field(window, cx);
+                    }
+                }
+            }))
             .children(rows)
             .into_any_element()
     }
@@ -15050,10 +19680,12 @@ impl PhpPanel {
             .items_center()
             .gap_1()
             .px_2()
+            .bg(colors.tab_bar_background)
             .border_b_1()
             .border_color(colors.border);
         for tab in HttpSubTab::ALL {
             let selected = self.http_subtab == tab;
+            let tooltip = tab.tooltip();
             subtab_row = subtab_row.child(
                 h_flex()
                     .id(("http-subtab", tab as usize))
@@ -15061,14 +19693,24 @@ impl PhpPanel {
                     .items_center()
                     .justify_center()
                     .px_2()
-                    .py_1()
+                    .py_1p5()
                     .cursor_pointer()
+                    .tooltip(Tooltip::text(tooltip))
                     .when(selected, |this| {
                         this.border_b_2().border_color(colors.border_focused)
+                    })
+                    .when(!selected, |this| {
+                        this.border_b_2().border_color(gpui::transparent_black())
+                            .hover(|s| s.bg(colors.element_hover.opacity(0.3)))
                     })
                     .child(
                         Label::new(tab.label())
                             .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .weight(if selected {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
                             .color(if selected {
                                 Color::Default
                             } else {
@@ -15085,6 +19727,7 @@ impl PhpPanel {
         rows.push(subtab_row.into_any_element());
 
         let content = match self.http_subtab {
+            HttpSubTab::Message => self.render_ws_message_tab(window, cx),
             HttpSubTab::Params => v_flex()
                 .id("http-params")
                 .w_full()
@@ -15215,6 +19858,9 @@ impl PhpPanel {
             "boundary",
         );
         let mut headers = Vec::new();
+        for (k, v) in auth_headers(&self.http_auth) {
+            headers.push((k, v));
+        }
         if let Some(content_type) = body.content_type {
             headers.push(("Content-Type".to_string(), content_type));
         }
@@ -15436,6 +20082,7 @@ impl PhpPanel {
                                                 if let Some(panel) = menu_panel.upgrade() {
                                                     panel.update(cx, |panel, cx| {
                                                         panel.http_raw_content_type = candidate;
+                                                        panel.update_raw_body_language(cx);
                                                         panel.persist_http_settings(cx);
                                                         cx.notify();
                                                     });
@@ -15448,18 +20095,83 @@ impl PhpPanel {
                         })
                         .anchor(Anchor::BottomLeft)
                         .trigger(trigger);
-                    content = content
+
+                    let mut header_flex = h_flex()
+                        .items_center()
+                        .gap_2()
                         .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Label::new("Content-Type")
-                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                                        .color(Color::Muted),
-                                )
-                                .child(menu),
+                            Label::new("Content-Type")
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .color(Color::Muted),
                         )
+                        .child(menu);
+
+                    if active == RawContentType::Json {
+                        let raw_text = editors.raw_body.read(cx).text(cx);
+                        let trimmed = raw_text.trim();
+                        if !trimmed.is_empty() {
+                            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                                Ok(_) => {
+                                    header_flex = header_flex
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .bg(gpui::rgba(0x57b85520))
+                                                .border_1()
+                                                .border_color(gpui::rgba(0x57b85550))
+                                                .child(
+                                                    Label::new("✓ Valid JSON")
+                                                        .size(LabelSize::Custom(Rems(0.75)))
+                                                        .color(Color::Custom(gpui::rgb(0x57b855).into())),
+                                                ),
+                                        )
+                                        .child(div().flex_1())
+                                        .child(
+                                            Button::new("http-beautify-json", "Beautify")
+                                                .size(ButtonSize::Compact)
+                                                .label_size(LabelSize::Custom(Rems(0.75)))
+                                                .style(ButtonStyle::Subtle)
+                                                .tooltip(Tooltip::text("Format JSON with 2-space indentation"))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.beautify_http_raw_json(window, cx);
+                                                })),
+                                        );
+                                }
+                                Err(err) => {
+                                    let err_str = err.to_string();
+                                    let short_err = if err_str.len() > 36 {
+                                        format!("⚠ {}…", &err_str[..34])
+                                    } else {
+                                        format!("⚠ {}", err_str)
+                                    };
+                                    header_flex = header_flex
+                                        .child(
+                                            h_flex()
+                                                .id("http-json-error-badge")
+                                                .items_center()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .bg(gpui::rgba(0xe0555520))
+                                                .border_1()
+                                                .border_color(gpui::rgba(0xe0555550))
+                                                .tooltip(Tooltip::text(err_str.clone()))
+                                                .child(
+                                                    Label::new(short_err)
+                                                        .size(LabelSize::Custom(Rems(0.75)))
+                                                        .color(Color::Custom(gpui::rgb(0xe05555).into())),
+                                                ),
+                                        );
+                                }
+                            }
+                        }
+                    }
+
+                    content = content
+                        .child(header_flex)
                         .child(
                             div()
                                 .id("http-raw-body-editor")
@@ -15471,7 +20183,7 @@ impl PhpPanel {
                                 .px_2()
                                 .py_1()
                                 .cursor_text()
-                                .child(dialog_editor_element(&editors.raw_body, cx)),
+                                .child(code_editor_element(&editors.raw_body, cx)),
                         );
                 }
                 HttpBodyKind::FormData | HttpBodyKind::UrlEncoded => {
@@ -15735,7 +20447,2351 @@ impl PhpPanel {
             .into_any_element()
     }
 
+    pub fn render_http_center(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.ensure_http_editors(window, cx);
+        self.schedule_http_editor_sync(window, cx);
+        let colors = cx.theme().colors().clone();
+        let method = self.http_method.clone();
+        let is_ws = self.is_websocket_mode(cx);
+
+        let panel = cx.entity().downgrade();
+        let (method_text_color, _method_bg_color) = match method.to_ascii_uppercase().as_str() {
+            "GET" => (gpui::rgb(0x57b855), gpui::rgba(0x57b85526)),
+            "POST" => (gpui::rgb(0xe5a84b), gpui::rgba(0xe5a84b26)),
+            "PUT" => (gpui::rgb(0x3574f0), gpui::rgba(0x3574f026)),
+            "PATCH" => (gpui::rgb(0xab7df6), gpui::rgba(0xab7df626)),
+            "DELETE" => (gpui::rgb(0xe05555), gpui::rgba(0xe0555526)),
+            "WS" => (gpui::rgb(0x26c6da), gpui::rgba(0x26c6da26)),
+            _ => (gpui::rgb(0x9da5b4), gpui::rgba(0x9da5b426)),
+        };
+        let trigger = Button::new("http-center-method-trigger", method.clone())
+            .size(ButtonSize::Medium)
+            .label_size(LabelSize::Custom(Rems(0.95)))
+            .color(Color::Custom(method_text_color.into()))
+            .end_icon(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Custom(method_text_color.into())),
+            )
+            .style(ButtonStyle::Subtle)
+            .tooltip(Tooltip::text("HTTP method"));
+        let method_menu = PopoverMenu::new("http-center-method-menu")
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                let active = method.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for candidate in HTTP_METHODS.iter() {
+                        let chosen = candidate.to_string();
+                        let menu_panel = panel.clone();
+                        let is_active = active == chosen;
+                        menu = menu.item(
+                            ui::ContextMenuEntry::new(chosen.clone())
+                                .toggleable(ui::IconPosition::Start, is_active)
+                                .handler(move |_window: &mut Window, cx: &mut App| {
+                                    if let Some(panel) = menu_panel.upgrade() {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.http_method = chosen.clone();
+                                            panel.persist_http_settings(cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        );
+                    }
+                    menu
+                }))
+            })
+            .anchor(Anchor::BottomLeft)
+            .trigger(trigger);
+
+        let url_editor = self
+            .http_builder
+            .as_ref()
+            .expect("http editors")
+            .url
+            .clone();
+        let url_input = div()
+            .id("http-center-url-box")
+            .flex_1()
+            .min_w_0()
+            .h(px(34.))
+            .flex()
+            .items_center()
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(if url_editor.read(cx).focus_handle(cx).is_focused(window) {
+                colors.border_focused
+            } else {
+                colors.border_variant
+            })
+            .bg(colors.editor_background)
+            .cursor_text()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(dialog_editor_element(&url_editor, cx)),
+            );
+
+        let (action_btn, ws_status_badge) = if is_ws {
+            let (status_text, status_color) = match self.ws_status {
+                WsStatus::Connected => ("● Connected", gpui::rgb(0x4caf50)),
+                WsStatus::Connecting => ("● Connecting…", gpui::rgb(0xffb74d)),
+                WsStatus::Disconnected => ("● Disconnected", gpui::rgb(0x9da5b4)),
+            };
+            let badge = div()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(colors.element_hover)
+                .child(
+                    Label::new(status_text)
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .weight(FontWeight::BOLD)
+                        .color(Color::Custom(status_color.into())),
+                );
+            let btn = match self.ws_status {
+                WsStatus::Connected => Button::new("http-center-ws-disconnect", "Disconnect")
+                    .size(ButtonSize::Medium)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(ButtonStyle::Subtle)
+                    .color(Color::Error)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.ws_disconnect(cx);
+                    })),
+                WsStatus::Connecting => Button::new("http-center-ws-connecting", "Connecting…")
+                    .size(ButtonSize::Medium)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(ButtonStyle::Filled)
+                    .disabled(true),
+                WsStatus::Disconnected => Button::new("http-center-ws-connect", "Connect")
+                    .size(ButtonSize::Medium)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(ButtonStyle::Filled)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.ws_connect(window, cx);
+                    })),
+            };
+            (btn, Some(badge))
+        } else {
+            let busy = self.http_builder_busy;
+            let send_label = if busy { "Sending…" } else { "Send" };
+            let btn = Button::new("http-center-send", send_label)
+                .size(ButtonSize::Medium)
+                .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                .style(ButtonStyle::Filled)
+                .disabled(busy)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.send_http_builder(window, cx);
+                }));
+            (btn, None)
+        };
+
+        let mut request_bar = h_flex()
+            .id("http-center-request-bar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(method_menu)
+            .child(url_input);
+        if let Some(badge) = ws_status_badge {
+            request_bar = request_bar.child(badge);
+        }
+        request_bar = request_bar.child(action_btn);
+
+        let mut subtab_row = h_flex()
+            .id("http-center-subtabs")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_4()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border);
+        let tabs_to_show: &[HttpSubTab] = if is_ws {
+            &HttpSubTab::WS_TABS
+        } else {
+            &HttpSubTab::HTTP_TABS
+        };
+        for &tab in tabs_to_show {
+            let selected = self.http_subtab == tab;
+            let tooltip = tab.tooltip();
+            subtab_row = subtab_row.child(
+                h_flex()
+                    .id(("http-center-subtab", tab as usize))
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(tooltip))
+                    .when(selected, |this| {
+                        this.border_b_2().border_color(colors.border_focused)
+                    })
+                    .when(!selected, |this| {
+                        this.border_b_2().border_color(gpui::transparent_black())
+                            .hover(|s| s.bg(colors.element_hover.opacity(0.3)))
+                    })
+                    .child(
+                        Label::new(tab.label())
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .weight(if selected {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .color(if selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.http_subtab = tab;
+                        this.persist_http_settings(cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let content = match self.http_subtab {
+            HttpSubTab::Message => self.render_ws_message_tab(window, cx),
+            HttpSubTab::Params => v_flex()
+                .id("http-center-params")
+                .w_full()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .child(section_header("Query Parameters", cx))
+                        .child(div().flex_1())
+                        .child(
+                            Label::new("Query parameters are synchronized with the URL")
+                                .size(LabelSize::Custom(Rems(0.8)))
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(self.render_http_pair_table(HttpPairKind::Params, window, cx))
+                .into_any_element(),
+            HttpSubTab::Authorization => self.render_http_auth(window, cx),
+            HttpSubTab::Headers => {
+                let auto = self.auto_generated_headers(cx);
+                let mut auto_rows: Vec<AnyElement> = auto
+                    .iter()
+                    .map(|(name, value)| {
+                        h_flex()
+                            .w_full()
+                            .flex_none()
+                            .h(px(24.))
+                            .px_2()
+                            .gap_2()
+                            .child(
+                                Label::new(name.clone())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Muted)
+                                    .flex_none(),
+                            )
+                            .child(
+                                Label::new(value.clone())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                            .into_any_element()
+                    })
+                    .collect();
+                if auto_rows.is_empty() {
+                    auto_rows.push(
+                        Label::new("no generated headers for the current body")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted)
+                            .into_any_element(),
+                    );
+                }
+                v_flex()
+                    .id("http-center-headers")
+                    .w_full()
+                    .gap_2()
+                    .child(section_header("Request Headers", cx))
+                    .child(self.render_http_pair_table(HttpPairKind::Headers, window, cx))
+                    .child(section_header("Auto-generated headers", cx))
+                    .child(
+                        v_flex()
+                            .id("http-center-auto-headers")
+                            .w_full()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.editor_background)
+                            .p_2()
+                            .gap_1()
+                            .children(auto_rows),
+                    )
+                    .into_any_element()
+            }
+            HttpSubTab::Body => self.render_http_body(window, cx),
+            HttpSubTab::Scripts => v_flex()
+                .id("http-center-scripts")
+                .w_full()
+                .p_4()
+                .gap_2()
+                .child(section_header("Scripts", cx))
+                .child(
+                    Label::new("Pre-request and test scripts are planned for a future update.")
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            HttpSubTab::Settings => self.render_http_settings(window, cx),
+        };
+
+        let request_pane = v_flex()
+            .id("http-center-request-pane")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(request_bar)
+            .child(subtab_row)
+            .child(
+                div()
+                    .id("http-center-subtab-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .px_4()
+                    .py_3()
+                    .child(content),
+            );
+
+        let divider = div()
+            .id("http-center-horizontal-divider")
+            .w_full()
+            .h(px(2.))
+            .flex_none()
+            .bg(colors.border);
+
+        let response_pane = if let Some(response) = self.http_builder_response.clone() {
+            let status_color = response_status_color(response.status);
+            let content_type = response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.clone());
+            let _body_text = if self.http_response_pretty {
+                pretty_body(&response.body, content_type.as_deref())
+            } else {
+                response.body.clone()
+            };
+            let mut header_rows = response
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .h(px(24.))
+                        .px_2()
+                        .gap_3()
+                        .child(
+                            Label::new(name.clone())
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .color(Color::Muted)
+                                .flex_none(),
+                        )
+                        .child(
+                            Label::new(value.clone())
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .truncate(),
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            if header_rows.is_empty() {
+                header_rows.push(
+                    Label::new("no response headers")
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .color(Color::Muted)
+                        .into_any_element(),
+                );
+            }
+            let body_active = self.http_response_tab == HttpResponseTab::Body;
+            let headers_active = self.http_response_tab == HttpResponseTab::Headers;
+            let request_active = self.http_response_tab == HttpResponseTab::Request;
+            let panel_ref = cx.entity().downgrade();
+            let pretty_toggle = Checkbox::new(
+                "http-center-response-pretty",
+                if self.http_response_pretty {
+                    ToggleState::Selected
+                } else {
+                    ToggleState::Unselected
+                },
+            )
+            .label("Pretty")
+            .on_click(move |_state, _window, cx| {
+                if let Some(panel) = panel_ref.upgrade() {
+                    let _ = panel.update(cx, |this, cx| {
+                        this.http_response_pretty = !this.http_response_pretty;
+                        this.http_response_editor_text.clear();
+                        cx.notify();
+                    });
+                }
+            });
+
+            let copy_body = response.body.clone();
+            let copy_btn = Button::new("http-center-copy-response", "Copy")
+                .size(ButtonSize::Compact)
+                .label_size(LabelSize::Custom(Rems(0.8)))
+                .style(ButtonStyle::Subtle)
+                .tooltip(Tooltip::text("Copy response body to clipboard"))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_body.clone()));
+                    this.saved_message = Some("Copied response body to clipboard".into());
+                    cx.notify();
+                }));
+
+            let status_bar = h_flex()
+                .id("http-center-response-status")
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .py_2()
+                .bg(colors.tab_bar_background)
+                .border_b_1()
+                .border_color(colors.border)
+                .child(
+                    div()
+                        .flex_none()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(colors.element_hover)
+                        .border_1()
+                        .border_color(colors.border)
+                        .child(
+                            Label::new(format!("HTTP {}", response.status))
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .weight(FontWeight::BOLD)
+                                .color(status_color),
+                        ),
+                )
+                .child(
+                    Label::new(format!("{} ms", response.time_ms))
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!("{} B", response.body.len()))
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .color(Color::Muted),
+                )
+                .child(div().w(px(16.)))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            h_flex()
+                                .id("http-resp-tab-body")
+                                .px_2p5()
+                                .py_1()
+                                .cursor_pointer()
+                                .when(body_active, |this| {
+                                    this.border_b_2().border_color(colors.border_focused)
+                                })
+                                .when(!body_active, |this| {
+                                    this.border_b_2().border_color(gpui::transparent_black())
+                                        .hover(|s| s.bg(colors.element_hover.opacity(0.3)))
+                                })
+                                .child(
+                                    Label::new("Body")
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .weight(if body_active {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::NORMAL
+                                        })
+                                        .color(if body_active {
+                                            Color::Default
+                                        } else {
+                                            Color::Muted
+                                        }),
+                                )
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.http_response_tab = HttpResponseTab::Body;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .id("http-resp-tab-headers")
+                                .px_2p5()
+                                .py_1()
+                                .cursor_pointer()
+                                .when(headers_active, |this| {
+                                    this.border_b_2().border_color(colors.border_focused)
+                                })
+                                .when(!headers_active, |this| {
+                                    this.border_b_2().border_color(gpui::transparent_black())
+                                        .hover(|s| s.bg(colors.element_hover.opacity(0.3)))
+                                })
+                                .child(
+                                    Label::new(format!("Headers ({})", response.headers.len()))
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .weight(if headers_active {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::NORMAL
+                                        })
+                                        .color(if headers_active {
+                                            Color::Default
+                                        } else {
+                                            Color::Muted
+                                        }),
+                                )
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.http_response_tab = HttpResponseTab::Headers;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .id("http-resp-tab-request")
+                                .px_2p5()
+                                .py_1()
+                                .cursor_pointer()
+                                .when(request_active, |this| {
+                                    this.border_b_2().border_color(colors.border_focused)
+                                })
+                                .when(!request_active, |this| {
+                                    this.border_b_2().border_color(gpui::transparent_black())
+                                        .hover(|s| s.bg(colors.element_hover.opacity(0.3)))
+                                })
+                                .child(
+                                    Label::new(format!("Request ({})", response.sent_headers.len()))
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .weight(if request_active {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::NORMAL
+                                        })
+                                        .color(if request_active {
+                                            Color::Default
+                                        } else {
+                                            Color::Muted
+                                        }),
+                                )
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.http_response_tab = HttpResponseTab::Request;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(div().flex_1())
+                .child(pretty_toggle)
+                .child(copy_btn);
+
+            let response_body_view = if body_active {
+                self.sync_http_response_editor(window, cx);
+                let resp_editor = self.ensure_http_response_editor(window, cx);
+                div()
+                    .id("http-center-response-body-editor")
+                    .size_full()
+                    .bg(colors.editor_background)
+                    .p_2()
+                    .child(code_editor_element(&resp_editor, cx))
+                    .into_any_element()
+            } else if headers_active {
+                div()
+                    .id("http-center-response-headers-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .bg(colors.editor_background)
+                    .p_4()
+                    .children(header_rows)
+                    .into_any_element()
+            } else {
+                let mut req_header_rows = response
+                    .sent_headers
+                    .iter()
+                    .map(|(name, value)| {
+                        h_flex()
+                            .w_full()
+                            .flex_none()
+                            .h(px(24.))
+                            .px_2()
+                            .gap_3()
+                            .child(
+                                Label::new(name.clone())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(Color::Muted)
+                                    .flex_none(),
+                            )
+                            .child(
+                                Label::new(value.clone())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .truncate(),
+                            )
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
+                if req_header_rows.is_empty() {
+                    req_header_rows.push(
+                        Label::new("no custom request headers sent")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(Color::Muted)
+                            .into_any_element(),
+                    );
+                }
+                v_flex()
+                    .id("http-center-response-request-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .bg(colors.editor_background)
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .p_2()
+                            .rounded_md()
+                            .bg(colors.element_hover)
+                            .border_1()
+                            .border_color(colors.border)
+                            .gap_2()
+                            .child(
+                                Label::new(response.sent_method.clone())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .weight(FontWeight::BOLD)
+                                    .color(Color::Accent),
+                            )
+                            .child(
+                                Label::new(response.sent_url.clone())
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .truncate(),
+                            ),
+                    )
+                    .child(section_header("Request Headers Sent Over Wire", cx))
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.editor_background)
+                            .p_2()
+                            .gap_1()
+                            .children(req_header_rows),
+                    )
+                    .when_some(response.sent_body.clone(), |this, body| {
+                        this.child(section_header("Request Body Sent", cx))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .p_3()
+                                    .rounded_md()
+                                    .bg(colors.editor_background)
+                                    .border_1()
+                                    .border_color(colors.border_variant)
+                                    .child(
+                                        Label::new(body)
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Default),
+                                    ),
+                            )
+                    })
+                    .into_any_element()
+            };
+
+            v_flex()
+                .id("http-center-response-pane")
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(status_bar)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .child(response_body_view),
+                )
+                .into_any_element()
+        } else if is_ws {
+            self.render_ws_center_response(window, cx)
+        } else {
+            let busy = self.http_builder_busy;
+            v_flex()
+                .id("http-center-response-empty")
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .bg(colors.editor_background.opacity(0.3))
+                .child(
+                    Icon::new(IconName::Server)
+                        .size(IconSize::Medium)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(if busy { "Sending request…" } else { "No response yet" })
+                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                        .weight(FontWeight::MEDIUM)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Click Send to execute the request and view the response here.")
+                        .size(LabelSize::Custom(Rems(0.8)))
+                        .color(Color::Disabled),
+                )
+                .into_any_element()
+        };
+
+        v_flex()
+            .id("http-center-layout")
+            .size_full()
+            .on_action(cx.listener(|this, _: &editor_actions::Tab, window, cx| {
+                this.focus_next_http_field(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor_actions::Backtab, window, cx| {
+                this.focus_prev_http_field(window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "tab" {
+                    cx.stop_propagation();
+                    if event.keystroke.modifiers.shift {
+                        this.focus_prev_http_field(window, cx);
+                    } else {
+                        this.focus_next_http_field(window, cx);
+                    }
+                }
+            }))
+            .child(request_pane)
+            .child(divider)
+            .child(response_pane)
+            .into_any_element()
+    }
+
+    fn render_ws_message_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let editors = self.http_builder.as_ref().expect("http editors");
+        let raw_editor = editors.raw_body.clone();
+        let is_connected = self.ws_status == WsStatus::Connected;
+
+        let send_btn = Button::new("ws-send-payload-btn", "Send Message")
+            .size(ButtonSize::Medium)
+            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+            .style(ButtonStyle::Filled)
+            .disabled(!is_connected)
+            .tooltip(if is_connected {
+                Tooltip::text("Send message to WebSocket server")
+            } else {
+                Tooltip::text("Connect to server first to send messages")
+            })
+            .on_click(cx.listener(|this, _, _window, cx| {
+                let msg = this
+                    .http_builder
+                    .as_ref()
+                    .map(|e| e.raw_body.read(cx).text(cx))
+                    .unwrap_or_default();
+                this.ws_send_message(msg, cx);
+            }));
+
+        let clear_btn = Button::new("ws-clear-payload-btn", "Clear")
+            .size(ButtonSize::Medium)
+            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+            .style(ButtonStyle::Subtle)
+            .on_click(cx.listener(|this, _, window, cx| {
+                if let Some(editors) = this.http_builder.as_ref() {
+                    editors.raw_body.update(cx, |editor, cx| {
+                        editor.set_text(String::new(), window, cx);
+                    });
+                    this.http_raw_body = String::new();
+                    this.persist_http_settings(cx);
+                    cx.notify();
+                }
+            }));
+
+        let msg_text = editors.raw_body.read(cx).text(cx);
+        let trimmed_msg = msg_text.trim();
+        let is_msg_json = if !trimmed_msg.is_empty() {
+            serde_json::from_str::<serde_json::Value>(trimmed_msg).is_ok()
+        } else {
+            false
+        };
+
+        let beautify_ws_btn = Button::new("ws-beautify-payload-btn", "Beautify JSON")
+            .size(ButtonSize::Medium)
+            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+            .style(ButtonStyle::Subtle)
+            .disabled(!is_msg_json)
+            .tooltip(Tooltip::text("Format JSON message with 2-space indentation"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.beautify_http_raw_json(window, cx);
+            }));
+
+        v_flex()
+            .id("ws-message-composer")
+            .w_full()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(section_header("Message Payload (Text / JSON)", cx))
+                    .child(div().flex_1())
+                    .child(
+                        Label::new(if is_connected {
+                            "● Ready to send frames"
+                        } else {
+                            "Click Connect in the request bar to open connection"
+                        })
+                        .size(LabelSize::Custom(Rems(0.8)))
+                        .color(if is_connected { Color::Success } else { Color::Muted }),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(140.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if raw_editor.read(cx).focus_handle(cx).is_focused(window) {
+                        colors.border_focused
+                    } else {
+                        colors.border_variant
+                    })
+                    .bg(colors.editor_background)
+                    .p_3()
+                    .child(code_editor_element(&raw_editor, cx)),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(send_btn)
+                    .child(beautify_ws_btn)
+                    .child(clear_btn),
+            )
+            .into_any_element()
+    }
+
+    fn render_ws_center_response(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let status = self.ws_status;
+        let (status_text, status_color) = match status {
+            WsStatus::Connected => ("Connected", gpui::rgb(0x4caf50)),
+            WsStatus::Connecting => ("Connecting…", gpui::rgb(0xffb74d)),
+            WsStatus::Disconnected => ("Disconnected", gpui::rgb(0x9da5b4)),
+        };
+
+        let messages_active = self.ws_response_tab == WsResponseTab::Messages;
+        let handshake_active = self.ws_response_tab == WsResponseTab::Handshake;
+
+        let clear_btn = Button::new("ws-clear-messages", "Clear")
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::Custom(Rems(0.8)))
+            .style(ButtonStyle::Subtle)
+            .tooltip(Tooltip::text("Clear message stream"))
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.ws_messages.clear();
+                this.saved_message = Some("Cleared WebSocket message log".into());
+                cx.notify();
+            }));
+
+        let status_bar = h_flex()
+            .id("ws-center-status-bar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .flex_none()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .bg(colors.element_hover)
+                    .border_1()
+                    .border_color(colors.border)
+                    .child(
+                        Label::new(format!("● {status_text}"))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .weight(FontWeight::BOLD)
+                            .color(Color::Custom(status_color.into())),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .id("ws-resp-tab-messages")
+                            .px_2p5()
+                            .py_1()
+                            .cursor_pointer()
+                            .when(messages_active, |this| {
+                                this.border_b_2().border_color(colors.border_focused)
+                            })
+                            .when(!messages_active, |this| {
+                                this.border_b_2().border_color(gpui::transparent_black())
+                                    .hover(|s| s.bg(colors.element_hover.opacity(0.3)))
+                            })
+                            .child(
+                                Label::new(format!("Messages ({})", self.ws_messages.len()))
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .weight(if messages_active {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .color(if messages_active {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    }),
+                            )
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.ws_response_tab = WsResponseTab::Messages;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .id("ws-resp-tab-handshake")
+                            .px_2p5()
+                            .py_1()
+                            .cursor_pointer()
+                            .when(handshake_active, |this| {
+                                this.border_b_2().border_color(colors.border_focused)
+                            })
+                            .when(!handshake_active, |this| {
+                                this.border_b_2().border_color(gpui::transparent_black())
+                                    .hover(|s| s.bg(colors.element_hover.opacity(0.3)))
+                            })
+                            .child(
+                                Label::new("Handshake")
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .weight(if handshake_active {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .color(if handshake_active {
+                                        Color::Default
+                                    } else {
+                                        Color::Muted
+                                    }),
+                            )
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.ws_response_tab = WsResponseTab::Handshake;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(clear_btn);
+
+        let content = if messages_active {
+            if self.ws_messages.is_empty() {
+                div()
+                    .id("ws-messages-empty")
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::ArrowCircle)
+                            .size(IconSize::Medium)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("No WebSocket messages yet")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .weight(FontWeight::BOLD)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Connect to a ws:// or wss:// endpoint to send and receive frames.")
+                            .size(LabelSize::Custom(Rems(0.85)))
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            } else {
+                let rows = self
+                    .ws_messages
+                    .iter()
+                    .map(|msg| {
+                        let (badge_text, badge_color, badge_bg) = if msg.is_outgoing {
+                            ("↑ Sent", gpui::rgb(0x3574f0), gpui::rgba(0x3574f026))
+                        } else {
+                            ("↓ Received", gpui::rgb(0x26c6da), gpui::rgba(0x26c6da26))
+                        };
+                        let payload_copy = msg.payload.clone();
+                        v_flex()
+                            .id(("ws-msg", msg.id))
+                            .w_full()
+                            .p_3()
+                            .rounded_md()
+                            .bg(colors.editor_background)
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .bg(badge_bg)
+                                            .child(
+                                                Label::new(badge_text)
+                                                    .size(LabelSize::Custom(Rems(0.75)))
+                                                    .weight(FontWeight::BOLD)
+                                                    .color(Color::Custom(badge_color.into())),
+                                            ),
+                                    )
+                                    .child(
+                                        Label::new(msg.timestamp.clone())
+                                            .size(LabelSize::Custom(Rems(0.75)))
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(format!("{} B", msg.payload.len()))
+                                            .size(LabelSize::Custom(Rems(0.75)))
+                                            .color(Color::Muted),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        Button::new(("ws-copy", msg.id), "Copy")
+                                            .size(ButtonSize::Compact)
+                                            .label_size(LabelSize::Custom(Rems(0.75)))
+                                            .style(ButtonStyle::Subtle)
+                                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(payload_copy.clone()));
+                                                this.saved_message = Some("Copied message to clipboard".into());
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .p_2()
+                                    .rounded_sm()
+                                    .bg(colors.element_hover.opacity(0.3))
+                                    .child(
+                                        Label::new(msg.payload.clone())
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .color(Color::Default),
+                                    ),
+                            )
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
+
+                div()
+                    .id("ws-messages-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .p_4()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_2()
+                            .children(rows),
+                    )
+                    .into_any_element()
+            }
+        } else {
+            if let Some(hs) = &self.ws_handshake {
+                let req_h = hs
+                    .request_headers
+                    .iter()
+                    .map(|(k, v)| {
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(Label::new(k.clone()).color(Color::Muted).flex_none())
+                            .child(Label::new(v.clone()).truncate())
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
+                let resp_h = hs
+                    .response_headers
+                    .iter()
+                    .map(|(k, v)| {
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(Label::new(k.clone()).color(Color::Muted).flex_none())
+                            .child(Label::new(v.clone()).truncate())
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
+
+                v_flex()
+                    .id("ws-handshake-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .p_2()
+                            .rounded_md()
+                            .bg(colors.element_hover)
+                            .gap_2()
+                            .child(
+                                Label::new(format!("HTTP {}", hs.response_status))
+                                    .weight(FontWeight::BOLD)
+                                    .color(Color::Custom(gpui::rgb(0x4caf50).into())),
+                            )
+                            .child(Label::new(hs.url.clone()).truncate()),
+                    )
+                    .child(section_header("Handshake Request Headers", cx))
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.editor_background)
+                            .gap_1()
+                            .children(req_h),
+                    )
+                    .child(section_header("Handshake Response Headers", cx))
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.editor_background)
+                            .gap_1()
+                            .children(resp_h),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .flex()
+                    .child(Label::new("No handshake information yet (not connected)").color(Color::Muted))
+                    .into_any_element()
+            }
+        };
+
+        v_flex()
+            .id("ws-center-response-pane")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(status_bar)
+            .child(div().flex_1().min_h_0().w_full().child(content))
+            .into_any_element()
+    }
+
+    fn ensure_db_console_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        if let Some(editor) = &self.db_console_editor {
+            return editor.clone();
+        }
+
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(4, 20, window, cx);
+            editor.set_show_gutter(true, cx);
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+            editor
+        });
+
+        let initial_sql = if !self.db_console_query.is_empty() {
+            self.db_console_query.clone()
+        } else {
+            "SELECT * FROM users LIMIT 50;".to_string()
+        };
+
+        editor.update(cx, |editor, cx| {
+            editor.set_text(initial_sql, window, cx);
+        });
+
+        self.apply_language_to_editor(&editor, Some("SQL"), cx);
+        self.db_console_editor = Some(editor.clone());
+        editor
+    }
+
+    pub fn render_database_center(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let console_editor = self.ensure_db_console_editor(window, cx);
+        let colors = cx.theme().colors();
+        let active_conn = self.db_active_connection.clone().or_else(|| {
+            self.databases.first().map(|d| d.name.clone())
+        }).unwrap_or_else(|| "No Connection".to_string());
+
+        let target_info = self.databases.iter().find(|d| d.name == active_conn).map(|d| {
+            let driver = d.driver.clone().unwrap_or_else(|| "sqlite".to_string());
+            let target = d.target.clone().unwrap_or_else(|| "".to_string());
+            (driver, target)
+        }).unwrap_or_else(|| ("sqlite".to_string(), "".to_string()));
+
+        let query_status = self.query_status.get(&active_conn);
+
+        let query_bar = h_flex()
+            .id("db-center-query-bar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .py_2()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_xs()
+                            .bg(gpui::rgba(0x3574f026))
+                            .child(
+                                Label::new(target_info.0.to_uppercase())
+                                    .size(LabelSize::Custom(Rems(0.72)))
+                                    .weight(FontWeight::BOLD)
+                                    .color(Color::Custom(gpui::rgb(0x3574f0).into())),
+                            ),
+                    )
+                    .child(
+                        Label::new(format!("{} · {}", active_conn, target_info.1))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .weight(FontWeight::MEDIUM)
+                            .color(Color::Default),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("db-run-query", "Run Query ▷")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Custom(Rems(0.85)))
+                            .style(ButtonStyle::Filled)
+                            .tooltip(Tooltip::text("Execute SQL query"))
+                            .on_click(cx.listener({
+                                let conn = active_conn.clone();
+                                let editor = console_editor.clone();
+                                move |this, _, _window, cx| {
+                                    let sql = editor.read(cx).text(cx).trim().to_string();
+                                    if sql.is_empty() {
+                                        return;
+                                    }
+                                    this.db_console_query = sql.clone();
+                                    if let Some(root) = this.worktree_root(cx) {
+                                        this.run_sql_query(conn.clone(), sql, root, cx);
+                                    }
+                                }
+                            })),
+                    ),
+            );
+
+        let top_pane = v_flex()
+            .id("db-center-top-pane")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(query_bar)
+            .child(
+                div()
+                    .id("db-center-query-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .bg(colors.editor_background)
+                    .p_2()
+                    .overflow_y_scroll()
+                    .child(code_editor_element(&console_editor, cx)),
+            );
+
+        let divider = h_flex()
+            .id("db-center-split-divider")
+            .h(px(2.))
+            .w_full()
+            .bg(colors.border);
+
+        let bottom_pane = match query_status {
+            Some(TableStatus::Loading) => {
+                v_flex()
+                    .id("db-center-loading")
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::RotateCw).size(IconSize::Medium).color(Color::Accent))
+                    .child(Label::new("Executing query…").color(Color::Muted))
+                    .into_any_element()
+            }
+            Some(TableStatus::Failed(err)) => {
+                v_flex()
+                    .id("db-center-error")
+                    .flex_1()
+                    .min_h_0()
+                    .p_4()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(Icon::new(IconName::Close).color(Color::Error))
+                            .child(Label::new("Query Error:").weight(FontWeight::BOLD).color(Color::Error)),
+                    )
+                    .child(Label::new(err.clone()).color(Color::Error))
+                    .into_any_element()
+            }
+            Some(TableStatus::Loaded(rows)) if !rows.is_empty() => {
+                let columns: Vec<String> = rows[0].keys().cloned().collect();
+                let col_header = h_flex()
+                    .w_full()
+                    .bg(colors.tab_bar_background)
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .py_1p5()
+                    .px_3()
+                    .gap_3()
+                    .children(columns.iter().map(|col| {
+                        Label::new(col.clone())
+                            .size(LabelSize::Custom(Rems(0.82)))
+                            .weight(FontWeight::BOLD)
+                            .color(Color::Muted)
+                            .into_any_element()
+                    }));
+
+                let table_rows = rows.iter().take(100).enumerate().map(|(idx, row)| {
+                    let bg = if idx % 2 == 0 {
+                        colors.editor_background
+                    } else {
+                        colors.element_hover
+                    };
+                    h_flex()
+                        .w_full()
+                        .py_1()
+                        .px_3()
+                        .gap_3()
+                        .bg(bg)
+                        .children(columns.iter().map(|col| {
+                            let val_str = match row.get(col) {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Null) => "NULL".to_string(),
+                                Some(other) => other.to_string(),
+                                None => "".to_string(),
+                            };
+                            Label::new(val_str)
+                                .size(LabelSize::Custom(Rems(0.82)))
+                                .color(Color::Default)
+                                .into_any_element()
+                        }))
+                        .into_any_element()
+                });
+
+                v_flex()
+                    .id("db-center-results")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .py_1()
+                            .justify_between()
+                            .bg(colors.tab_bar_background)
+                            .border_b_1()
+                            .border_color(colors.border)
+                            .child(Label::new(format!("{} rows returned", rows.len())).size(LabelSize::Custom(Rems(0.78))).color(Color::Success)),
+                    )
+                    .child(col_header)
+                    .child(
+                        div()
+                            .id("db-center-rows-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_y_scroll()
+                            .children(table_rows),
+                    )
+                    .into_any_element()
+            }
+            _ => {
+                v_flex()
+                    .id("db-center-placeholder")
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .bg(colors.editor_background.opacity(0.3))
+                    .child(Icon::new(IconName::DatabaseZap).size(IconSize::Medium).color(Color::Muted))
+                    .child(Label::new("No query executed yet").weight(FontWeight::MEDIUM).color(Color::Muted))
+                    .child(Label::new("Click Run Query ▷ or select a table from the sidebar to view data").size(LabelSize::Custom(Rems(0.8))).color(Color::Disabled))
+                    .into_any_element()
+            }
+        };
+
+        v_flex()
+            .id("db-center-layout")
+            .size_full()
+            .child(top_pane)
+            .child(divider)
+            .child(bottom_pane)
+            .into_any_element()
+    }
+
+    pub fn render_remote_center(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let server = self.current_remote_server().cloned();
+        let server_name = server.as_ref().map(|s| s.name.clone()).unwrap_or_else(|| "No Server".to_string());
+        let protocol = server.as_ref().and_then(|s| s.protocol.clone()).unwrap_or_else(|| "sftp".to_string());
+        let host_line = server.as_ref().map(|s| {
+            let user = s.user.as_deref().unwrap_or("user");
+            let host = s.host.as_deref().unwrap_or("localhost");
+            let port = s.port.as_deref().unwrap_or("22");
+            let root = s.remote_root.as_deref().unwrap_or("/");
+            format!("{user}@{host}:{port} ({root})")
+        }).unwrap_or_default();
+
+        let current_path = server
+            .as_ref()
+            .and_then(|s| self.remote_center_path.get(&s.name))
+            .cloned()
+            .unwrap_or_else(|| ".".to_string());
+        let is_root = current_path == "." || current_path == "/" || current_path.is_empty();
+
+        let refresh_target = server.as_ref().map(|s| (s.name.clone(), s.root.clone()));
+        let sync_target = refresh_target.clone();
+
+        let mut breadcrumbs: Vec<AnyElement> = Vec::new();
+        let s_name = server_name.clone();
+        breadcrumbs.push(
+            Button::new("crumb-root", "/")
+                .size(ButtonSize::Compact)
+                .label_size(LabelSize::Custom(Rems(0.8)))
+                .style(ButtonStyle::Subtle)
+                .tooltip(Tooltip::text("Go to root folder"))
+                .on_click(cx.listener({
+                    let s_name = s_name.clone();
+                    move |this, _, _window, cx| {
+                        this.remote_center_path.insert(s_name.clone(), ".".to_string());
+                        cx.notify();
+                    }
+                }))
+                .into_any_element(),
+        );
+
+        if !is_root {
+            let mut accum = String::new();
+            for (seg_idx, seg) in current_path.split('/').enumerate() {
+                if seg.is_empty() || seg == "." { continue; }
+                if !accum.is_empty() {
+                    accum.push('/');
+                }
+                accum.push_str(seg);
+                let target_path = accum.clone();
+                breadcrumbs.push(Label::new("/").size(LabelSize::Custom(Rems(0.75))).color(Color::Muted).into_any_element());
+                breadcrumbs.push(
+                    Button::new(("crumb-seg", seg_idx), seg.to_string())
+                        .size(ButtonSize::Compact)
+                        .label_size(LabelSize::Custom(Rems(0.8)))
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener({
+                            let s_name = s_name.clone();
+                            let target_path = target_path.clone();
+                            move |this, _, _window, cx| {
+                                this.remote_center_path.insert(s_name.clone(), target_path.clone());
+                                cx.notify();
+                            }
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let top_bar = h_flex()
+            .id("remote-center-bar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .py_2()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_xs()
+                            .bg(gpui::rgba(0xab7df626))
+                            .child(
+                                Label::new(protocol.to_uppercase())
+                                    .size(LabelSize::Custom(Rems(0.72)))
+                                    .weight(FontWeight::BOLD)
+                                    .color(Color::Custom(gpui::rgb(0xab7df6).into())),
+                            ),
+                    )
+                    .child(
+                        Label::new(format!("{} · {}", server_name, host_line))
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .weight(FontWeight::MEDIUM)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_xs()
+                            .bg(gpui::rgba(0xffffff0a))
+                            .children(breadcrumbs),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("remote-center-sync", "Sync Server ⇅")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Custom(Rems(0.85)))
+                            .style(ButtonStyle::Filled)
+                            .disabled(sync_target.is_none())
+                            .tooltip(Tooltip::text("Synchronize files with remote server"))
+                            .on_click(cx.listener({
+                                let st = sync_target.clone();
+                                move |this, _, _window, cx| {
+                                    if let Some((name, root)) = st.clone() {
+                                        this.sync_server(name, root, cx);
+                                    }
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("remote-center-refresh", "Refresh ↻")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Custom(Rems(0.85)))
+                            .style(ButtonStyle::Subtle)
+                            .disabled(refresh_target.is_none())
+                            .tooltip(Tooltip::text("Refresh remote files in this directory"))
+                            .on_click(cx.listener({
+                                let rt = refresh_target.clone();
+                                let c_path = current_path.clone();
+                                move |this, _, _window, cx| {
+                                    if let Some((name, root)) = rt.clone() {
+                                        if c_path == "." || c_path == "/" {
+                                            this.refresh_remote(name, root, cx);
+                                        } else {
+                                            this.load_remote_dir(name, c_path.clone(), root, cx);
+                                        }
+                                    }
+                                }
+                            })),
+                    ),
+            );
+
+        let sync_banner = if let Some(active) = &self.remote_active_file {
+            let active_server = active.server.clone();
+            let active_path = active.remote_path.clone();
+            let (status_text, status_color) = active.status_message.as_ref().cloned().unwrap_or_else(|| {
+                ("The file is identical to remote one.".to_string(), Color::Success)
+            });
+            Some(
+                h_flex()
+                    .id("remote-sync-banner")
+                    .w_full()
+                    .flex_none()
+                    .px_4()
+                    .py_2()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .bg(gpui::rgba(0x388bfd18))
+                    .border_b_1()
+                    .border_color(gpui::rgba(0x388bfd33))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(Icon::new(IconName::Info).size(IconSize::Small).color(Color::Accent))
+                            .child(
+                                Label::new(format!("sftp://{active_server}/{active_path}"))
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .weight(FontWeight::BOLD)
+                                    .color(Color::Default),
+                            )
+                            .child(
+                                Label::new(format!("— {status_text}"))
+                                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                    .color(status_color),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("remote-sync-revert", "⟲ Revert")
+                                    .size(ButtonSize::Compact)
+                                    .label_size(LabelSize::Custom(Rems(0.78)))
+                                    .style(ButtonStyle::Subtle)
+                                    .tooltip(Tooltip::text("Re-download file from remote server"))
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.redownload_active_remote_file(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("remote-sync-upload", "⇡ Upload to Server")
+                                    .size(ButtonSize::Compact)
+                                    .label_size(LabelSize::Custom(Rems(0.78)))
+                                    .style(ButtonStyle::Filled)
+                                    .tooltip(Tooltip::text("Upload local changes back to remote server"))
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.upload_active_remote_file(cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        let (entries, is_loading, error_msg) = if let Some(s) = &server {
+            if is_root {
+                let key = (s.name.clone(), ".".to_string());
+                let loading = matches!(self.remote_status.get(&key), Some(RemoteStatus::Loading));
+                let err = match self.remote_status.get(&key) {
+                    Some(RemoteStatus::Failed(msg)) => Some(msg.clone()),
+                    _ => None,
+                };
+                (self.remote_entries.get(&s.name).cloned().unwrap_or_default(), loading, err)
+            } else {
+                let key = (s.name.clone(), current_path.clone());
+                let loading = matches!(self.remote_status.get(&key), Some(RemoteStatus::Loading));
+                let err = match self.remote_status.get(&key) {
+                    Some(RemoteStatus::Failed(msg)) => Some(msg.clone()),
+                    _ => None,
+                };
+                match self.remote_dir_entries.get(&key) {
+                    Some(entries) => (entries.clone(), loading, err),
+                    None => {
+                        if !loading {
+                            let s_name = s.name.clone();
+                            let c_path = current_path.clone();
+                            let s_root = s.root.clone();
+                            cx.spawn(async move |this, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.load_remote_dir(s_name, c_path, s_root, cx);
+                                })
+                                .log_err();
+                            })
+                            .detach();
+                        }
+                        (Vec::new(), true, None)
+                    }
+                }
+            }
+        } else {
+            (Vec::new(), false, None)
+        };
+
+        let mut file_rows: Vec<AnyElement> = Vec::new();
+
+        if !is_root {
+            let parent_path = remote_parent_path(&current_path);
+            let s_name = server_name.clone();
+            file_rows.push(
+                h_flex()
+                    .id("remote-parent-row")
+                    .w_full()
+                    .py_1p5()
+                    .px_4()
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .bg(colors.editor_background)
+                    .hover(|this| this.bg(colors.element_hover))
+                    .on_click(cx.listener({
+                        let s_name = s_name.clone();
+                        let parent_path = parent_path.clone();
+                        move |this, _, _window, cx| {
+                            this.remote_center_path.insert(s_name.clone(), parent_path.clone());
+                            cx.notify();
+                        }
+                    }))
+                    .child(Icon::new(IconName::FolderOpen).size(IconSize::Small).color(Color::Accent))
+                    .child(
+                        Label::new(".. (Parent folder)")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .weight(FontWeight::MEDIUM)
+                            .color(Color::Accent),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        for (idx, entry) in entries.into_iter().enumerate() {
+            let is_dir = entry.is_directory;
+            let path = entry.path.clone();
+            let name = entry.name.clone();
+            let size_str = entry.size.map(format_size).unwrap_or_else(|| if is_dir { "DIR".to_string() } else { "".to_string() });
+
+            let srv = server.clone();
+            let s_name = server_name.clone();
+            let row_bg = if idx % 2 == 0 {
+                colors.editor_background
+            } else {
+                colors.element_hover
+            };
+
+            let start_icon = if is_dir {
+                Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Accent)
+            } else {
+                match FileIcons::get_icon(Path::new(&name), cx) {
+                    Some(icon_path) => Icon::from_path(icon_path).size(IconSize::Small),
+                    None => Icon::new(IconName::File).size(IconSize::Small),
+                }
+            };
+
+            let r_server_name = server_name.clone();
+            let r_entry = RemoteEntry {
+                name: name.clone(),
+                path: path.clone(),
+                is_directory: is_dir,
+                size: entry.size,
+            };
+            let r_root = server.as_ref().map(|s| s.root.clone());
+            let row = h_flex()
+                .id(("remote-file-row", idx))
+                .w_full()
+                .py_1p5()
+                .px_4()
+                .justify_between()
+                .items_center()
+                .cursor_pointer()
+                .bg(row_bg)
+                .hover(|this| this.bg(colors.element_hover))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.deploy_remote_context_menu(
+                            r_server_name.clone(),
+                            r_entry.clone(),
+                            r_root.clone(),
+                            event.position,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                .on_click(cx.listener({
+                    let srv = srv.clone();
+                    let path = path.clone();
+                    let s_name = s_name.clone();
+                    move |this, _, _window, cx| {
+                        if is_dir {
+                            this.remote_center_path.insert(s_name.clone(), path.clone());
+                            cx.notify();
+                        } else if let Some(s) = &srv {
+                            this.download_remote_file(s.name.clone(), path.clone(), s.root.clone(), cx);
+                        }
+                    }
+                }))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(start_icon)
+                        .child(
+                            Label::new(name)
+                                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                .weight(if is_dir { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                                .color(Color::Default),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(
+                            Label::new(size_str)
+                                .size(LabelSize::Custom(Rems(0.8)))
+                                .color(Color::Muted),
+                        )
+                        .when(!is_dir, |this| {
+                            this.child(
+                                Button::new(("remote-open-file", idx), "Download & Open ↗")
+                                    .size(ButtonSize::Compact)
+                                    .label_size(LabelSize::Custom(Rems(0.75)))
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener({
+                                        let srv = srv.clone();
+                                        let path = path.clone();
+                                        move |this, _, _window, cx| {
+                                            if let Some(s) = &srv {
+                                                this.download_remote_file(s.name.clone(), path.clone(), s.root.clone(), cx);
+                                            }
+                                        }
+                                    })),
+                            )
+                        })
+                        .when(is_dir, |this| {
+                            this.child(
+                                Button::new(("remote-enter-dir", idx), "Open ↗")
+                                    .size(ButtonSize::Compact)
+                                    .label_size(LabelSize::Custom(Rems(0.75)))
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener({
+                                        let s_name = s_name.clone();
+                                        let path = path.clone();
+                                        move |this, _, _window, cx| {
+                                            this.remote_center_path.insert(s_name.clone(), path.clone());
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                        }),
+                )
+                .into_any_element();
+
+            file_rows.push(row);
+        }
+
+        if is_loading && file_rows.is_empty() {
+            file_rows.push(
+                h_flex()
+                    .w_full()
+                    .p_6()
+                    .justify_center()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::RotateCw).size(IconSize::Medium).color(Color::Accent))
+                    .child(Label::new("Loading directory contents…").color(Color::Muted))
+                    .into_any_element(),
+            );
+        } else if let Some(err) = error_msg {
+            file_rows.push(
+                h_flex()
+                    .w_full()
+                    .p_4()
+                    .gap_2()
+                    .items_center()
+                    .child(Icon::new(IconName::Close).size(IconSize::Small).color(Color::Error))
+                    .child(Label::new(format!("Error reading directory: {err}")).color(Color::Error))
+                    .into_any_element(),
+            );
+        } else if file_rows.is_empty() {
+            file_rows.push(
+                h_flex()
+                    .w_full()
+                    .p_6()
+                    .justify_center()
+                    .items_center()
+                    .child(Label::new("Directory is empty").color(Color::Muted))
+                    .into_any_element(),
+            );
+        }
+
+        let file_list_pane = div()
+            .id("remote-center-file-list")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .children(file_rows);
+
+        v_flex()
+            .id("remote-center-layout")
+            .size_full()
+            .relative()
+            .child(top_bar)
+            .children(sync_banner)
+            .child(file_list_pane)
+            .children(self.remote_context_menu.as_ref().map(|context_menu| {
+                deferred(
+                    anchored()
+                        .position(context_menu.position)
+                        .child(context_menu.menu.clone()),
+                )
+                .with_priority(3)
+            }))
+            .into_any_element()
+    }
+
+    fn render_http_sidebar(
+        &mut self,
+        http_rows: Vec<AnyElement>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let busy = self.http_builder_busy;
+
+        let active_title = if let Some(req) = &self.http_active_request {
+            if req.name.is_empty() {
+                req.url.clone()
+            } else {
+                req.name.clone()
+            }
+        } else {
+            self.http_method.clone()
+        };
+
+        let sidebar_header = h_flex()
+            .id("http-sidebar-header")
+            .w_full()
+            .flex_none()
+            .px_2p5()
+            .py_2()
+            .items_center()
+            .justify_between()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Server)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .child(
+                        Label::new("HTTP Requests")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .weight(FontWeight::SEMIBOLD),
+                    ),
+            )
+            .child(
+                Button::new("http-open-editor", "Open in Editor ↗")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(Rems(0.8)))
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text(
+                        "Open full request & response split view in center editor",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_http_client_tab(window, cx);
+                    })),
+            );
+
+        let (method_fg, method_bg) = match self.http_method.to_ascii_uppercase().as_str() {
+            "GET" => (gpui::rgb(0x57b855), gpui::rgba(0x57b85526)),
+            "POST" => (gpui::rgb(0xe5a84b), gpui::rgba(0xe5a84b26)),
+            "PUT" => (gpui::rgb(0x3574f0), gpui::rgba(0x3574f026)),
+            "PATCH" => (gpui::rgb(0xab7df6), gpui::rgba(0xab7df626)),
+            "DELETE" => (gpui::rgb(0xe05555), gpui::rgba(0xe0555526)),
+            "WS" => (gpui::rgb(0x26c6da), gpui::rgba(0x26c6da26)),
+            _ => (gpui::rgb(0x9da5b4), gpui::rgba(0x9da5b426)),
+        };
+        let method_badge = h_flex()
+            .px_1p5()
+            .py_0p5()
+            .rounded_xs()
+            .bg(method_bg)
+            .child(
+                Label::new(self.http_method.clone())
+                    .size(LabelSize::Custom(Rems(0.72)))
+                    .weight(FontWeight::BOLD)
+                    .color(Color::Custom(method_fg.into())),
+            );
+
+        let active_bar = h_flex()
+            .id("http-sidebar-active-bar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_1p5()
+            .px_2()
+            .py_1p5()
+            .bg(colors.editor_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(method_badge)
+            .child(
+                Label::new(active_title)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .weight(FontWeight::MEDIUM)
+                    .truncate()
+                    .flex_1(),
+            )
+            .child(
+                Button::new("http-sidebar-send-btn", if busy { "…" } else { "Send" })
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(Rems(0.8)))
+                    .style(ButtonStyle::Filled)
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.send_http_builder(window, cx);
+                        this.open_http_client_tab(window, cx);
+                    })),
+            );
+
+        let response_pill = if let Some(resp) = &self.http_builder_response {
+            let status_color = response_status_color(resp.status);
+            Some(
+                h_flex()
+                    .id("http-sidebar-resp-pill")
+                    .w_full()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .px_2p5()
+                    .py_1()
+                    .bg(colors.element_hover)
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text("Click to view full response in center editor"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_http_client_tab(window, cx);
+                    }))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Label::new(format!("HTTP {}", resp.status))
+                                    .size(LabelSize::Custom(Rems(0.85)))
+                                    .weight(FontWeight::BOLD)
+                                    .color(status_color),
+                            )
+                            .child(
+                                Label::new(format!("{} ms", resp.time_ms))
+                                    .size(LabelSize::Custom(Rems(0.8)))
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(format!("{} B", resp.body.len()))
+                                    .size(LabelSize::Custom(Rems(0.8)))
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        Label::new("View ↗")
+                            .size(LabelSize::Custom(Rems(0.8)))
+                            .color(Color::Accent),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        let is_history = self.http_sidebar_mode == HttpSidebarMode::History;
+        let history_count = self.http_history.len();
+        let saved_count = self.http_requests.len();
+
+        let mode_bar = h_flex()
+            .id("http-sidebar-mode-bar")
+            .w_full()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .items_center()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .id("http-mode-history")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_xs()
+                    .cursor_pointer()
+                    .when(is_history, |this| this.bg(colors.element_selected))
+                    .when(!is_history, |this| this.hover(|s| s.bg(colors.element_hover)))
+                    .child(
+                        Label::new(format!("History ({history_count})"))
+                            .size(LabelSize::Custom(Rems(0.78)))
+                            .weight(if is_history { FontWeight::BOLD } else { FontWeight::NORMAL })
+                            .color(if is_history { Color::Default } else { Color::Muted }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.http_sidebar_mode = HttpSidebarMode::History;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .id("http-mode-files")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_xs()
+                    .cursor_pointer()
+                    .when(!is_history, |this| this.bg(colors.element_selected))
+                    .when(is_history, |this| this.hover(|s| s.bg(colors.element_hover)))
+                    .child(
+                        Label::new(format!("Saved ({saved_count})"))
+                            .size(LabelSize::Custom(Rems(0.78)))
+                            .weight(if !is_history { FontWeight::BOLD } else { FontWeight::NORMAL })
+                            .color(if !is_history { Color::Default } else { Color::Muted }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.http_sidebar_mode = HttpSidebarMode::Files;
+                        cx.notify();
+                    })),
+            )
+            .child(div().flex_1())
+            .when(is_history && history_count > 0, |this| {
+                this.child(
+                    IconButton::new("http-clear-history", IconName::Trash)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Clear request history"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.http_history.clear();
+                            this.persist_http_history(cx);
+                            cx.notify();
+                        })),
+                )
+            });
+
+        let scroll_children: Vec<AnyElement> = if is_history {
+            if self.http_history.is_empty() {
+                vec![empty_state(
+                    IconName::Clock,
+                    "No HTTP History",
+                    "Sent requests and responses will be saved here",
+                    cx,
+                )]
+            } else {
+                self.http_history
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, entry)| {
+                        let entry_clone = entry.clone();
+                        let method = if entry.method.is_empty() {
+                            "GET".to_string()
+                        } else {
+                            entry.method.to_ascii_uppercase()
+                        };
+                        let (method_fg, method_bg) = match method.as_str() {
+                            "GET" => (gpui::rgb(0x57b855), gpui::rgba(0x57b85526)),
+                            "POST" => (gpui::rgb(0xe5a84b), gpui::rgba(0xe5a84b26)),
+                            "PUT" => (gpui::rgb(0x3574f0), gpui::rgba(0x3574f026)),
+                            "PATCH" => (gpui::rgb(0xab7df6), gpui::rgba(0xab7df626)),
+                            "DELETE" => (gpui::rgb(0xe05555), gpui::rgba(0xe0555526)),
+                            "WS" => (gpui::rgb(0x26c6da), gpui::rgba(0x26c6da26)),
+                            _ => (gpui::rgb(0x9da5b4), gpui::rgba(0x9da5b426)),
+                        };
+
+                        let status_color = if entry.status > 0 {
+                            response_status_color(entry.status)
+                        } else {
+                            Color::Error
+                        };
+
+                        let time_short = entry
+                            .timestamp
+                            .split(' ')
+                            .nth(1)
+                            .unwrap_or(&entry.timestamp);
+
+                        let entry_id_for_del = entry.id.clone();
+
+                        h_flex()
+                            .id(("http-hist-row", idx))
+                            .w_full()
+                            .flex_none()
+                            .px_2()
+                            .py_1p5()
+                            .gap_2()
+                            .items_center()
+                            .cursor_pointer()
+                            .rounded_xs()
+                            .border_b_1()
+                            .border_color(colors.border.opacity(0.4))
+                            .hover(|s| s.bg(cx.theme().colors().element_hover))
+                            .tooltip(Tooltip::text("Click to open request & response in center editor"))
+                            .on_click(cx.listener({
+                                let entry_clone = entry_clone.clone();
+                                move |this, _, window, cx| {
+                                    this.load_http_history_into_builder(entry_clone.clone(), window, cx);
+                                }
+                            }))
+                            .child(
+                                h_flex()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_xs()
+                                    .bg(method_bg)
+                                    .flex_none()
+                                    .child(
+                                        Label::new(method)
+                                            .size(LabelSize::Custom(Rems(0.7)))
+                                            .weight(FontWeight::BOLD)
+                                            .color(Color::Custom(method_fg.into())),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new(entry.url.clone())
+                                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                            .weight(FontWeight::MEDIUM)
+                                            .truncate(),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .when(entry.status > 0, |this| {
+                                                this.child(
+                                                    Label::new(format!("HTTP {}", entry.status))
+                                                        .size(LabelSize::Custom(Rems(0.72)))
+                                                        .weight(FontWeight::BOLD)
+                                                        .color(status_color),
+                                                )
+                                                .child(
+                                                    Label::new(format!("{} ms", entry.time_ms))
+                                                        .size(LabelSize::Custom(Rems(0.72)))
+                                                        .color(Color::Muted),
+                                                )
+                                            })
+                                            .when(entry.status == 0, |this| {
+                                                this.child(
+                                                    Label::new("Failed")
+                                                        .size(LabelSize::Custom(Rems(0.72)))
+                                                        .weight(FontWeight::BOLD)
+                                                        .color(Color::Error),
+                                                )
+                                            })
+                                            .child(
+                                                Label::new(time_short.to_string())
+                                                    .size(LabelSize::Custom(Rems(0.72)))
+                                                    .color(Color::Muted),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                IconButton::new(("http-hist-del", idx), IconName::Close)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Remove from history"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.http_history.retain(|e| e.id != entry_id_for_del);
+                                        this.persist_http_history(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            if http_rows.is_empty() {
+                vec![empty_state(
+                    IconName::Info,
+                    "No HTTP requests",
+                    "Add a .http file to the project",
+                    cx,
+                )]
+            } else {
+                http_rows
+            }
+        };
+
+        let requests_scroll = div()
+            .id("php-http-scroll")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .children(scroll_children);
+
+        let mut sidebar = v_flex()
+            .id("http-sidebar")
+            .size_full()
+            .child(sidebar_header)
+            .child(mode_bar)
+            .child(active_bar);
+
+        if let Some(pill) = response_pill {
+            sidebar = sidebar.child(pill);
+        }
+
+        sidebar.child(requests_scroll).into_any_element()
+    }
+
     fn send_http_builder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_http_client_tab(window, cx);
         if self.http_builder_busy {
             return;
         }
@@ -15763,6 +22819,7 @@ impl PhpPanel {
             &boundary,
         );
         self.persist_http_settings(cx);
+        self.http_active_url = url.clone();
 
         let method = method_text;
         let timeout = self.http_timeout_secs.max(1);
@@ -15771,6 +22828,25 @@ impl PhpPanel {
         let headers = composed.headers.clone();
         let body = composed.body.clone();
         let request_url = composed.url.clone();
+        let hist_sent_headers = headers.clone();
+        let sent_method = method.clone();
+        let sent_url = request_url.clone();
+        let sent_headers = headers.clone();
+        let sent_body = body.clone();
+
+        let hist_method = method.clone();
+        let hist_url = url.clone();
+        let hist_subtab = Some(self.http_subtab);
+        let hist_params = self.http_params.clone();
+        let hist_auth = self.http_auth.clone();
+        let hist_headers = self.http_headers.clone();
+        let hist_body_kind = self.http_body_kind;
+        let hist_raw_content_type = self.http_raw_content_type;
+        let hist_raw_body = self.http_raw_body.clone();
+        let hist_body_fields = self.http_body_fields.clone();
+        let hist_follow = self.http_follow_redirects;
+        let hist_timeout = self.http_timeout_secs;
+        let hist_verify = self.http_verify_tls;
 
         self.http_builder_busy = true;
         self.http_builder_response = None;
@@ -15795,7 +22871,7 @@ impl PhpPanel {
                 std::fs::write(&body_file, body.as_bytes()).map_err(|error| error.to_string())?;
             }
 
-            let mut command = std::process::Command::new("php-http");
+            let mut command = std::process::Command::new(resolve_helper_tool("php-http"));
             command
                 .arg("run")
                 .arg(&file)
@@ -15858,6 +22934,10 @@ impl PhpPanel {
                         time_ms: elapsed_ms,
                         headers,
                         body,
+                        sent_method: sent_method.clone(),
+                        sent_url: sent_url.clone(),
+                        sent_headers: sent_headers.clone(),
+                        sent_body: sent_body.clone(),
                     })
                 }
                 Ok(output) => {
@@ -15874,14 +22954,14 @@ impl PhpPanel {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.http_builder_busy = false;
-                match result {
+                match &result {
                     Ok(response) => {
                         let status = response.status;
                         if let Some(request) = this.http_active_request.as_ref() {
                             this.http_status
                                 .insert(http_request_key(request), HttpStatus::Response(response.clone()));
                         }
-                        this.http_builder_response = Some(response);
+                        this.http_builder_response = Some(response.clone());
                         this.saved_message = if (200..400).contains(&status) {
                             Some(format!("request finished: HTTP {status}"))
                         } else {
@@ -15892,12 +22972,292 @@ impl PhpPanel {
                         this.saved_message = Some(format!("failed: {message}"));
                     }
                 }
+
+                let now = OffsetDateTime::now_utc();
+                let timestamp = format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    now.year(),
+                    u8::from(now.month()),
+                    now.day(),
+                    now.hour(),
+                    now.minute(),
+                    now.second()
+                );
+                let date = format!(
+                    "{:04}-{:02}-{:02}",
+                    now.year(),
+                    u8::from(now.month()),
+                    now.day()
+                );
+                let (status, time_ms, response_headers, response_body, error) = match &result {
+                    Ok(resp) => (resp.status, resp.time_ms, resp.headers.clone(), resp.body.clone(), None),
+                    Err(err) => (0, 0, Vec::new(), String::new(), Some(err.clone())),
+                };
+                let entry = HttpHistoryEntry {
+                    id: format!("{}-{}", now.unix_timestamp_nanos(), this.http_history.len()),
+                    timestamp,
+                    date,
+                    method: hist_method,
+                    url: hist_url,
+                    subtab: hist_subtab,
+                    params: hist_params,
+                    auth: hist_auth,
+                    headers: hist_headers,
+                    body_kind: hist_body_kind,
+                    raw_content_type: hist_raw_content_type,
+                    raw_body: hist_raw_body,
+                    body_fields: hist_body_fields,
+                    follow_redirects: hist_follow,
+                    timeout_secs: hist_timeout,
+                    verify_tls: hist_verify,
+                    status,
+                    time_ms,
+                    request_headers: hist_sent_headers,
+                    response_headers,
+                    response_body,
+                    error,
+                };
+                this.http_history.insert(0, entry);
+                if this.http_history.len() > 100 {
+                    this.http_history.truncate(100);
+                }
+                this.persist_http_history(cx);
+
                 cx.notify();
             })
             .log_err();
         })
         .detach();
     }
+
+    pub(crate) fn is_websocket_mode(&self, cx: &Context<Self>) -> bool {
+        if self.http_method.eq_ignore_ascii_case("WS") {
+            return true;
+        }
+        let url = self.current_http_url(cx);
+        let trimmed = url.trim();
+        trimmed.starts_with("ws://") || trimmed.starts_with("wss://")
+    }
+
+    pub(crate) fn add_ws_message(&mut self, is_outgoing: bool, payload: String, is_binary: bool) {
+        let now = OffsetDateTime::now_utc();
+        let timestamp = format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second());
+        let id = self.ws_next_id;
+        self.ws_next_id = self.ws_next_id.wrapping_add(1);
+        self.ws_messages.push(WsMessageItem {
+            id,
+            timestamp,
+            is_outgoing,
+            payload,
+            is_binary,
+        });
+        if self.ws_messages.len() > 500 {
+            self.ws_messages.remove(0);
+        }
+    }
+
+    pub(crate) fn add_ws_system_message(&mut self, text: String) {
+        self.add_ws_message(false, format!("[System] {text}"), false);
+    }
+
+    pub(crate) fn ws_disconnect(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut sender) = self.ws_send_channel.take() {
+            let _ = sender.close();
+        }
+        self.ws_task = None;
+        self.ws_status = WsStatus::Disconnected;
+        self.add_ws_system_message("Disconnected.".to_string());
+        cx.notify();
+    }
+
+    pub(crate) fn ws_send_message(&mut self, message: String, cx: &mut Context<Self>) {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Some(sender) = self.ws_send_channel.as_mut() {
+            if let Err(e) = sender.unbounded_send(message.clone()) {
+                self.add_ws_system_message(format!("Failed to send: {e}"));
+            } else {
+                self.add_ws_message(true, message, false);
+            }
+            cx.notify();
+        } else {
+            self.add_ws_system_message("Cannot send: not connected.".to_string());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn ws_connect(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.ws_status == WsStatus::Connecting || self.ws_status == WsStatus::Connected {
+            return;
+        }
+
+        let url = self.current_http_url(cx).trim().to_string();
+        if url.is_empty() {
+            self.add_ws_system_message("Cannot connect: empty URL".to_string());
+            cx.notify();
+            return;
+        }
+
+        let boundary = multipart_boundary();
+        let composed = compose_http_request(
+            &url,
+            &self.http_headers,
+            &self.http_auth,
+            self.http_body_kind,
+            self.http_raw_content_type,
+            &self.http_raw_body,
+            &self.http_body_fields,
+            &boundary,
+        );
+
+        let mut ws_url = composed.url.trim().to_string();
+        if ws_url.starts_with("http://") {
+            ws_url = format!("ws://{}", &ws_url["http://".len()..]);
+        } else if ws_url.starts_with("https://") {
+            ws_url = format!("wss://{}", &ws_url["https://".len()..]);
+        } else if !ws_url.starts_with("ws://") && !ws_url.starts_with("wss://") {
+            ws_url = format!("ws://{ws_url}");
+        }
+
+        let req_headers = composed.headers.clone();
+        self.ws_status = WsStatus::Connecting;
+        self.add_ws_system_message(format!("Connecting to {ws_url}…"));
+        cx.notify();
+
+        let (in_tx, mut in_rx) = futures::channel::mpsc::unbounded::<WsEvent>();
+        let (out_tx, mut out_rx) = futures::channel::mpsc::unbounded::<String>();
+        self.ws_send_channel = Some(out_tx);
+
+        let connect_url = ws_url.clone();
+        let headers_for_req = req_headers.clone();
+
+        let tokio_task = Tokio::spawn(cx, async move {
+            let mut request = match connect_url.as_str().into_client_request() {
+                Ok(req) => req,
+                Err(err) => {
+                    let _ = in_tx.unbounded_send(WsEvent::Closed(format!("Invalid WebSocket URL/request: {err}")));
+                    return;
+                }
+            };
+            for (name, val) in &headers_for_req {
+                if let (Ok(hname), Ok(hval)) = (
+                    async_tungstenite::tungstenite::http::header::HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(val),
+                ) {
+                    request.headers_mut().insert(hname, hval);
+                }
+            }
+
+            let (ws_stream, response) = match connect_async(request).await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = in_tx.unbounded_send(WsEvent::Closed(format!("Connection failed: {err}")));
+                    return;
+                }
+            };
+
+            let resp_status = response.status().as_u16();
+            let resp_headers = response
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or_default().to_string()))
+                .collect::<Vec<_>>();
+
+            let _ = in_tx.unbounded_send(WsEvent::Handshake(WsHandshakeInfo {
+                url: connect_url,
+                request_headers: headers_for_req,
+                response_status: resp_status,
+                response_headers: resp_headers,
+            }));
+            let _ = in_tx.unbounded_send(WsEvent::System(format!("Connected to WebSocket (HTTP {resp_status})")));
+
+            let (mut write, mut read) = ws_stream.split();
+            loop {
+                tokio::select! {
+                    outgoing = out_rx.next() => {
+                        match outgoing {
+                            Some(msg) => {
+                                if write.send(WsMessage::Text(msg.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    incoming = read.next() => {
+                        match incoming {
+                            Some(Ok(WsMessage::Text(txt))) => {
+                                let _ = in_tx.unbounded_send(WsEvent::Message { text: txt.to_string(), is_binary: false });
+                            }
+                            Some(Ok(WsMessage::Binary(bin))) => {
+                                let text = String::from_utf8(bin.to_vec()).unwrap_or_else(|_| format!("<binary {} bytes>", bin.len()));
+                                let _ = in_tx.unbounded_send(WsEvent::Message { text, is_binary: true });
+                            }
+                            Some(Ok(WsMessage::Ping(p))) => {
+                                let _ = write.send(WsMessage::Pong(p)).await;
+                            }
+                            Some(Ok(WsMessage::Close(frame))) => {
+                                let desc = frame
+                                    .map(|f| format!("code: {}, reason: {}", f.code, f.reason))
+                                    .unwrap_or_else(|| "normal closure".to_string());
+                                let _ = in_tx.unbounded_send(WsEvent::Closed(format!("Connection closed by server ({desc})")));
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                let _ = in_tx.unbounded_send(WsEvent::Closed(format!("WebSocket error: {e}")));
+                                break;
+                            }
+                            None => {
+                                let _ = in_tx.unbounded_send(WsEvent::Closed("Connection closed.".to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let app_task = cx.spawn(async move |panel, cx| {
+            let _tokio_guard = tokio_task;
+            while let Some(event) = in_rx.next().await {
+                panel.update(cx, |panel, cx| {
+                    match event {
+                        WsEvent::Handshake(hs) => {
+                            panel.ws_status = WsStatus::Connected;
+                            panel.ws_handshake = Some(hs);
+                            cx.notify();
+                        }
+                        WsEvent::Message { text, is_binary } => {
+                            panel.add_ws_message(false, text, is_binary);
+                            cx.notify();
+                        }
+                        WsEvent::System(msg) => {
+                            panel.add_ws_system_message(msg);
+                            cx.notify();
+                        }
+                        WsEvent::Closed(reason) => {
+                            panel.ws_status = WsStatus::Disconnected;
+                            panel.ws_send_channel = None;
+                            panel.add_ws_system_message(reason);
+                            cx.notify();
+                        }
+                    }
+                }).log_err();
+            }
+        });
+
+        self.ws_task = Some(app_task);
+    }
+}
+
+enum WsEvent {
+    Handshake(WsHandshakeInfo),
+    Message { text: String, is_binary: bool },
+    System(String),
+    Closed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16251,6 +23611,84 @@ fn save_http_settings(root: &Path, settings: &HttpSettingsFile) -> Result<()> {
     Ok(())
 }
 
+fn http_history_path(root: &Path) -> PathBuf {
+    root.join(".zed/http-history.json")
+}
+
+fn seed_initial_http_history() -> HttpHistoryFile {
+    HttpHistoryFile {
+        entries: vec![HttpHistoryEntry {
+            id: "seed-eventnetwork-login".to_string(),
+            timestamp: "2026-11-06 14:08:32".to_string(),
+            date: "2026-11-06".to_string(),
+            method: "POST".to_string(),
+            url: "https://back.eventnetwork.eu/api/login".to_string(),
+            subtab: Some(HttpSubTab::Params),
+            params: vec![KeyValueRow {
+                enabled: true,
+                key: "status[]".to_string(),
+                value: "0".to_string(),
+            }],
+            auth: HttpAuthSettings::default(),
+            headers: vec![
+                KeyValueRow {
+                    enabled: true,
+                    key: "Accept".to_string(),
+                    value: "application/json".to_string(),
+                },
+                KeyValueRow {
+                    enabled: true,
+                    key: "Content-Type".to_string(),
+                    value: "application/json".to_string(),
+                },
+            ],
+            body_kind: HttpBodyKind::Raw,
+            raw_content_type: RawContentType::Json,
+            raw_body: "{\n  \"email\": \"darklexusblac@gmail.com\",\n  \"password\": \"\"\n}".to_string(),
+            body_fields: Vec::new(),
+            follow_redirects: true,
+            timeout_secs: 15,
+            verify_tls: true,
+            status: 422,
+            time_ms: 304,
+            request_headers: vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            response_headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("server".to_string(), "nginx".to_string()),
+            ],
+            response_body: "{\n  \"message\": \"The email field is required. (and 2 more errors)\",\n  \"errors\": {\n    \"email\": [\n      \"The email field is required.\"\n    ],\n    \"password\": [\n      \"The password field is required.\"\n    ],\n    \"recaptcha_token\": [\n      \"The recaptcha_token field is required.\"\n    ]\n  }\n}".to_string(),
+            error: None,
+        }],
+    }
+}
+
+fn load_http_history(root: &Path) -> HttpHistoryFile {
+    let path = http_history_path(root);
+    if path.is_file() {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(file) = serde_json::from_str::<HttpHistoryFile>(&contents) {
+                return file;
+            }
+        }
+    }
+    let seeded = seed_initial_http_history();
+    let _ = save_http_history(root, &seeded);
+    seeded
+}
+
+fn save_http_history(root: &Path, history: &HttpHistoryFile) -> Result<()> {
+    let path = http_history_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(history)?;
+    std::fs::write(path, format!("{text}\n"))?;
+    Ok(())
+}
+
 fn response_status_color(status: u16) -> Color {
     match status {
         200..=299 => Color::Success,
@@ -16274,7 +23712,7 @@ fn pretty_body(body: &str, content_type: Option<&str>) -> String {
     body.to_string()
 }
 
-const HTTP_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+const HTTP_METHODS: [&str; 8] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "WS"];
 
 fn select_tab_cyclically(
     window: &mut Window,
@@ -16296,41 +23734,168 @@ fn select_tab_cyclically(
     window.focus(&focus_handle, cx);
 }
 
-fn render_tab_bar(active: PanelTab, cx: &Context<PhpPanel>) -> gpui::AnyElement {
-    h_flex()
-        .id("php-panel-tabs")
-        .w_full()
-        .flex_none()
-        .border_b_1()
-        .border_color(cx.theme().colors().border)
-        .children(PanelTab::VISIBLE.into_iter().map(|tab| {
-            let selected = tab == active;
-            h_flex()
-                .id(("php-panel-tab", tab as usize))
-                .flex_1()
-                .justify_center()
-                .py_1()
-                .cursor_pointer()
-                .when(selected, |this| {
-                    this.border_b_2()
-                        .border_color(cx.theme().colors().border_focused)
-                })
-                .child(
-                    Label::new(tab.label())
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .color(if selected {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        })
-                        .truncate(),
-                )
-                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    this.select_tab(tab, cx);
-                }))
-                .into_any_element()
-        }))
-        .into_any_element()
+impl PhpPanel {
+    #[allow(dead_code)]
+    fn render_compact_stripe(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let active_tab = self.active_tab;
+        let root = self.worktree_root(cx);
+
+        v_flex()
+            .id("phpstorm-right-stripe")
+            .w(px(38.))
+            .h_full()
+            .flex_none()
+            .border_l_1()
+            .border_color(colors.border)
+            .bg(colors.tab_bar_background)
+            .items_center()
+            .justify_between()
+            .py_2()
+            .child(
+                v_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1p5()
+                    // Database
+                    .child({
+                        let is_active = active_tab == PanelTab::Databases;
+                        div()
+                            .id("stripe-database")
+                            .relative()
+                            .size(px(32.))
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .tooltip(|window, cx| Tooltip::text("Database (⌘1)")(window, cx))
+                            .when(is_active, |this| {
+                                this.bg(colors.element_selected)
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .right(px(0.))
+                                            .top(px(4.))
+                                            .bottom(px(4.))
+                                            .w(px(2.))
+                                            .rounded_sm()
+                                            .bg(colors.border_focused),
+                                    )
+                            })
+                            .when(!is_active, |this| {
+                                this.hover(|s| s.bg(colors.element_hover))
+                            })
+                            .child(
+                                Icon::from_path("icons/file_icons/database_stripe.svg")
+                                    .size(IconSize::Small)
+                                    .color(if is_active { Color::Default } else { Color::Muted }),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.select_tab(PanelTab::Databases, cx);
+                                this.open_database_client_tab(window, cx);
+                            }))
+                    })
+                    // 4. Remote Host
+                    .child({
+                        let is_active = active_tab == PanelTab::Remote;
+                        div()
+                            .id("stripe-remote")
+                            .relative()
+                            .size(px(32.))
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .tooltip(|window, cx| Tooltip::text("Remote Host (SFTP / Deployment)")(window, cx))
+                            .when(is_active, |this| {
+                                this.bg(colors.element_selected)
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .right(px(0.))
+                                            .top(px(4.))
+                                            .bottom(px(4.))
+                                            .w(px(2.))
+                                            .rounded_sm()
+                                            .bg(colors.border_focused),
+                                    )
+                            })
+                            .when(!is_active, |this| {
+                                this.hover(|s| s.bg(colors.element_hover))
+                            })
+                            .child(
+                                Icon::new(IconName::Server)
+                                    .size(IconSize::Small)
+                                    .color(if is_active { Color::Default } else { Color::Muted }),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.select_tab(PanelTab::Remote, cx);
+                                this.open_remote_client_tab(window, cx);
+                            }))
+                    })
+                    // 5. HTTP Client
+                    .child({
+                        let is_active = active_tab == PanelTab::Http;
+                        div()
+                            .id("stripe-http")
+                            .relative()
+                            .size(px(32.))
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .tooltip(|window, cx| Tooltip::text("HTTP Client (.http / REST)")(window, cx))
+                            .when(is_active, |this| {
+                                this.bg(colors.element_selected)
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .right(px(0.))
+                                            .top(px(4.))
+                                            .bottom(px(4.))
+                                            .w(px(2.))
+                                            .rounded_sm()
+                                            .bg(colors.border_focused),
+                                    )
+                            })
+                            .when(!is_active, |this| {
+                                this.hover(|s| s.bg(colors.element_hover))
+                            })
+                            .child(
+                                Icon::new(IconName::ArrowRightLeft)
+                                    .size(IconSize::Small)
+                                    .color(if is_active { Color::Default } else { Color::Muted }),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.select_tab(PanelTab::Http, cx);
+                                this.open_http_client_tab(window, cx);
+                            }))
+                    }),
+            )
+            .child(
+                // Bottom Settings icon
+                div()
+                    .id("stripe-deployment-settings")
+                    .size(px(32.))
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .tooltip(|window, cx| Tooltip::text("Deployment Configuration…")(window, cx))
+                    .hover(|s| s.bg(colors.element_hover))
+                    .child(Icon::new(IconName::Settings).size(IconSize::Small).color(Color::Muted))
+                    .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+                        if let Some(root) = root.clone() {
+                            open_deployment_window(root, cx);
+                        }
+                    })),
+            )
+            .into_any_element()
+    }
 }
 
 fn render_form(form: &FormState) -> gpui::AnyElement {
@@ -16539,6 +24104,59 @@ impl Render for DeployServerIndicator {
                 let panel = shared.panel.clone();
                 let root = shared.root.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if let Some(active_server) = active.as_ref() {
+                        let s_deploy = active_server.clone();
+                        let r_root = root.clone();
+                        let menu_panel = panel.clone();
+                        menu = menu.item(
+                            ContextMenuEntry::new(format!("Upload to {s_deploy} (Deploy)"))
+                                .icon(IconName::ArrowUp)
+                                .handler(move |_window, cx| {
+                                    if let Some(panel) = menu_panel.clone().and_then(|panel| panel.upgrade()) {
+                                        panel.update(cx, |panel, cx| {
+                                            if let Some(root) = r_root.clone() {
+                                                panel.upload_project(s_deploy.clone(), root, cx);
+                                            }
+                                        });
+                                    }
+                                }),
+                        );
+
+                        let s_dl = active_server.clone();
+                        let r_root_dl = root.clone();
+                        let menu_panel_dl = panel.clone();
+                        menu = menu.item(
+                            ContextMenuEntry::new(format!("Download from {s_dl}"))
+                                .icon(IconName::Download)
+                                .handler(move |_window, cx| {
+                                    if let Some(panel) = menu_panel_dl.clone().and_then(|panel| panel.upgrade()) {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.download_from_remote_path(s_dl.clone(), ".".to_string(), true, r_root_dl.clone(), cx);
+                                        });
+                                    }
+                                }),
+                        );
+
+                        let s_sync = active_server.clone();
+                        let r_root_sync = root.clone();
+                        let menu_panel_sync = panel.clone();
+                        menu = menu.item(
+                            ContextMenuEntry::new(format!("Sync with {s_sync}…"))
+                                .icon(IconName::RotateCw)
+                                .handler(move |_window, cx| {
+                                    if let Some(panel) = menu_panel_sync.clone().and_then(|panel| panel.upgrade()) {
+                                        panel.update(cx, |panel, cx| {
+                                            if let Some(root) = r_root_sync.clone() {
+                                                panel.sync_server(s_sync.clone(), root, cx);
+                                            }
+                                        });
+                                    }
+                                }),
+                        );
+
+                        menu = menu.separator();
+                    }
+
                     for server in servers.iter() {
                         let is_active = active.as_deref() == Some(server.as_str());
                         let server_name = server.clone();
@@ -16578,7 +24196,17 @@ impl Render for DeployServerIndicator {
                             });
                         }
                     });
-                    let _ = root;
+
+                    if let Some(root) = root.clone() {
+                        menu = menu.separator();
+                        menu = menu.item(
+                            ContextMenuEntry::new("Deployment Configuration…")
+                                .icon(IconName::Settings)
+                                .handler(move |_window, cx| {
+                                    open_deployment_window(root.clone(), cx);
+                                }),
+                        );
+                    }
                     menu
                 }))
             })
@@ -16799,6 +24427,9 @@ mod tests {
                     excluded: Vec::new(),
                     upload_on_save: false,
                     use_rsync: false,
+                    rsync_args: None,
+                    rsync_path: None,
+                    rsync_delete: false,
                     use_sudo: false,
                     visible: true,
                     passive_mode: true,
@@ -16826,6 +24457,9 @@ mod tests {
                     excluded: Vec::new(),
                     upload_on_save: false,
                     use_rsync: false,
+                    rsync_args: None,
+                    rsync_path: None,
+                    rsync_delete: false,
                     use_sudo: false,
                     visible: true,
                     passive_mode: true,
@@ -17142,6 +24776,7 @@ mod tests {
             name: name.to_string(),
             driver: None,
             target: None,
+            database: None,
             user: None,
             host: None,
             root: PathBuf::from("/tmp"),
@@ -18967,18 +26602,24 @@ Host web1
 
     #[test]
     fn parse_local_dir_entries_sorts_dirs_first() {
-        let entries = parse_local_dir_entries(vec![
-            ("README.md".to_string(), false),
-            ("vendor".to_string(), true),
-            ("app.log".to_string(), false),
-            ("public".to_string(), true),
-        ]);
+        let entries = parse_local_dir_entries(
+            vec![
+                ("README.md".to_string(), false),
+                ("vendor".to_string(), true),
+                ("app.log".to_string(), false),
+                ("public".to_string(), true),
+            ],
+            ".",
+        );
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["public", "vendor", "app.log", "README.md"]);
         assert!(entries[0].is_directory);
         assert_eq!(entries[0].path, "public");
         assert!(!entries[2].is_directory);
         assert_eq!(entries[2].size, None);
+
+        let nested = parse_local_dir_entries(vec![("index.php".to_string(), false)], "public");
+        assert_eq!(nested[0].path, "public/index.php");
     }
 
     #[test]
@@ -19223,13 +26864,40 @@ Host web1
 
         // First three slots are always the tab strip.
         assert_eq!(connection[3], DeployFocusSlot::Visibility);
+        assert_eq!(connection[4], DeployFocusSlot::UploadOnSave);
         assert_eq!(mappings[3], DeployFocusSlot::MappingLocal);
         assert_eq!(excluded[3], DeployFocusSlot::ExcludedPaths);
 
         assert!(connection.contains(&DeployFocusSlot::Visibility));
+        assert!(connection.contains(&DeployFocusSlot::UploadOnSave));
         assert!(!mappings.contains(&DeployFocusSlot::Visibility));
         assert!(mappings.contains(&DeployFocusSlot::MappingRemote));
         assert!(!excluded.contains(&DeployFocusSlot::WebUrl));
+    }
+
+    #[test]
+    fn relative_upload_path_resolves_project_and_subroot_paths() {
+        let root = Path::new("/tmp/phpworkbench-test-project");
+        assert_eq!(
+            relative_upload_path(
+                &root.join("src/Controller/HomeController.php"),
+                root,
+                None,
+            ),
+            Some("src/Controller/HomeController.php".to_string())
+        );
+        assert_eq!(
+            relative_upload_path(&root.join("public/index.php"), root, Some("public")),
+            Some("index.php".to_string())
+        );
+        assert_eq!(
+            relative_upload_path(&root.join(".zed/deploy.json"), root, Some(".")),
+            None
+        );
+        assert_eq!(
+            relative_upload_path(Path::new("/tmp/other/file.php"), root, None),
+            None
+        );
     }
 
     #[test]

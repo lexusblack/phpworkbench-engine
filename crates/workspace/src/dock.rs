@@ -101,6 +101,12 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn hide_button_setting(&self, _: &App) -> Option<HideStatusItem> {
         None
     }
+    fn active_subview(&self, _cx: &App) -> Option<String> {
+        None
+    }
+    fn activate_subview(&mut self, _name: &str, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        false
+    }
 }
 
 pub trait PanelHandle: Send + Sync {
@@ -134,6 +140,8 @@ pub trait PanelHandle: Send + Sync {
     fn enabled(&self, cx: &App) -> bool;
     fn is_agent_panel(&self, cx: &App) -> bool;
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem>;
+    fn active_subview(&self, cx: &App) -> Option<String>;
+    fn activate_subview(&self, name: &str, window: &mut Window, cx: &mut App) -> bool;
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
         let next_position = [
@@ -269,6 +277,14 @@ where
 
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem> {
         self.read(cx).hide_button_setting(cx)
+    }
+
+    fn active_subview(&self, cx: &App) -> Option<String> {
+        self.read(cx).active_subview(cx)
+    }
+
+    fn activate_subview(&self, name: &str, window: &mut Window, cx: &mut App) -> bool {
+        self.update(cx, |this, cx| this.activate_subview(name, window, cx))
     }
 }
 
@@ -1275,10 +1291,516 @@ impl Dock {
             .flatten()
             .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
     }
+    fn render_stripe_button<F>(
+        &self,
+        id: &'static str,
+        icon: ui::IconName,
+        tooltip_text: &'static str,
+        is_active: bool,
+        on_click: F,
+        cx: &App,
+    ) -> impl IntoElement
+    where
+        F: Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    {
+        let colors = cx.theme().colors();
+        div()
+            .id(id)
+            .relative()
+            .w(px(34.0))
+            .h(px(34.0))
+            .rounded_md()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(is_active, |this| this.bg(colors.element_selected))
+            .when(!is_active, |this| {
+                this.hover(|style| style.bg(colors.element_hover))
+            })
+            .tooltip(Tooltip::text(tooltip_text))
+            .on_click(on_click)
+            .when(is_active, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(4.0))
+                        .bottom(px(4.0))
+                        .w(px(2.0))
+                        .rounded_sm()
+                        .bg(colors.border_focused),
+                )
+            })
+            .child(
+                Icon::new(icon)
+                    .size(IconSize::default())
+                    .color(if is_active {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }),
+            )
+    }
+
+    pub fn render_left_tool_window_stripe(
+        &self,
+        window: &mut Window,
+        cx: &App,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+
+        let git_panel_ix = self.panel_index_for_persistent_name("GitPanel", cx);
+        let is_git_active = self.is_open && self.active_panel_index == git_panel_ix;
+
+        let project_panel_ix = self.panel_index_for_persistent_name("ProjectPanel", cx);
+        let is_project_active = self.is_open && self.active_panel_index == project_panel_ix;
+
+        let outline_panel_ix = self.panel_index_for_persistent_name("OutlinePanel", cx);
+        let is_outline_active = self.is_open && self.active_panel_index == outline_panel_ix;
+
+        let is_terminal_active = self.workspace.upgrade().map_or(false, |ws| {
+            ws.read(cx).bottom_dock().read(cx).is_open()
+        });
+
+        let focus_handle = self.focus_handle(cx);
+
+        let top_buttons = v_flex()
+            .w_full()
+            .items_center()
+            .gap(px(2.0))
+            // 1. Commit / Changes (matches PhpStorm New UI Left Stripe)
+            .child(self.render_stripe_button(
+                "left-stripe-commit",
+                ui::IconName::GitCommit,
+                "Commit & Changes (⌘0)",
+                is_git_active,
+                {
+                    let is_active = is_git_active;
+                    let focus = focus_handle.clone();
+                    move |_, window, cx| {
+                        window.focus(&focus, cx);
+                        if is_active {
+                            window.dispatch_action(Box::new(crate::ToggleLeftDock), cx);
+                        } else {
+                            window.dispatch_action(Box::new(zed_actions::git_panel::ToggleFocus), cx);
+                        }
+                    }
+                },
+                cx,
+            ))
+            // 2. Project (file tree)
+            .child(self.render_stripe_button(
+                "left-stripe-project",
+                ui::IconName::Folder,
+                "Project (⌘1)",
+                is_project_active,
+                {
+                    let is_active = is_project_active;
+                    let focus = focus_handle.clone();
+                    move |_, window, cx| {
+                        window.focus(&focus, cx);
+                        if is_active {
+                            window.dispatch_action(Box::new(crate::ToggleLeftDock), cx);
+                        } else {
+                            window.dispatch_action(Box::new(zed_actions::project_panel::ToggleFocus), cx);
+                        }
+                    }
+                },
+                cx,
+            ))
+            // 3. Structure
+            .child(self.render_stripe_button(
+                "left-stripe-structure",
+                ui::IconName::ListTree,
+                "Structure (⌘7)",
+                is_outline_active,
+                {
+                    let is_active = is_outline_active;
+                    let focus = focus_handle.clone();
+                    move |_, window, cx| {
+                        window.focus(&focus, cx);
+                        if is_active {
+                            window.dispatch_action(Box::new(crate::ToggleLeftDock), cx);
+                        } else {
+                            window.dispatch_action(Box::new(zed_actions::outline::ToggleOutline), cx);
+                        }
+                    }
+                },
+                cx,
+            ))
+            // 4. Pull Requests / Services
+            .child(self.render_stripe_button(
+                "left-stripe-pull-requests",
+                ui::IconName::PullRequest,
+                "Pull Requests & Services",
+                false,
+                |_, window, cx| {
+                    window.dispatch_action(Box::new(zed_actions::git::CreatePullRequest), cx);
+                },
+                cx,
+            ))
+            // 5. More (···)
+            .child(self.render_stripe_button(
+                "left-stripe-more",
+                ui::IconName::Ellipsis,
+                "More Tool Windows",
+                false,
+                |_, window, cx| {
+                    window.dispatch_action(Box::new(zed_actions::command_palette::Toggle), cx);
+                },
+                cx,
+            ));
+
+        let bottom_buttons = v_flex()
+            .w_full()
+            .items_center()
+            .gap(px(2.0))
+            // 1. Sync / Fetch
+            .child(self.render_stripe_button(
+                "left-stripe-sync",
+                ui::IconName::ArrowRightLeft,
+                "Sync / Fetch",
+                false,
+                |_, window, cx| {
+                    window.dispatch_action(Box::new(zed_actions::git::Branch), cx);
+                },
+                cx,
+            ))
+            // 2. Run / Debug
+            .child(self.render_stripe_button(
+                "left-stripe-debug",
+                ui::IconName::PlayFilled,
+                "Run / Debug Configurations",
+                false,
+                |_, window, cx| {
+                    window.dispatch_action(Box::new(zed_actions::debug_panel::ToggleFocus), cx);
+                },
+                cx,
+            ))
+            // 3. Terminal
+            .child(self.render_stripe_button(
+                "left-stripe-terminal",
+                ui::IconName::Terminal,
+                "Terminal (⌥F12)",
+                is_terminal_active,
+                |_, window, cx| {
+                    window.dispatch_action(Box::new(crate::ToggleBottomDock), cx);
+                },
+                cx,
+            ))
+            // 4. Problems / Diagnostics
+            .child(self.render_stripe_button(
+                "left-stripe-problems",
+                ui::IconName::Warning,
+                "Problems / Diagnostics (⌘6)",
+                false,
+                |_, window, cx| {
+                    if let Ok(action) = cx.build_action("diagnostics::Deploy", None) {
+                        window.dispatch_action(action, cx);
+                    }
+                },
+                cx,
+            ))
+            // 5. Git Log / Branches
+            .child(self.render_stripe_button(
+                "left-stripe-git-log",
+                ui::IconName::GitBranch,
+                "Git Log & Branches (⌘9)",
+                false,
+                {
+                    let git_action = git_panel_ix
+                        .and_then(|ix| self.panel_entries.get(ix))
+                        .map(|entry| entry.panel.toggle_action(window, cx));
+                    move |_, window, cx| {
+                        if let Some(action) = &git_action {
+                            window.dispatch_action(action.boxed_clone(), cx);
+                        }
+                        if let Ok(action) = cx.build_action("git_panel::ActivateHistoryTab", None) {
+                            window.dispatch_action(action, cx);
+                        }
+                    }
+                },
+                cx,
+            ))
+            // 6. Settings
+            .child(self.render_stripe_button(
+                "left-stripe-settings",
+                ui::IconName::Settings,
+                "Settings",
+                false,
+                |_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(zed_actions::OpenSettingsPage {
+                            page: "Settings".into(),
+                            target: None,
+                        }),
+                        cx,
+                    );
+                },
+                cx,
+            ));
+
+        v_flex()
+            .id("phpstorm-left-stripe")
+            .w(px(38.0))
+            .h_full()
+            .bg(colors.tab_bar_background)
+            .border_r_1()
+            .border_color(colors.border)
+            .justify_between()
+            .items_center()
+            .py_1()
+            .child(top_buttons)
+            .child(bottom_buttons)
+    }
+
+    fn render_right_stripe_button<F>(
+        &self,
+        id: &'static str,
+        icon: ui::Icon,
+        tooltip_text: &'static str,
+        is_active: bool,
+        on_click: F,
+        cx: &App,
+    ) -> impl IntoElement
+    where
+        F: Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    {
+        let colors = cx.theme().colors();
+        div()
+            .id(id)
+            .relative()
+            .w(px(34.0))
+            .h(px(34.0))
+            .rounded_md()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(is_active, |this| this.bg(colors.element_selected))
+            .when(!is_active, |this| {
+                this.hover(|style| style.bg(colors.element_hover))
+            })
+            .tooltip(Tooltip::text(tooltip_text))
+            .on_click(on_click)
+            .when(is_active, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .right(px(0.0))
+                        .top(px(4.0))
+                        .bottom(px(4.0))
+                        .w(px(2.0))
+                        .rounded_sm()
+                        .bg(colors.border_focused),
+                )
+            })
+            .child(
+                icon.size(IconSize::default())
+                    .color(if is_active {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }),
+            )
+    }
+
+    pub fn render_right_tool_window_stripe(
+        &self,
+        _window: &mut Window,
+        cx: &App,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+
+        let php_panel_ix = self.panel_index_for_persistent_name("PHP", cx);
+        let php_entry = php_panel_ix.and_then(|ix| self.panel_entries.get(ix));
+        let current_tab = php_entry.and_then(|entry| entry.panel.active_subview(cx));
+
+        let is_database_active = self.is_open
+            && self.active_panel_index == php_panel_ix
+            && current_tab.as_deref() == Some("databases");
+        let is_remote_active = self.is_open
+            && self.active_panel_index == php_panel_ix
+            && current_tab.as_deref() == Some("remote");
+        let is_http_active = self.is_open
+            && self.active_panel_index == php_panel_ix
+            && current_tab.as_deref() == Some("http");
+
+        let workspace = self.workspace.clone();
+
+        let make_click_handler = |subview: &'static str, is_active: bool| {
+            let ws = workspace.clone();
+            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                if let Some(ws) = ws.upgrade() {
+                    ws.update(cx, |ws, cx| {
+                        if is_active {
+                            ws.toggle_dock(DockPosition::Right, window, cx);
+                        } else {
+                            let right_dock = ws.right_dock().clone();
+                            right_dock.update(cx, |dock, cx| {
+                                if let Some(ix) = php_panel_ix {
+                                    dock.activate_panel(ix, window, cx);
+                                }
+                                if let Some(entry) = php_panel_ix.and_then(|ix| dock.panel_entries.get(ix)) {
+                                    entry.panel.activate_subview(subview, window, cx);
+                                }
+                                dock.set_open(true, window, cx);
+                                if let Some(active_panel) = dock.active_panel() {
+                                    let focus_handle = active_panel.activation_focus_handle(cx);
+                                    window.focus(&focus_handle, cx);
+                                }
+                            });
+                            ws.dismiss_zoomed_items_to_reveal(Some(DockPosition::Right), window, cx);
+                            cx.notify();
+                            ws.serialize_workspace(window, cx);
+                        }
+                    });
+                }
+            }
+        };
+
+        let top_buttons = v_flex()
+            .w_full()
+            .items_center()
+            .gap(px(2.0))
+            // 1. Database
+            .child(self.render_right_stripe_button(
+                "stripe-database",
+                Icon::from_path("icons/file_icons/database_stripe.svg"),
+                "Database (⌘1)",
+                is_database_active,
+                make_click_handler("databases", is_database_active),
+                cx,
+            ))
+            // 2. Services / Remote Host
+            .child(self.render_right_stripe_button(
+                "stripe-remote",
+                Icon::new(ui::IconName::Server),
+                "Services (Server / Remote Host)",
+                is_remote_active,
+                make_click_handler("remote", is_remote_active),
+                cx,
+            ))
+            // 3. HTTP Client (.http / REST)
+            .child(self.render_right_stripe_button(
+                "stripe-http",
+                Icon::new(ui::IconName::ArrowRightLeft),
+                "HTTP Client (.http / REST)",
+                is_http_active,
+                make_click_handler("http", is_http_active),
+                cx,
+            ));
+
+        v_flex()
+            .id("phpstorm-right-stripe")
+            .w(px(38.0))
+            .h_full()
+            .bg(colors.tab_bar_background)
+            .border_l_1()
+            .border_color(colors.border)
+            .items_center()
+            .justify_start()
+            .py_1()
+            .child(top_buttons)
+    }
+
+    fn render_tool_window_header(
+        &self,
+        entry: &PanelEntry,
+        _window: &mut Window,
+        cx: &App,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let title: String = match entry.panel.persistent_name() {
+            "ProjectPanel" => "Project".to_string(),
+            "GitPanel" => "Commit".to_string(),
+            "OutlinePanel" => "Structure".to_string(),
+            "TerminalPanel" => "Terminal".to_string(),
+            "CollabPanel" => "Collaborate".to_string(),
+            "PHP" => match entry.panel.active_subview(cx).as_deref() {
+                Some("databases") => "Database".to_string(),
+                Some("remote") => "Remote Host".to_string(),
+                Some("http") => "HTTP Client".to_string(),
+                Some("tests") => "Tests".to_string(),
+                Some("collections") => "Endpoints".to_string(),
+                _ => "Database".to_string(),
+            },
+            name => name.to_string(),
+        };
+
+        let workspace = self.workspace.clone();
+        let position = self.position;
+
+        h_flex()
+            .id("tool-window-header")
+            .w_full()
+            .h(px(28.0))
+            .px_2p5()
+            .items_center()
+            .justify_between()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                Label::new(title)
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .color(Color::Default),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .id("tool-window-settings")
+                            .size(px(20.0))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|s| s.bg(colors.element_hover))
+                            .tooltip(Tooltip::text("Options Menu"))
+                            .child(
+                                Icon::new(ui::IconName::Settings)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child({
+                        let ws = workspace.clone();
+                        div()
+                            .id("tool-window-hide")
+                            .size(px(20.0))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|s| s.bg(colors.element_hover))
+                            .tooltip(Tooltip::text("Hide (Shift+Escape)"))
+                            .on_click(move |_, window: &mut Window, cx: &mut App| {
+                                if let Some(ws) = ws.upgrade() {
+                                    ws.update(cx, |ws, cx| {
+                                        ws.toggle_dock(position, window, cx);
+                                        ws.focus_active_editor(window, cx);
+                                    });
+                                }
+                            })
+                            .child(
+                                Icon::new(ui::IconName::Dash)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                    }),
+            )
+    }
 }
 
 impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
@@ -1341,47 +1863,150 @@ impl Render for Dock {
                 }
             };
 
-            div()
-                .id("dock-panel")
-                .key_context(dispatch_context)
-                .track_focus(&self.focus_handle(cx))
-                .focus_follows_mouse(self.focus_follows_mouse, cx)
-                .flex()
-                .bg(cx.theme().colors().panel_background)
-                .border_color(cx.theme().colors().border)
-                .overflow_hidden()
-                .map(|this| match self.position().axis() {
-                    // Width and height are always set on the workspace wrapper in
-                    // render_dock, so fill whatever space the wrapper provides.
-                    Axis::Horizontal => this.w_full().h_full().flex_row(),
-                    Axis::Vertical => this.h_full().w_full().flex_col(),
-                })
-                .map(|this| match self.position() {
-                    DockPosition::Left => this.border_r_1(),
-                    DockPosition::Right => this.border_l_1(),
-                    DockPosition::Bottom => this.border_t_1(),
-                })
-                .child(
-                    div()
-                        .map(|this| match self.position().axis() {
-                            Axis::Horizontal => this.w_full().h_full(),
-                            Axis::Vertical => this.h_full().w_full(),
-                        })
-                        .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
-                )
-                .when(self.resizable(cx), |this| {
-                    this.child(create_resize_handle())
-                })
+            if self.position == DockPosition::Left {
+                div()
+                    .id("dock-panel")
+                    .key_context(dispatch_context)
+                    .track_focus(&self.focus_handle(cx))
+                    .focus_follows_mouse(self.focus_follows_mouse, cx)
+                    .flex()
+                    .bg(cx.theme().colors().panel_background)
+                    .border_color(cx.theme().colors().border)
+                    .overflow_hidden()
+                    .w_full()
+                    .h_full()
+                    .flex_row()
+                    .border_r_1()
+                    .child(self.render_left_tool_window_stripe(window, cx))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.render_tool_window_header(entry, window, cx))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .child(
+                                        entry
+                                            .panel
+                                            .to_any()
+                                            .cached(StyleRefinement::default().v_flex().size_full()),
+                                    ),
+                            ),
+                    )
+                    .when(self.resizable(cx), |this| {
+                        this.child(create_resize_handle())
+                    })
+            } else if self.position == DockPosition::Right {
+                div()
+                    .id("dock-panel")
+                    .key_context(dispatch_context)
+                    .track_focus(&self.focus_handle(cx))
+                    .focus_follows_mouse(self.focus_follows_mouse, cx)
+                    .flex()
+                    .bg(cx.theme().colors().panel_background)
+                    .border_color(cx.theme().colors().border)
+                    .overflow_hidden()
+                    .w_full()
+                    .h_full()
+                    .flex_row()
+                    .border_l_1()
+                    .when(self.resizable(cx), |this| {
+                        this.child(create_resize_handle())
+                    })
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.render_tool_window_header(entry, window, cx))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .child(
+                                        entry
+                                            .panel
+                                            .to_any()
+                                            .cached(StyleRefinement::default().v_flex().size_full()),
+                                    ),
+                            ),
+                    )
+                    .child(self.render_right_tool_window_stripe(window, cx))
+            } else {
+                div()
+                    .id("dock-panel")
+                    .key_context(dispatch_context)
+                    .track_focus(&self.focus_handle(cx))
+                    .focus_follows_mouse(self.focus_follows_mouse, cx)
+                    .flex()
+                    .bg(cx.theme().colors().panel_background)
+                    .border_color(cx.theme().colors().border)
+                    .overflow_hidden()
+                    .map(|this| match self.position().axis() {
+                        // Width and height are always set on the workspace wrapper in
+                        // render_dock, so fill whatever space the wrapper provides.
+                        Axis::Horizontal => this.w_full().h_full().flex_row(),
+                        Axis::Vertical => this.h_full().w_full().flex_col(),
+                    })
+                    .map(|this| match self.position() {
+                        DockPosition::Left => this.border_r_1(),
+                        DockPosition::Right => this.border_l_1(),
+                        DockPosition::Bottom => this.border_t_1(),
+                    })
+                    .child(
+                        div()
+                            .map(|this| match self.position().axis() {
+                                Axis::Horizontal => this.w_full().h_full(),
+                                Axis::Vertical => this.h_full().w_full(),
+                            })
+                            .child(
+                                entry
+                                    .panel
+                                    .to_any()
+                                    .cached(StyleRefinement::default().v_flex().size_full()),
+                            ),
+                    )
+                    .when(self.resizable(cx), |this| {
+                        this.child(create_resize_handle())
+                    })
+            }
         } else {
-            div()
-                .id("dock-panel")
-                .key_context(dispatch_context)
-                .track_focus(&self.focus_handle(cx))
+            let dispatch_context = KeyContext::new_with_defaults();
+            if self.position == DockPosition::Left {
+                div()
+                    .id("dock-panel")
+                    .key_context(dispatch_context)
+                    .track_focus(&self.focus_handle(cx))
+                    .flex()
+                    .w(px(38.0))
+                    .h_full()
+                    .flex_row()
+                    .border_r_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(self.render_left_tool_window_stripe(window, cx))
+            } else if self.position == DockPosition::Right {
+                div()
+                    .id("dock-panel")
+                    .key_context(dispatch_context)
+                    .track_focus(&self.focus_handle(cx))
+                    .flex()
+                    .w(px(38.0))
+                    .h_full()
+                    .flex_row()
+                    .border_l_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(self.render_right_tool_window_stripe(window, cx))
+            } else {
+                div()
+                    .id("dock-panel")
+                    .key_context(dispatch_context)
+                    .track_focus(&self.focus_handle(cx))
+            }
         }
     }
 }
@@ -1544,7 +2169,7 @@ impl Render for PanelButtons {
                             // Include active state in element ID to invalidate the cached
                             // tooltip when panel state changes (e.g., via keyboard shortcut)
                             let button = IconButton::new((name, is_active_button as u64), icon)
-                                .icon_size(IconSize::Small)
+                                .icon_size(IconSize::default())
                                 .toggle_state(is_active_button)
                                 .tab_index(0isize)
                                 .aria_label(icon_tooltip)

@@ -5,14 +5,11 @@ mod reliability;
 mod watcher_debug;
 mod zed;
 
-// Ensure the binary name stays in sync with APP_NAME so that the paths used
-// at runtime (data dir, config dir, etc.) match what the binary is called.
+// Cargo package/binary target keeps the upstream `zed` name for build tooling,
+// while packaged binaries and runtime app dirs (`APP_NAME`) use PhpWorkbench.
 const _: () = assert!(
-    paths::APP_NAME_LOWERCASE
-        .as_bytes()
-        .eq_ignore_ascii_case(env!("CARGO_BIN_NAME").as_bytes()),
-    "paths::APP_NAME_LOWERCASE must match the binary name. \
-     Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
+    !paths::APP_NAME_LOWERCASE.is_empty(),
+    "paths::APP_NAME_LOWERCASE must not be empty.",
 );
 
 use agent_ui::AgentPanel;
@@ -37,7 +34,7 @@ use gpui_platform;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
-use onboarding::{FIRST_OPEN, show_onboarding_view};
+use onboarding::FIRST_OPEN;
 use project_panel::ProjectPanel;
 use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
@@ -266,7 +263,15 @@ fn main() {
             directory.as_os_str().to_owned(),
         ]
     } else {
-        Vec::new()
+        let default_dir = std::env::var("ZED_USER_DATA_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| paths::home_dir().join(".phpworkbench"));
+        let directory = paths::set_custom_data_dir(default_dir.to_str().unwrap());
+        vec![
+            std::ffi::OsString::from("--user-data-dir"),
+            directory.as_os_str().to_owned(),
+        ]
     };
 
     #[cfg(target_os = "windows")]
@@ -1553,7 +1558,30 @@ pub(crate) async fn restore_or_create_workspace(
             .await?;
         }
     } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-        cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
+        cx.update(|cx| {
+            db::write_and_log(cx, {
+                let kvp = kvp.clone();
+                move || async move {
+                    kvp.write_kvp(FIRST_OPEN.to_string(), "false".to_string())
+                        .await
+                }
+            });
+            workspace::open_new(
+                Default::default(),
+                app_state,
+                cx,
+                |workspace, window, cx| {
+                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
+                    match restore_on_startup {
+                        workspace::RestoreOnStartupBehavior::Launchpad => {}
+                        _ => {
+                            Editor::new_file(workspace, &Default::default(), window, cx);
+                        }
+                    }
+                },
+            )
+        })
+        .await?;
     } else {
         cx.update(|cx| {
             workspace::open_new(

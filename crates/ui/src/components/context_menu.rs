@@ -99,6 +99,7 @@ pub struct ContextMenuEntry {
     end_slot_title: Option<SharedString>,
     end_slot_handler: Option<Rc<dyn Fn(Option<&FocusHandle>, &mut Window, &mut App)>>,
     show_end_slot_on_hover: bool,
+    shortcut: Option<SharedString>,
 }
 
 impl ContextMenuEntry {
@@ -121,7 +122,13 @@ impl ContextMenuEntry {
             end_slot_title: None,
             end_slot_handler: None,
             show_end_slot_on_hover: false,
+            shortcut: None,
         }
+    }
+
+    pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
     }
 
     pub fn toggleable(mut self, toggle_position: IconPosition, toggled: bool) -> Self {
@@ -517,6 +524,7 @@ impl ContextMenu {
             end_slot_title: None,
             end_slot_handler: None,
             show_end_slot_on_hover: false,
+            shortcut: None,
         }));
         self
     }
@@ -548,6 +556,7 @@ impl ContextMenu {
             end_slot_title: Some(end_slot_title),
             end_slot_handler: Some(Rc::new(move |_, window, cx| end_slot_handler(window, cx))),
             show_end_slot_on_hover: false,
+            shortcut: None,
         }));
         self
     }
@@ -579,6 +588,7 @@ impl ContextMenu {
             end_slot_title: Some(end_slot_title),
             end_slot_handler: Some(Rc::new(move |_, window, cx| end_slot_handler(window, cx))),
             show_end_slot_on_hover: true,
+            shortcut: None,
         }));
         self
     }
@@ -623,6 +633,7 @@ impl ContextMenu {
             end_slot_title: None,
             end_slot_handler: None,
             show_end_slot_on_hover: false,
+            shortcut: None,
         }));
         self
     }
@@ -732,6 +743,7 @@ impl ContextMenu {
             end_slot_title: None,
             end_slot_handler: None,
             show_end_slot_on_hover: false,
+            shortcut: None,
         }));
         self
     }
@@ -765,6 +777,7 @@ impl ContextMenu {
             end_slot_title: None,
             end_slot_handler: None,
             show_end_slot_on_hover: false,
+            shortcut: None,
         }));
         self
     }
@@ -800,6 +813,7 @@ impl ContextMenu {
             end_slot_title: None,
             end_slot_handler: None,
             show_end_slot_on_hover: false,
+            shortcut: None,
         }));
         self
     }
@@ -1789,6 +1803,7 @@ impl ContextMenu {
             end_slot_title,
             end_slot_handler,
             show_end_slot_on_hover,
+            shortcut,
             secondary_handler: _,
         } = entry;
         let this = cx.weak_entity();
@@ -2045,6 +2060,17 @@ impl ContextMenu {
                                         parent.invisible()
                                     })
                             }))
+                            .when_some(shortcut.as_ref(), |parent, shortcut| {
+                                parent.child(
+                                    div()
+                                        .ml_4()
+                                        .child(
+                                            Label::new(shortcut.clone())
+                                                .size(LabelSize::Custom(Rems(0.72)))
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                            })
                             .when(*disabled && documentation_aside.is_some(), |parent| {
                                 parent.child(
                                     Icon::new(IconName::Info)

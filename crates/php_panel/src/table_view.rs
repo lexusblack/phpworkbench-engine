@@ -13,15 +13,21 @@ use crate::{
 };
 use editor::{Editor, EditorElement, EditorEvent, EditorStyle, actions as editor_actions};
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, Task, Window, div, px,
+    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ListSizingBehavior, ParentElement as _, Pixels, Render, ScrollHandle,
+    SharedString, Styled as _, Subscription, Task, UniformListScrollHandle, Window, div,
+    px, uniform_list,
 };
 use menu::Confirm;
 use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use ui::{
-    Color, Icon, IconButton, IconButtonShape, IconName, IconSize, Label, LabelSize, Tooltip,
+    Color, ContextMenu, ContextMenuEntry, Icon, IconButton, IconButtonShape, IconName,
+    IconSize, Label, LabelSize, PopoverMenu, ScrollAxes, Scrollbars, Tooltip,
+    WithScrollbar,
     prelude::*,
 };
 use util::ResultExt as _;
@@ -30,11 +36,12 @@ use workspace::item::ItemEvent;
 
 /// Hidden column alias carrying sqlite `rowid` so keyless rows can be targeted.
 pub(crate) const ROWID_COLUMN: &str = "__rowid";
+pub(crate) const PAGE_SIZES: &[usize] = &[10, 25, 50, 100, 250, 500];
 const CELL_WIDTH: f32 = 180.0;
 const ROW_NUMBER_WIDTH: f32 = 48.0;
 const ROW_HEIGHT: f32 = 24.0;
 const TOOLBAR_HEIGHT: f32 = 34.0;
-const ROW_LIMIT: usize = 500;
+const DEFAULT_PAGE_SIZE: usize = 50;
 
 /// A table to open as a tab.
 #[derive(Clone)]
@@ -43,9 +50,10 @@ pub struct TableTabTarget {
     /// Human-facing connection label: sqlite file name when known.
     pub connection_label: String,
     pub table: String,
+    pub driver: Option<String>,
     pub root: PathBuf,
     pub columns: Vec<DatabaseColumn>,
-    /// Editable candidate: a sqlite table (not a view).
+    /// Editable candidate: a table (not a view).
     pub editable_candidate: bool,
     /// Connection is configured `read_only: true`.
     pub read_only: bool,
@@ -55,30 +63,107 @@ pub struct TableTabTarget {
 #[derive(Clone)]
 struct RowData {
     values: Map<String, Value>,
+    formatted_cells: Vec<SharedString>,
+    is_null_cells: Vec<bool>,
     rowid: Option<Value>,
     /// Appended locally by `+`, not yet present in the database.
     is_new: bool,
+}
+
+impl RowData {
+    fn format_for_columns(&mut self, columns: &[DatabaseColumn]) {
+        self.formatted_cells.clear();
+        self.is_null_cells.clear();
+        self.formatted_cells.reserve(columns.len());
+        self.is_null_cells.reserve(columns.len());
+        for col in columns {
+            let val = self.values.get(&col.name);
+            let is_null = val.map_or(true, |v| v.is_null());
+            let text = match val {
+                Some(Value::String(s)) => single_line_text(s),
+                Some(Value::Null) | None => "NULL".to_string(),
+                Some(other) => single_line_text(&display_value(other)),
+            };
+            self.formatted_cells.push(SharedString::from(text));
+            self.is_null_cells.push(is_null);
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum ExportFormat {
+    Csv,
+    Tsv,
+    Json,
+    SqlInserts,
+    Markdown,
+    Html,
+}
+
+impl ExportFormat {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Csv => "CSV",
+            Self::Tsv => "TSV",
+            Self::Json => "JSON",
+            Self::SqlInserts => "SQL Inserts",
+            Self::Markdown => "Markdown",
+            Self::Html => "HTML",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingCellUpdate {
+    row_index: usize,
+    column: String,
+    column_type: String,
+    original_value: Value,
+    new_value: Value,
+    original_text: String,
+    new_text: String,
+    key_column: String,
+    key_value: Value,
 }
 
 pub struct DatabaseTableView {
     connection: String,
     connection_label: String,
     table: String,
+    driver: Option<String>,
     root: PathBuf,
     columns: Vec<DatabaseColumn>,
     read_only: bool,
     editable_candidate: bool,
     rows: Vec<RowData>,
+    original_rows: Vec<RowData>,
+    pending_updates: HashMap<(usize, String), PendingCellUpdate>,
+    pending_deletions: HashSet<usize>,
     editable: bool,
+    /// Current 0-based page index.
+    page: usize,
+    /// Rows to fetch per page (default 50).
+    page_size: usize,
     /// The load selected `rowid` because the table has no primary key.
     rowid_mode: bool,
     status: LoadStatus,
     message: Option<(SharedString, Color)>,
     busy: bool,
     focus_handle: FocusHandle,
+    vertical_scroll_handle: UniformListScrollHandle,
+    horizontal_scroll_handle: ScrollHandle,
     editing: Option<CellEdit>,
     selected_cell: Option<(usize, usize)>,
     selected_row: Option<usize>,
+    filter_where: Option<String>,
+    filter_order_by: Option<String>,
+    where_editor: Option<Entity<Editor>>,
+    order_by_editor: Option<Entity<Editor>>,
+    tx_manual: bool,
+    export_format: ExportFormat,
+    ddl_modal: Option<String>,
+    preview_modal: Option<String>,
+    last_executed_sql: Option<String>,
 }
 
 struct CellEdit {
@@ -101,24 +186,43 @@ impl DatabaseTableView {
     pub fn open(target: TableTabTarget, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
+            let vertical_scroll_handle = UniformListScrollHandle::new();
+            let horizontal_scroll_handle = ScrollHandle::new();
             let mut this = Self {
                 connection: target.connection,
                 connection_label: target.connection_label,
                 table: target.table,
+                driver: target.driver,
                 root: target.root,
                 columns: target.columns,
                 read_only: target.read_only,
                 editable_candidate: target.editable_candidate && !target.read_only,
                 rows: Vec::new(),
+                original_rows: Vec::new(),
+                pending_updates: HashMap::new(),
+                pending_deletions: HashSet::new(),
                 editable: false,
+                page: 0,
+                page_size: DEFAULT_PAGE_SIZE,
                 rowid_mode: false,
                 status: LoadStatus::Loading,
                 message: None,
                 busy: false,
                 focus_handle,
+                vertical_scroll_handle,
+                horizontal_scroll_handle,
                 editing: None,
                 selected_cell: None,
                 selected_row: None,
+                filter_where: None,
+                filter_order_by: None,
+                where_editor: None,
+                order_by_editor: None,
+                tx_manual: false,
+                export_format: ExportFormat::Csv,
+                ddl_modal: None,
+                preview_modal: None,
+                last_executed_sql: None,
             };
             this.load(cx);
             this
@@ -130,6 +234,7 @@ impl DatabaseTableView {
             connection: self.connection.clone(),
             connection_label: self.connection_label.clone(),
             table: self.table.clone(),
+            driver: self.driver.clone(),
             root: self.root.clone(),
             columns: self.columns.clone(),
             editable_candidate: self.editable_candidate,
@@ -151,40 +256,130 @@ impl DatabaseTableView {
 
         let connection = self.connection.clone();
         let table = self.table.clone();
+        let driver = self.driver.clone();
         let root = self.root.clone();
-        let wants_rowid = rowid_fallback(&self.columns, self.editable_candidate);
+        let page = self.page;
+        let page_size = self.page_size;
+        let offset = page * page_size;
+        let is_sqlite = driver.as_deref().map_or(true, |d| {
+            let d = d.to_ascii_lowercase();
+            d.contains("sqlite")
+        });
+        let wants_rowid = is_sqlite && rowid_fallback(&self.columns, self.editable_candidate);
+        let columns_empty = self.columns.is_empty();
+
+        let where_clause = self.filter_where.as_ref().and_then(|w| {
+            let t = w.trim();
+            if t.is_empty() {
+                None
+            } else if t.to_ascii_uppercase().starts_with("WHERE ") {
+                Some(t.to_string())
+            } else {
+                Some(format!("WHERE {}", t))
+            }
+        });
+
+        let order_by_clause = self.filter_order_by.as_ref().and_then(|o| {
+            let t = o.trim();
+            if t.is_empty() {
+                None
+            } else if t.to_ascii_uppercase().starts_with("ORDER BY ") {
+                Some(t.to_string())
+            } else {
+                Some(format!("ORDER BY {}", t))
+            }
+        });
 
         let task = cx.background_spawn(async move {
-            let quoted = sql_quote_ident(&table);
+            let is_mysql = driver.as_deref().map_or(false, |d| {
+                let d = d.to_ascii_lowercase();
+                d.contains("mysql") || d.contains("mariadb")
+            });
+            let quoted = if is_mysql {
+                format!("`{}`", table.replace('`', "``"))
+            } else {
+                format!("\"{}\"", table.replace('"', "\"\""))
+            };
+
+            let mut fetched_columns = Vec::new();
+            if columns_empty && is_mysql {
+                let describe_sql = format!("DESCRIBE {}", quoted);
+                if let Ok(desc_rows) = run_query(&root, &connection, &describe_sql) {
+                    for row in desc_rows {
+                        let name = row.get("Field").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !name.is_empty() {
+                            let column_type = row.get("Type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let primary_key = row.get("Key").and_then(|v| v.as_str()).map_or(false, |k| k == "PRI");
+                            fetched_columns.push(DatabaseColumn {
+                                name,
+                                column_type,
+                                primary_key,
+                            });
+                        }
+                    }
+                }
+            }
+
             if wants_rowid {
-                let rowid_sql = format!(
-                    "select rowid as {} , * from {} limit {}",
-                    sql_quote_ident(ROWID_COLUMN),
-                    quoted,
-                    ROW_LIMIT
+                let mut rowid_sql = format!(
+                    "select rowid as {} , * from {}",
+                    sql_quote_ident_for(driver.as_deref(), ROWID_COLUMN),
+                    quoted
                 );
+                if let Some(w) = &where_clause {
+                    rowid_sql.push(' ');
+                    rowid_sql.push_str(w);
+                }
+                if let Some(o) = &order_by_clause {
+                    rowid_sql.push(' ');
+                    rowid_sql.push_str(o);
+                }
+                rowid_sql.push_str(&format!(" limit {} offset {}", page_size, offset));
+                let executed_sql = rowid_sql.clone();
                 match run_query(&root, &connection, &rowid_sql) {
-                    Ok(rows) => return Ok((rows, true, true)),
+                    Ok(rows) => return Ok((rows, true, true, fetched_columns, executed_sql)),
                     Err(_) => {}
                 }
             }
-            let sql = format!("select * from {} limit {}", quoted, ROW_LIMIT);
-            run_query(&root, &connection, &sql).map(|rows| (rows, false, false))
+            let mut sql = format!("select * from {}", quoted);
+            if let Some(w) = &where_clause {
+                sql.push(' ');
+                sql.push_str(w);
+            }
+            if let Some(o) = &order_by_clause {
+                sql.push(' ');
+                sql.push_str(o);
+            }
+            sql.push_str(&format!(" limit {} offset {}", page_size, offset));
+            let executed_sql = sql.clone();
+            run_query(&root, &connection, &sql).map(|rows| (rows, false, false, fetched_columns, executed_sql))
         });
 
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok((rows, rowid_mode, rowid_ok)) => {
+                    Ok((rows, rowid_mode, rowid_ok, fetched_columns, executed_sql)) => {
+                        this.last_executed_sql = Some(executed_sql);
                         this.rowid_mode = rowid_mode;
                         this.rows = rows
                             .into_iter()
                             .map(|row| row_data_from_json(row, rowid_mode))
                             .collect();
                         if this.columns.is_empty() {
-                            this.columns = derive_columns(&this.rows);
+                            if !fetched_columns.is_empty() {
+                                this.columns = fetched_columns;
+                            } else {
+                                this.columns = derive_columns(&this.rows);
+                            }
                         }
+                        for row in &mut this.rows {
+                            row.format_for_columns(&this.columns);
+                        }
+                        this.original_rows = this.rows.clone();
+                        this.pending_updates.clear();
+                        this.pending_deletions.clear();
+                        this.preview_modal = None;
                         this.editable = this.editable_candidate
                             && (this.primary_key().is_some() || (rowid_mode && rowid_ok));
                         this.status = LoadStatus::Loaded;
@@ -192,7 +387,8 @@ impl DatabaseTableView {
                     Err(message) => {
                         this.rows.clear();
                         this.editable = false;
-                        this.status = LoadStatus::Failed(message);
+                        this.status = LoadStatus::Loaded;
+                        this.message = Some((message.into(), Color::Error));
                     }
                 }
                 cx.notify();
@@ -279,15 +475,38 @@ impl DatabaseTableView {
         }
     }
 
-    fn on_editor_blur(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.editing.as_ref() else {
-            return;
-        };
-        if self.rows.get(edit.row).is_some_and(|row| row.is_new) {
-            // Draft rows stage the typed value but are not inserted until Enter.
-            self.stage_draft_cell(cx);
+    fn has_pending_changes(&self) -> bool {
+        !self.pending_updates.is_empty()
+            || !self.pending_deletions.is_empty()
+            || self.rows.iter().any(|r| r.is_new)
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending_updates.len()
+            + self.pending_deletions.len()
+            + self.rows.iter().filter(|r| r.is_new).count()
+    }
+
+    fn update_pending_message(&mut self) {
+        let count = self.pending_count();
+        if count > 0 {
+            self.message = Some((
+                format!(
+                    "{} uncommitted change{} · click ↑ to Submit",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                )
+                .into(),
+                Color::Warning,
+            ));
         } else {
-            self.commit_cell(cx);
+            self.message = None;
+        }
+    }
+
+    fn on_editor_blur(&mut self, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.stage_cell_edit(cx);
         }
     }
 
@@ -297,157 +516,111 @@ impl DatabaseTableView {
         }
     }
 
-    /// Stores a draft-row cell value locally without touching the database.
-    fn stage_draft_cell(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.editing.take() else {
-            return;
-        };
-        let text = edit.editor.read(cx).text(cx);
-        if let Some(row) = self.rows.get_mut(edit.row) {
-            if text.is_empty() {
-                row.values.remove(&edit.column);
-            } else {
-                row.values.insert(edit.column, Value::String(text));
-            }
-        }
-        cx.notify();
-    }
-
-    /// Applies the pending cell edit. Existing rows run UPDATE; draft rows run
-    /// INSERT and require Enter (blur only stages the value).
-    fn commit_cell(&mut self, cx: &mut Context<Self>) {
+    /// Stores cell edit in memory and marks it as pending. Does not write to DB.
+    fn stage_cell_edit(&mut self, cx: &mut Context<Self>) {
         let Some(edit) = self.editing.take() else {
             return;
         };
         let text = edit.editor.read(cx).text(cx);
         let is_new = self.rows.get(edit.row).is_some_and(|row| row.is_new);
-        // Resolve the row key before mutating the draft value, so editing the
-        // primary key column still targets the original row.
-        let key = if is_new { None } else { self.row_key(edit.row) };
-
-        if let Some(row) = self.rows.get_mut(edit.row) {
-            if text.is_empty() {
-                row.values.remove(&edit.column);
-            } else {
-                row.values.insert(edit.column.clone(), Value::String(text.clone()));
-            }
-        }
 
         if is_new {
-            self.insert_draft_row(edit.row, cx);
-            return;
-        }
-
-        if text == edit.original_text || (edit.original_is_null && text.is_empty()) {
+            if let Some(row) = self.rows.get_mut(edit.row) {
+                if text.is_empty() {
+                    row.values.remove(&edit.column);
+                } else {
+                    row.values.insert(edit.column.clone(), Value::String(text.clone()));
+                }
+                row.format_for_columns(&self.columns);
+            }
+            self.update_pending_message();
             cx.notify();
             return;
         }
 
+        let original_row = self.original_rows.get(edit.row);
+        let original_val = original_row
+            .and_then(|r| r.values.get(&edit.column))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let original_text = match &original_val {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => display_value(other),
+        };
+        let original_is_null = original_val.is_null();
+
+        let is_same = if original_is_null {
+            text.is_empty()
+        } else {
+            text == original_text
+        };
+
+        if is_same {
+            self.pending_updates.remove(&(edit.row, edit.column.clone()));
+            if let Some(row) = self.rows.get_mut(edit.row) {
+                row.values.insert(edit.column.clone(), original_val);
+                row.format_for_columns(&self.columns);
+            }
+            self.update_pending_message();
+            cx.notify();
+            return;
+        }
+
+        let key = self.row_key(edit.row);
         let Some((key_column, key_value)) = key else {
             self.message = Some(("no key column for this row".into(), Color::Error));
             cx.notify();
             return;
         };
-        let literal = if edit.original_is_null && text.is_empty() {
-            "NULL".to_string()
+
+        let new_val = if text.is_empty() {
+            Value::Null
         } else {
-            sql_value_for_column(&edit.column_type, &text)
+            Value::String(text.clone())
         };
-        let sql = update_sql(
-            &self.table,
-            &edit.column,
-            &literal,
-            &key_column,
-            &sql_literal_for_value(&key_value),
+
+        if let Some(row) = self.rows.get_mut(edit.row) {
+            row.values.insert(edit.column.clone(), new_val.clone());
+            row.format_for_columns(&self.columns);
+        }
+
+        self.pending_updates.insert(
+            (edit.row, edit.column.clone()),
+            PendingCellUpdate {
+                row_index: edit.row,
+                column: edit.column,
+                column_type: edit.column_type,
+                original_value: original_val,
+                new_value: new_val,
+                original_text,
+                new_text: text,
+                key_column,
+                key_value,
+            },
         );
-        self.busy = true;
-        self.message = None;
+
+        self.update_pending_message();
         cx.notify();
-
-        let connection = self.connection.clone();
-        let root = self.root.clone();
-        let row_index = edit.row;
-        let column = edit.column.clone();
-        let saved_text = text.clone();
-        let task = cx.background_spawn(async move { run_write(&root, &connection, &sql) });
-
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                this.busy = false;
-                match result {
-                    Ok(()) => {
-                        if let Some(row) = this.rows.get_mut(row_index) {
-                            if saved_text.is_empty() {
-                                row.values.insert(column, Value::Null);
-                            } else {
-                                row.values.insert(column, Value::String(saved_text));
-                            }
-                        }
-                        this.message = Some(("saved".into(), Color::Success));
-                    }
-                    Err(message) => {
-                        this.message = Some((message.into(), Color::Error));
-                    }
-                }
-                cx.notify();
-            })
-            .log_err();
-        })
-        .detach();
-    }
-
-    fn insert_draft_row(&mut self, row_index: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.rows.get(row_index) else {
-            return;
-        };
-        let columns = self.columns.clone();
-        let sql = insert_sql(&self.table, &columns, &row.values);
-        self.busy = true;
-        self.message = None;
-        cx.notify();
-
-        let connection = self.connection.clone();
-        let root = self.root.clone();
-        let task = cx.background_spawn(async move { run_write(&root, &connection, &sql) });
-
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                this.busy = false;
-                match result {
-                    Ok(()) => {
-                        this.message = Some(("row added".into(), Color::Success));
-                        this.load(cx);
-                    }
-                    Err(message) => {
-                        // Keep the draft so the user can complete required fields.
-                        this.message = Some((message.into(), Color::Error));
-                        cx.notify();
-                    }
-                }
-            })
-            .log_err();
-        })
-        .detach();
     }
 
     fn add_row(&mut self, cx: &mut Context<Self>) {
         if !self.editable || self.busy {
             return;
         }
-        self.rows.push(RowData {
+        let mut row = RowData {
             values: Map::new(),
+            formatted_cells: Vec::new(),
+            is_null_cells: Vec::new(),
             rowid: None,
             is_new: true,
-        });
+        };
+        row.format_for_columns(&self.columns);
+        self.rows.push(row);
         let index = self.rows.len() - 1;
         self.selected_row = Some(index);
         self.selected_cell = Some((index, 0));
-        self.message = Some((
-            "new row — fill cells, Enter to insert".into(),
-            Color::Muted,
-        ));
+        self.update_pending_message();
         cx.notify();
     }
 
@@ -467,50 +640,18 @@ impl DatabaseTableView {
             self.rows.remove(index);
             self.selected_row = None;
             self.selected_cell = None;
-            self.message = Some(("draft row discarded".into(), Color::Muted));
+            self.update_pending_message();
             cx.notify();
             return;
         }
-        let Some((key_column, key_value)) = self.row_key(index) else {
-            self.message = Some(("no key column for this row".into(), Color::Error));
-            cx.notify();
-            return;
-        };
-        let sql = delete_sql(
-            &self.table,
-            &key_column,
-            &sql_literal_for_value(&key_value),
-        );
-        self.busy = true;
-        self.message = None;
+        if self.pending_deletions.contains(&index) {
+            self.pending_deletions.remove(&index);
+            self.update_pending_message();
+        } else {
+            self.pending_deletions.insert(index);
+            self.update_pending_message();
+        }
         cx.notify();
-
-        let connection = self.connection.clone();
-        let root = self.root.clone();
-        let task = cx.background_spawn(async move { run_write(&root, &connection, &sql) });
-
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                this.busy = false;
-                match result {
-                    Ok(()) => {
-                        if index < this.rows.len() {
-                            this.rows.remove(index);
-                        }
-                        this.selected_row = None;
-                        this.selected_cell = None;
-                        this.message = Some(("deleted".into(), Color::Success));
-                    }
-                    Err(message) => {
-                        this.message = Some((message.into(), Color::Error));
-                    }
-                }
-                cx.notify();
-            })
-            .log_err();
-        })
-        .detach();
     }
 
     /// Key column and value that identify a row: the primary key, else rowid.
@@ -523,17 +664,495 @@ impl DatabaseTableView {
         row.rowid.clone().map(|value| ("rowid".to_string(), value))
     }
 
+    fn ensure_filter_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.where_editor.is_none() {
+            let ed = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Filter criteria (e.g. status = 1 AND users > 10)", window, cx);
+                editor
+            });
+            self.where_editor = Some(ed);
+        }
+        if self.order_by_editor.is_none() {
+            let ed = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("e.g. id DESC, datetime ASC", window, cx);
+                editor
+            });
+            self.order_by_editor = Some(ed);
+        }
+    }
+
+    fn apply_filter(&mut self, cx: &mut Context<Self>) {
+        if let Some(ed) = &self.where_editor {
+            let text = ed.read(cx).text(cx);
+            let trimmed = text.trim();
+            self.filter_where = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            self.page = 0;
+            self.load(cx);
+        }
+    }
+
+    fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ed) = &self.where_editor {
+            ed.update(cx, |ed, cx| ed.set_text("", window, cx));
+        }
+        self.filter_where = None;
+        self.page = 0;
+        self.load(cx);
+    }
+
+    fn apply_sort(&mut self, cx: &mut Context<Self>) {
+        if let Some(ed) = &self.order_by_editor {
+            let text = ed.read(cx).text(cx);
+            let trimmed = text.trim();
+            self.filter_order_by = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            self.page = 0;
+            self.load(cx);
+        }
+    }
+
+    fn clear_sort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ed) = &self.order_by_editor {
+            ed.update(cx, |ed, cx| ed.set_text("", window, cx));
+        }
+        self.filter_order_by = None;
+        self.page = 0;
+        self.load(cx);
+    }
+
+    fn toggle_column_sort(&mut self, col_name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.filter_order_by.as_deref().unwrap_or("").trim();
+        let asc_clause = format!("{col_name} ASC");
+        let desc_clause = format!("{col_name} DESC");
+
+        let next_sort = if current.eq_ignore_ascii_case(&asc_clause) || current.eq_ignore_ascii_case(col_name) {
+            Some(desc_clause)
+        } else if current.eq_ignore_ascii_case(&desc_clause) {
+            None
+        } else {
+            Some(asc_clause)
+        };
+
+        if let Some(sort_str) = &next_sort {
+            if let Some(ed) = &self.order_by_editor {
+                ed.update(cx, |ed, cx| ed.set_text(sort_str.clone(), window, cx));
+            }
+            self.filter_order_by = Some(sort_str.clone());
+        } else {
+            if let Some(ed) = &self.order_by_editor {
+                ed.update(cx, |ed, cx| ed.set_text("", window, cx));
+            }
+            self.filter_order_by = None;
+        }
+        self.page = 0;
+        self.load(cx);
+    }
+
+    fn quick_filter_column(&mut self, col_name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let prefill = if let Some((row_idx, col_idx)) = self.selected_cell {
+            if self.columns.get(col_idx).is_some_and(|c| c.name == col_name) {
+                if let Some(row) = self.rows.get(row_idx) {
+                    if let Some(val) = row.values.get(col_name) {
+                        if val.is_null() {
+                            format!("{col_name} IS NULL")
+                        } else if let Some(s) = val.as_str() {
+                            format!("{col_name} = '{s}'")
+                        } else {
+                            format!("{col_name} = {val}")
+                        }
+                    } else {
+                        format!("{col_name} = ")
+                    }
+                } else {
+                    format!("{col_name} = ")
+                }
+            } else {
+                format!("{col_name} = ")
+            }
+        } else {
+            format!("{col_name} = ")
+        };
+
+        if let Some(ed) = &self.where_editor {
+            ed.update(cx, |ed, cx| {
+                ed.set_text(prefill.clone(), window, cx);
+                ed.focus_handle(cx).focus(window, cx);
+            });
+        }
+        self.filter_where = Some(prefill);
+        cx.notify();
+    }
+
+    fn show_ddl(&mut self, cx: &mut Context<Self>) {
+        let connection = self.connection.clone();
+        let root = self.root.clone();
+        let table = self.table.clone();
+        let driver = self.driver.clone();
+        let columns = self.columns.clone();
+        let is_mysql = driver.as_deref().map_or(false, |d| {
+            let d = d.to_ascii_lowercase();
+            d.contains("mysql") || d.contains("mariadb")
+        });
+        let quoted = if is_mysql {
+            format!("`{}`", table.replace('`', "``"))
+        } else {
+            format!("\"{}\"", table.replace('"', "\"\""))
+        };
+
+        self.busy = true;
+        self.message = Some(("Fetching DDL…".into(), Color::Muted));
+        cx.notify();
+
+        let task = cx.background_spawn(async move {
+            if is_mysql {
+                let sql = format!("SHOW CREATE TABLE {}", quoted);
+                if let Ok(rows) = run_query(&root, &connection, &sql) {
+                    if let Some(row) = rows.first() {
+                        if let Some(ddl) = row.get("Create Table").and_then(|v| v.as_str()) {
+                            return Ok::<String, String>(ddl.to_string());
+                        }
+                    }
+                }
+            } else {
+                let sql = format!(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='{}'",
+                    table.replace('\'', "''")
+                );
+                if let Ok(rows) = run_query(&root, &connection, &sql) {
+                    if let Some(row) = rows.first() {
+                        if let Some(ddl) = row.get("sql").and_then(|v| v.as_str()) {
+                            return Ok::<String, String>(ddl.to_string());
+                        }
+                    }
+                }
+            }
+            let mut ddl = format!("CREATE TABLE {} (\n", quoted);
+            for (i, col) in columns.iter().enumerate() {
+                let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
+                ddl.push_str(&format!("  {} {}{}", col.name, col.column_type, pk));
+                if i + 1 < columns.len() {
+                    ddl.push(',');
+                }
+                ddl.push('\n');
+            }
+            ddl.push_str(");");
+            Ok::<String, String>(ddl)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result: Result<String, String> = task.await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(ddl) => {
+                        this.ddl_modal = Some(ddl);
+                        this.message = None;
+                    }
+                    Err(err) => {
+                        this.message = Some((err.into(), Color::Error));
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn revert_changes(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.editing = None;
+        self.pending_updates.clear();
+        self.pending_deletions.clear();
+        self.preview_modal = None;
+        self.rows = self.original_rows.clone();
+        self.message = Some(("Reverted all pending changes".into(), Color::Muted));
+        cx.notify();
+    }
+
+    fn generate_pending_sqls(&self) -> Vec<String> {
+        let mut sqls = Vec::new();
+
+        // 1. Pending updates
+        for update in self.pending_updates.values() {
+            let literal = if update.new_value.is_null() {
+                "NULL".to_string()
+            } else {
+                sql_value_for_column(&update.column_type, &update.new_text)
+            };
+            let sql = update_sql_for(
+                self.driver.as_deref(),
+                &self.table,
+                &update.column,
+                &literal,
+                &update.key_column,
+                &sql_literal_for_value(&update.key_value),
+            );
+            sqls.push(sql);
+        }
+
+        // 2. Pending new rows (inserts)
+        for row in &self.rows {
+            if row.is_new {
+                let sql = insert_sql_for(
+                    self.driver.as_deref(),
+                    &self.table,
+                    &self.columns,
+                    &row.values,
+                );
+                sqls.push(sql);
+            }
+        }
+
+        // 3. Pending deletions
+        for &del_idx in &self.pending_deletions {
+            if let Some((key_col, key_val)) = self.row_key(del_idx) {
+                let sql = delete_sql_for(
+                    self.driver.as_deref(),
+                    &self.table,
+                    &key_col,
+                    &sql_literal_for_value(&key_val),
+                );
+                sqls.push(sql);
+            }
+        }
+
+        sqls
+    }
+
+    fn show_pending_changes_preview(&mut self, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.stage_cell_edit(cx);
+        }
+        let sqls = self.generate_pending_sqls();
+        if sqls.is_empty() {
+            self.message = Some(("No pending changes to preview".into(), Color::Muted));
+            cx.notify();
+            return;
+        }
+        let count = sqls.len();
+        let mut body = format!(
+            "-- Pending Changes ({} statement{}):\n\n",
+            count,
+            if count == 1 { "" } else { "s" }
+        );
+        for sql in &sqls {
+            body.push_str(sql);
+            body.push_str(";\n");
+        }
+        self.preview_modal = Some(body);
+        cx.notify();
+    }
+
+    fn submit_changes(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        if self.editing.is_some() {
+            self.stage_cell_edit(cx);
+        }
+        let sqls = self.generate_pending_sqls();
+        if sqls.is_empty() {
+            self.message = Some(("No pending changes to submit".into(), Color::Muted));
+            cx.notify();
+            return;
+        }
+        self.busy = true;
+        self.message = Some(("Submitting changes...".into(), Color::Muted));
+        self.preview_modal = None;
+        cx.notify();
+
+        let connection = self.connection.clone();
+        let root = self.root.clone();
+
+        let task = cx.background_spawn(async move {
+            for sql in &sqls {
+                run_write(&root, &connection, sql)?;
+            }
+            Ok::<(), String>(())
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = task.await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(()) => {
+                        this.pending_updates.clear();
+                        this.pending_deletions.clear();
+                        this.message = Some(("saved".into(), Color::Success));
+                        this.load(cx);
+                    }
+                    Err(err) => {
+                        this.message = Some((err.into(), Color::Error));
+                        cx.notify();
+                    }
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn stop_query(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            self.busy = false;
+            self.message = Some(("Query stopped".into(), Color::Muted));
+            cx.notify();
+        }
+    }
+
+    fn format_export_data(&self, format: ExportFormat) -> String {
+        match format {
+            ExportFormat::Csv => {
+                let mut out = String::new();
+                let col_names = self.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
+                out.push_str(&col_names.join(","));
+                out.push('\n');
+                for row in &self.rows {
+                    let values = self.columns.iter().map(|c| {
+                        let val = row.values.get(&c.name);
+                        match val {
+                            None | Some(Value::Null) => String::new(),
+                            Some(Value::String(s)) => {
+                                if s.contains(',') || s.contains('"') || s.contains('\n') {
+                                    format!("\"{}\"", s.replace('"', "\"\""))
+                                } else {
+                                    s.clone()
+                                }
+                            }
+                            Some(other) => other.to_string(),
+                        }
+                    }).collect::<Vec<_>>();
+                    out.push_str(&values.join(","));
+                    out.push('\n');
+                }
+                out
+            }
+            ExportFormat::Tsv => {
+                let mut out = String::new();
+                let col_names = self.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
+                out.push_str(&col_names.join("\t"));
+                out.push('\n');
+                for row in &self.rows {
+                    let values = self.columns.iter().map(|c| {
+                        let val = row.values.get(&c.name);
+                        match val {
+                            None | Some(Value::Null) => String::new(),
+                            Some(Value::String(s)) => s.replace('\t', " ").replace('\n', " "),
+                            Some(other) => other.to_string(),
+                        }
+                    }).collect::<Vec<_>>();
+                    out.push_str(&values.join("\t"));
+                    out.push('\n');
+                }
+                out
+            }
+            ExportFormat::Json => {
+                let mut list = Vec::new();
+                for row in &self.rows {
+                    list.push(&row.values);
+                }
+                serde_json::to_string_pretty(&list).unwrap_or_else(|_| "[]".to_string())
+            }
+            ExportFormat::SqlInserts => {
+                let mut out = String::new();
+                let table_quoted = format!("`{}`", self.table.replace('`', "``"));
+                let col_quoted = self.columns.iter().map(|c| format!("`{}`", c.name.replace('`', "``"))).collect::<Vec<_>>().join(", ");
+                for row in &self.rows {
+                    let values = self.columns.iter().map(|c| {
+                        let val = row.values.get(&c.name);
+                        match val {
+                            None | Some(Value::Null) => "NULL".to_string(),
+                            Some(Value::String(s)) => format!("'{}'", s.replace('\'', "''")),
+                            Some(Value::Number(n)) => n.to_string(),
+                            Some(Value::Bool(b)) => if *b { "1" } else { "0" }.to_string(),
+                            Some(other) => format!("'{}'", other.to_string().replace('\'', "''")),
+                        }
+                    }).collect::<Vec<_>>().join(", ");
+                    out.push_str(&format!("INSERT INTO {} ({}) VALUES ({});\n", table_quoted, col_quoted, values));
+                }
+                out
+            }
+            ExportFormat::Markdown => {
+                let mut out = String::new();
+                let headers = self.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(" | ");
+                out.push_str(&format!("| {} |\n", headers));
+                let separators = self.columns.iter().map(|_| "---").collect::<Vec<_>>().join(" | ");
+                out.push_str(&format!("| {} |\n", separators));
+                for row in &self.rows {
+                    let values = self.columns.iter().map(|c| {
+                        let val = row.values.get(&c.name);
+                        match val {
+                            None | Some(Value::Null) => "".to_string(),
+                            Some(Value::String(s)) => s.replace('|', "\\|").replace('\n', " "),
+                            Some(other) => other.to_string(),
+                        }
+                    }).collect::<Vec<_>>().join(" | ");
+                    out.push_str(&format!("| {} |\n", values));
+                }
+                out
+            }
+            ExportFormat::Html => {
+                let mut out = String::new();
+                out.push_str("<table>\n  <thead>\n    <tr>\n");
+                for col in &self.columns {
+                    out.push_str(&format!("      <th>{}</th>\n", html_escape(&col.name)));
+                }
+                out.push_str("    </tr>\n  </thead>\n  <tbody>\n");
+                for row in &self.rows {
+                    out.push_str("    <tr>\n");
+                    for col in &self.columns {
+                        let val = row.values.get(&col.name);
+                        let s = match val {
+                            None | Some(Value::Null) => "".to_string(),
+                            Some(Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                        };
+                        out.push_str(&format!("      <td>{}</td>\n", html_escape(&s)));
+                    }
+                    out.push_str("    </tr>\n");
+                }
+                out.push_str("  </tbody>\n</table>\n");
+                out
+            }
+        }
+    }
+
+    fn export_to_clipboard(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
+        let text = self.format_export_data(format);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.message = Some((
+            format!("Copied {} rows as {} to clipboard", self.rows.len(), format.label()).into(),
+            Color::Success,
+        ));
+        cx.notify();
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
+        let border_color = colors.border;
+        let has_pending = self.has_pending_changes();
 
         let mut toolbar = h_flex()
             .h(px(TOOLBAR_HEIGHT))
             .flex_none()
             .items_center()
-            .gap_2()
+            .gap_1p5()
             .px_2()
             .border_b_1()
-            .border_color(colors.border)
+            .border_color(border_color)
             .bg(colors.surface_background)
             .child(
                 IconButton::new("table-refresh", IconName::RotateCw)
@@ -543,6 +1162,15 @@ impl DatabaseTableView {
                     .tooltip(Tooltip::text("Refresh"))
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.load(cx))),
             )
+            .child(
+                IconButton::new("table-stop", IconName::Stop)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(!self.busy)
+                    .tooltip(Tooltip::text("Cancel Query"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.stop_query(cx))),
+            )
+            .child(div().w(px(1.0)).h(px(16.0)).bg(border_color))
             .child(
                 IconButton::new("table-add-row", IconName::Plus)
                     .shape(IconButtonShape::Square)
@@ -564,9 +1192,182 @@ impl DatabaseTableView {
                     ),
             )
             .child(
-                Label::new(format!("{} rows", self.rows.len()))
+                IconButton::new("table-revert-btn", IconName::Undo)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(!has_pending || self.busy)
+                    .tooltip(Tooltip::text(if has_pending {
+                        "Revert pending changes"
+                    } else {
+                        "No pending changes to revert"
+                    }))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.revert_changes(cx))),
+            )
+            .child(
+                IconButton::new("table-preview-btn", IconName::Eye)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(!has_pending || self.busy)
+                    .tooltip(Tooltip::text(if has_pending {
+                        "Preview pending changes (Show SQL)"
+                    } else {
+                        "No pending changes to preview"
+                    }))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.show_pending_changes_preview(cx))),
+            )
+            .child(
+                if has_pending && !self.busy {
+                    IconButton::new("table-submit-btn", IconName::ArrowUp)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Success)
+                        .tooltip(Tooltip::text("Submit changes (Cmd+Enter)"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.submit_changes(cx)))
+                } else {
+                    IconButton::new("table-submit-btn", IconName::ArrowUp)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::XSmall)
+                        .disabled(true)
+                        .tooltip(Tooltip::text("No pending changes to submit"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.submit_changes(cx)))
+                }
+            )
+            .child(div().w(px(1.0)).h(px(16.0)).bg(border_color))
+            .child(
+                PopoverMenu::new("table-tx-menu")
+                    .trigger(
+                        Button::new("table-tx-btn", if self.tx_manual { "Tx: Manual" } else { "Tx: Auto" })
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(Tooltip::text("Transaction Mode")),
+                    )
+                    .anchor(Anchor::BottomLeft)
+                    .menu({
+                        let is_manual = self.tx_manual;
+                        let view = cx.entity().downgrade();
+                        move |window, cx| {
+                            let view = view.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                let view_auto = view.clone();
+                                let view_man = view.clone();
+                                menu
+                                    .item(
+                                        ContextMenuEntry::new("Tx: Auto (Auto-commit)")
+                                            .toggleable(ui::IconPosition::Start, !is_manual)
+                                            .handler(move |_window, cx| {
+                                                if let Some(view) = view_auto.upgrade() {
+                                                    view.update(cx, |this, cx| {
+                                                        this.tx_manual = false;
+                                                        this.message = Some(("Auto-commit enabled".into(), Color::Muted));
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .item(
+                                        ContextMenuEntry::new("Tx: Manual (Explicit commit)")
+                                            .toggleable(ui::IconPosition::Start, is_manual)
+                                            .handler(move |_window, cx| {
+                                                if let Some(view) = view_man.upgrade() {
+                                                    view.update(cx, |this, cx| {
+                                                        this.tx_manual = true;
+                                                        this.message = Some(("Manual transaction mode enabled".into(), Color::Muted));
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            }),
+                                    )
+                            }))
+                        }
+                    }),
+            )
+            .child(
+                Button::new("table-ddl-btn", "DDL")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text("View Table DDL"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.show_ddl(cx))),
+            )
+            .child(div().w(px(1.0)).h(px(16.0)).bg(border_color))
+            .child(
+                IconButton::new("table-page-prev", IconName::ArrowLeft)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(self.page == 0 || self.busy)
+                    .tooltip(Tooltip::text("Previous page"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.page = this.page.saturating_sub(1);
+                        this.load(cx);
+                    })),
+            )
+            .child(
+                Label::new(format!("Page {}", self.page + 1))
                     .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                    .color(Color::Muted),
+                    .color(Color::Default),
+            )
+            .child(
+                IconButton::new("table-page-next", IconName::ArrowRight)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(self.rows.len() < self.page_size || self.busy)
+                    .tooltip(Tooltip::text("Next page"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.page += 1;
+                        this.load(cx);
+                    })),
+            )
+            .child(
+                PopoverMenu::new("table-page-size-menu")
+                    .trigger(
+                        Button::new("table-page-size", format!("{} / page", self.page_size))
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(Tooltip::text("Rows per page")),
+                    )
+                    .anchor(Anchor::BottomLeft)
+                    .menu({
+                        let active_page_size = self.page_size;
+                        let view = cx.entity().downgrade();
+                        move |window, cx| {
+                            let view = view.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                for &size in PAGE_SIZES {
+                                    let is_active = size == active_page_size;
+                                    let view = view.clone();
+                                    menu = menu.item(
+                                        ContextMenuEntry::new(format!("{size} rows"))
+                                            .toggleable(ui::IconPosition::Start, is_active)
+                                            .handler(move |_window, cx| {
+                                                if let Some(view) = view.upgrade() {
+                                                    view.update(cx, |this, cx| {
+                                                        if this.page_size != size {
+                                                            this.page_size = size;
+                                                            this.page = 0;
+                                                            this.load(cx);
+                                                        }
+                                                    });
+                                                }
+                                            }),
+                                    );
+                                }
+                                menu
+                            }))
+                        }
+                    }),
+            )
+            .child(
+                Label::new(if self.rows.is_empty() {
+                    "0 rows".to_string()
+                } else {
+                    let start = self.page * self.page_size + 1;
+                    let end = self.page * self.page_size + self.rows.len();
+                    format!("{start}–{end} rows")
+                })
+                .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                .color(Color::Muted),
             )
             .child(
                 Label::new(format!("{} · {}", self.connection_label, self.table))
@@ -583,8 +1384,6 @@ impl DatabaseTableView {
             );
         }
 
-        toolbar = toolbar.child(div().flex_1());
-
         if let Some((message, color)) = &self.message {
             toolbar = toolbar.child(
                 Label::new(message.clone())
@@ -593,10 +1392,291 @@ impl DatabaseTableView {
                     .truncate(),
             );
         }
+
+        toolbar = toolbar.child(div().flex_1());
+
+        let sql_tip: SharedString = self
+            .last_executed_sql
+            .as_deref()
+            .unwrap_or("No query executed yet")
+            .to_string()
+            .into();
+
+        toolbar = toolbar
+            .child(
+                Button::new("table-sql-btn", "SQL")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text(sql_tip))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        if let Some(sql) = &this.last_executed_sql {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(sql.clone()));
+                            this.message = Some(("Current SQL copied to clipboard".into(), Color::Success));
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                PopoverMenu::new("table-export-menu")
+                    .trigger(
+                        Button::new("table-export-btn", self.export_format.label())
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(Tooltip::text("Export Format")),
+                    )
+                    .anchor(Anchor::BottomRight)
+                    .menu({
+                        let current_fmt = self.export_format;
+                        let view = cx.entity().downgrade();
+                        move |window, cx| {
+                            let view = view.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                const FORMATS: &[ExportFormat] = &[
+                                    ExportFormat::Csv,
+                                    ExportFormat::Tsv,
+                                    ExportFormat::Json,
+                                    ExportFormat::SqlInserts,
+                                    ExportFormat::Markdown,
+                                    ExportFormat::Html,
+                                ];
+                                for &fmt in FORMATS {
+                                    let is_active = fmt == current_fmt;
+                                    let view = view.clone();
+                                    menu = menu.item(
+                                        ContextMenuEntry::new(fmt.label())
+                                            .toggleable(ui::IconPosition::Start, is_active)
+                                            .handler(move |_window, cx| {
+                                                if let Some(view) = view.upgrade() {
+                                                    view.update(cx, |this, cx| {
+                                                        this.export_format = fmt;
+                                                        this.export_to_clipboard(fmt, cx);
+                                                    });
+                                                }
+                                            }),
+                                    );
+                                }
+                                menu
+                            }))
+                        }
+                    }),
+            )
+            .child(
+                IconButton::new("table-export-dl", IconName::Download)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Export data (Copy to Clipboard)"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        let fmt = this.export_format;
+                        this.export_to_clipboard(fmt, cx);
+                    })),
+            )
+            .child(
+                PopoverMenu::new("table-settings-menu")
+                    .trigger(
+                        IconButton::new("table-settings-btn", IconName::Settings)
+                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Table Options")),
+                    )
+                    .anchor(Anchor::BottomRight)
+                    .menu({
+                        let view = cx.entity().downgrade();
+                        move |window, cx| {
+                            let view = view.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                let v1 = view.clone();
+                                let v2 = view.clone();
+                                let v3 = view.clone();
+                                menu
+                                    .item(
+                                        ContextMenuEntry::new("Reload Data & Schema")
+                                            .icon(IconName::RotateCw)
+                                            .handler(move |_window, cx| {
+                                                if let Some(view) = v1.upgrade() {
+                                                    view.update(cx, |this, cx| {
+                                                        this.load(cx);
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .item(
+                                        ContextMenuEntry::new("Clear WHERE Filter")
+                                            .icon(IconName::Filter)
+                                            .handler(move |window, cx| {
+                                                if let Some(view) = v2.upgrade() {
+                                                    view.update(cx, |this, cx| {
+                                                        this.clear_filter(window, cx);
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .item(
+                                        ContextMenuEntry::new("Reset Sorting (ORDER BY)")
+                                            .icon(IconName::ArrowDown10)
+                                            .handler(move |window, cx| {
+                                                if let Some(view) = v3.upgrade() {
+                                                    view.update(cx, |this, cx| {
+                                                        this.clear_sort(window, cx);
+                                                    });
+                                                }
+                                            }),
+                                    )
+                            }))
+                        }
+                    }),
+            );
+
         toolbar.into_any_element()
     }
 
-    fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_filter_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let border_color = colors.border;
+        let editor_bg = colors.editor_background;
+
+        let where_editor_el = self.where_editor.as_ref().map(|ed| {
+            let style = EditorStyle {
+                background: editor_bg,
+                local_player: cx.theme().players().local(),
+                text: dialog_text_style(cx),
+                ..EditorStyle::default()
+            };
+            div()
+                .flex_1()
+                .h(px(22.0))
+                .px_1()
+                .border_1()
+                .border_color(border_color)
+                .rounded_xs()
+                .bg(editor_bg)
+                .flex()
+                .items_center()
+                .on_action(cx.listener(|this, _: &editor_actions::Newline, _window, cx| {
+                    this.apply_filter(cx);
+                }))
+                .on_action(cx.listener(|this, _: &Confirm, _window, cx| {
+                    this.apply_filter(cx);
+                }))
+                .child(EditorElement::new(ed, style))
+        });
+
+        let order_by_editor_el = self.order_by_editor.as_ref().map(|ed| {
+            let style = EditorStyle {
+                background: editor_bg,
+                local_player: cx.theme().players().local(),
+                text: dialog_text_style(cx),
+                ..EditorStyle::default()
+            };
+            div()
+                .w(px(220.0))
+                .h(px(22.0))
+                .px_1()
+                .border_1()
+                .border_color(border_color)
+                .rounded_xs()
+                .bg(editor_bg)
+                .flex()
+                .items_center()
+                .on_action(cx.listener(|this, _: &editor_actions::Newline, _window, cx| {
+                    this.apply_sort(cx);
+                }))
+                .on_action(cx.listener(|this, _: &Confirm, _window, cx| {
+                    this.apply_sort(cx);
+                }))
+                .child(EditorElement::new(ed, style))
+        });
+
+        let has_where = self.filter_where.is_some();
+        let has_order_by = self.filter_order_by.is_some();
+
+        h_flex()
+            .h(px(30.0))
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(border_color)
+            .bg(colors.surface_background)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Filter)
+                            .size(IconSize::XSmall)
+                            .color(if has_where { Color::Accent } else { Color::Muted }),
+                    )
+                    .child(
+                        Label::new("WHERE")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(if has_where { Color::Accent } else { Color::Muted }),
+                    ),
+            )
+            .children(where_editor_el)
+            .when(has_where, |this| {
+                this.child(
+                    IconButton::new("table-clear-filter", IconName::Close)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Clear filter"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.clear_filter(window, cx);
+                        })),
+                )
+            })
+            .child(
+                IconButton::new("table-apply-filter", IconName::Check)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Apply filter (Enter)"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.apply_filter(cx);
+                    })),
+            )
+            .child(div().w(px(1.0)).h(px(16.0)).bg(border_color))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::ArrowDown10)
+                            .size(IconSize::XSmall)
+                            .color(if has_order_by { Color::Accent } else { Color::Muted }),
+                    )
+                    .child(
+                        Label::new("ORDER BY")
+                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                            .color(if has_order_by { Color::Accent } else { Color::Muted }),
+                    ),
+            )
+            .children(order_by_editor_el)
+            .when(has_order_by, |this| {
+                this.child(
+                    IconButton::new("table-clear-sort", IconName::Close)
+                        .shape(IconButtonShape::Square)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Clear ordering"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.clear_sort(window, cx);
+                        })),
+                )
+            })
+            .child(
+                IconButton::new("table-apply-sort", IconName::Check)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Apply order (Enter)"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.apply_sort(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match &self.status {
             LoadStatus::Loading => centered_note("loading rows…", Color::Muted),
             LoadStatus::Failed(message) => centered_note(message.clone(), Color::Error),
@@ -604,64 +1684,96 @@ impl DatabaseTableView {
                 if self.rows.is_empty() {
                     return centered_note("no rows", Color::Muted);
                 }
-                let total_width = ROW_NUMBER_WIDTH + self.columns.len() as f32 * CELL_WIDTH;
                 let editor_background = cx.theme().colors().editor_background;
-                let mut body = v_flex().w(px(total_width)).flex_none();
-                for (row_index, row) in self.rows.iter().enumerate() {
-                    body = body.child(self.render_grid_row(row_index, row, cx));
-                }
-                // Horizontal scroll wraps a sticky header and a vertically
-                // scrolling body so the header stays visible.
-                div()
-                    .id("table-grid-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_x_scroll()
+                let row_count = self.rows.len();
+                let columns_width = self.columns.len() as f32 * CELL_WIDTH;
+
+                let vertical_scroll_handle = self.vertical_scroll_handle.clone();
+                let horizontal_scroll_handle = self.horizontal_scroll_handle.clone();
+
+                let header_row = self.render_grid_header_row(columns_width, cx);
+
+                let rows_list = uniform_list(
+                    "table-grid-body",
+                    row_count,
+                    cx.processor(move |this, range: Range<usize>, _window, cx| {
+                        range
+                            .map(|row_index| this.render_grid_row(row_index, columns_width, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .size_full()
+                .with_sizing_behavior(ListSizingBehavior::Auto)
+                .track_scroll(&vertical_scroll_handle);
+
+                let h_scrollbar = div()
+                    .absolute()
+                    .inset_0()
+                    .left(px(ROW_NUMBER_WIDTH))
+                    .custom_scrollbars(
+                        Scrollbars::new(ScrollAxes::Horizontal)
+                            .tracked_scroll_handle(&horizontal_scroll_handle),
+                        window,
+                        cx,
+                    );
+
+                let mut body = v_flex()
+                    .id("table-grid-viewport")
+                    .size_full()
+                    .relative()
+                    .overflow_hidden()
                     .bg(editor_background)
+                    .child(header_row)
                     .child(
-                        v_flex()
-                            .w(px(total_width))
-                            .h_full()
-                            .flex_none()
-                            .child(self.render_grid_header_row(cx))
-                            .child(
-                                div()
-                                    .id("table-grid-body")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .child(body),
-                            ),
-                    )
-                    .into_any_element()
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .size_full()
+                            .relative()
+                            .child(rows_list)
+                            .child(h_scrollbar),
+                    );
+
+                body = body.custom_scrollbars(
+                    Scrollbars::new(ScrollAxes::Vertical)
+                        .tracked_scroll_handle(&vertical_scroll_handle),
+                    window,
+                    cx,
+                );
+
+                body.into_any_element()
             }
         }
     }
 
-    fn render_grid_header_row(&self, cx: &App) -> AnyElement {
+    fn render_grid_header_row(&self, columns_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
-        let mut header = h_flex()
-            .h(px(ROW_HEIGHT + 4.0))
+        let pinned_header = div()
+            .w(px(ROW_NUMBER_WIDTH))
+            .h_full()
             .flex_none()
-            .bg(colors.element_background)
-            .border_b_1()
+            .px_2()
+            .flex()
+            .items_center()
+            .border_r_1()
             .border_color(colors.border)
             .child(
-                div()
-                    .w(px(ROW_NUMBER_WIDTH))
-                    .h_full()
-                    .flex_none()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .child(
-                        Label::new("#")
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .color(Color::Muted),
-                    ),
+                Label::new("#")
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .color(Color::Muted),
             );
-        for column in &self.columns {
-            let mut column_label = h_flex().gap_1().child(
+
+        let mut columns_header = h_flex().w(px(columns_width)).h_full().flex_none();
+        for (col_idx, column) in self.columns.iter().enumerate() {
+            let is_sorted_asc = self.filter_order_by.as_deref().map_or(false, |s| {
+                s.eq_ignore_ascii_case(&format!("{} ASC", column.name))
+                    || s.eq_ignore_ascii_case(&column.name)
+            });
+            let is_sorted_desc = self.filter_order_by.as_deref().map_or(false, |s| {
+                s.eq_ignore_ascii_case(&format!("{} DESC", column.name))
+            });
+
+            let mut column_label = h_flex().gap_1().items_center().overflow_hidden().child(
                 Label::new(column.name.clone())
                     .size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .truncate(),
@@ -673,66 +1785,164 @@ impl DatabaseTableView {
                         .color(Color::Warning),
                 );
             }
-            header = header.child(
+
+            let col_name = column.name.clone();
+            let col_name_for_filter = column.name.clone();
+
+            columns_header = columns_header.child(
                 div()
                     .w(px(CELL_WIDTH))
                     .h_full()
                     .flex_none()
-                    .px_2()
+                    .px_1()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .border_r_1()
                     .border_color(colors.border)
                     .overflow_hidden()
-                    .child(column_label),
+                    .child(column_label)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_0p5()
+                            .child(
+                                IconButton::new(("col-filter", col_idx), IconName::Filter)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text(format!("Filter by {}", column.name)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                        this.quick_filter_column(&col_name_for_filter, window, cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new(
+                                    ("col-sort", col_idx),
+                                    if is_sorted_asc {
+                                        IconName::ArrowUp
+                                    } else if is_sorted_desc {
+                                        IconName::ArrowDown
+                                    } else {
+                                        IconName::ArrowDown10
+                                    },
+                                )
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text(format!("Sort by {}", column.name)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.toggle_column_sort(&col_name, window, cx);
+                                })),
+                            ),
+                    ),
             );
         }
-        header.into_any_element()
+
+        let scrollable_header = div()
+            .id("table-header-scrollable")
+            .flex_grow_1()
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .track_scroll(&self.horizontal_scroll_handle)
+            .child(columns_header);
+
+        h_flex()
+            .id("table-grid-header")
+            .h(px(ROW_HEIGHT + 4.0))
+            .w_full()
+            .flex_none()
+            .bg(colors.element_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(pinned_header)
+            .child(scrollable_header)
+            .into_any_element()
     }
 
     fn render_grid_row(
         &self,
         row_index: usize,
-        row: &RowData,
-        cx: &mut Context<Self>,
+        columns_width: f32,
+        cx: &Context<Self>,
     ) -> AnyElement {
+        let Some(row) = self.rows.get(row_index) else {
+            return div().into_any_element();
+        };
         let colors = cx.theme().colors();
         let row_selected = self.selected_row == Some(row_index);
-        let mut row_element = h_flex()
+
+        let row_number_text = if row.is_new {
+            "·".to_string()
+        } else {
+            format!("{}", self.page * self.page_size + row_index + 1)
+        };
+
+        let pinned_cell = div()
+            .id(("row-num", row_index))
+            .w(px(ROW_NUMBER_WIDTH))
+            .h_full()
+            .flex_none()
+            .px_2()
+            .flex()
+            .items_center()
+            .border_r_1()
+            .border_color(colors.border)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.selected_row = Some(row_index);
+                this.selected_cell = None;
+                cx.notify();
+            }))
+            .child(
+                Label::new(row_number_text)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .color(if row.is_new { Color::Accent } else { Color::Muted }),
+            );
+
+        let mut columns_container = h_flex().w(px(columns_width)).h_full().flex_none();
+        for (column_index, column) in self.columns.iter().enumerate() {
+            columns_container = columns_container.child(
+                self.render_cell(row_index, column_index, column, row, cx),
+            );
+        }
+
+        let scrollable_section = div()
+            .id(("row-cells", row_index))
+            .flex_grow_1()
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .track_scroll(&self.horizontal_scroll_handle)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                let container_bounds = this.horizontal_scroll_handle.bounds();
+                let h_offset = this.horizontal_scroll_handle.offset().x;
+                let col_x = event.position().x - container_bounds.left() - h_offset;
+                if col_x >= Pixels::ZERO {
+                    let col_idx = (col_x / px(CELL_WIDTH)).floor() as usize;
+                    if col_idx < this.columns.len() {
+                        this.focus_handle.focus(window, cx);
+                        this.select_cell(row_index, col_idx, cx);
+                        if this.editable && event.click_count() > 1 {
+                            this.start_editing(row_index, col_idx, window, cx);
+                        }
+                    }
+                }
+            }))
+            .child(columns_container);
+
+        h_flex()
             .id(("table-row", row_index))
             .h(px(ROW_HEIGHT))
+            .w_full()
             .flex_none()
             .border_b_1()
             .border_color(colors.border)
             .when(row_selected, |this| this.bg(colors.element_selected))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                this.selected_row = Some(row_index);
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .w(px(ROW_NUMBER_WIDTH))
-                    .h_full()
-                    .flex_none()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .child(
-                        Label::new(if row.is_new {
-                            "·".to_string()
-                        } else {
-                            format!("{}", row_index + 1)
-                        })
-                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                        .color(if row.is_new { Color::Accent } else { Color::Muted }),
-                    ),
-            );
-        for (column_index, column) in self.columns.iter().enumerate() {
-            row_element = row_element.child(
-                self.render_cell(row_index, column_index, column, row, cx),
-            );
-        }
-        row_element.into_any_element()
+            .when(!row_selected, |this| {
+                this.hover(|style| style.bg(colors.element_hover.opacity(0.4)))
+            })
+            .child(pinned_cell)
+            .child(scrollable_section)
+            .into_any_element()
     }
 
     fn render_cell(
@@ -741,37 +1951,29 @@ impl DatabaseTableView {
         column_index: usize,
         column: &DatabaseColumn,
         row: &RowData,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let value = row.values.get(&column.name).cloned().unwrap_or(Value::Null);
         let selected = self.selected_cell == Some((row_index, column_index));
-        let cell = div()
-            .id(SharedString::from(format!(
-                "cell-{row_index}-{column_index}"
-            )))
-            .w(px(CELL_WIDTH))
-            .h_full()
-            .flex_none()
-            .px_2()
-            .flex()
-            .items_center()
-            .overflow_hidden()
-            .border_r_1()
-            .border_color(colors.border)
-            .when(selected, |this| {
-                this.bg(colors.element_hover)
-                    .border_1()
-                    .border_color(colors.border_focused)
-            })
-            .hover(|style| style.bg(colors.element_hover));
 
         if let Some(edit) = &self.editing
             && edit.row == row_index
             && edit.column == column.name
         {
-            return cell
+            return div()
+                .id(("c-edit", row_index * 10000 + column_index))
+                .w(px(CELL_WIDTH))
+                .h_full()
+                .flex_none()
+                .px_2()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .border_r_1()
+                .border_color(colors.border)
                 .bg(colors.editor_background)
+                .border_1()
+                .border_color(colors.border_focused)
                 .child(
                     div()
                         .id("cell-editor")
@@ -779,11 +1981,11 @@ impl DatabaseTableView {
                         .key_context("DatabaseTableCellEditor")
                         .capture_action(cx.listener(
                             |this, _: &editor_actions::Newline, _window, cx| {
-                                this.commit_cell(cx);
+                                this.stage_cell_edit(cx);
                             },
                         ))
                         .on_action(cx.listener(|this, _: &Confirm, _window, cx| {
-                            this.commit_cell(cx);
+                            this.stage_cell_edit(cx);
                         }))
                         .on_action(
                             cx.listener(|this, _: &editor_actions::Cancel, _window, cx| {
@@ -795,29 +1997,275 @@ impl DatabaseTableView {
                 .into_any_element();
         }
 
-        let text = single_line_text(&display_value(&value));
-        cell.child(
-            Label::new(text)
-                .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                .color(if value.is_null() {
-                    Color::Muted
-                } else {
-                    Color::Default
-                })
-                .truncate(),
+        let is_modified = self
+            .pending_updates
+            .contains_key(&(row_index, column.name.clone()));
+        let is_deleted = self.pending_deletions.contains(&row_index);
+
+        let text = row
+            .formatted_cells
+            .get(column_index)
+            .cloned()
+            .unwrap_or_else(|| SharedString::from("NULL"));
+        let is_null = row.is_null_cells.get(column_index).copied().unwrap_or(true);
+
+        div()
+            .w(px(CELL_WIDTH))
+            .h_full()
+            .flex_none()
+            .px_2()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .border_r_1()
+            .border_color(colors.border)
+            .when(is_modified && !selected, |this| {
+                this.bg(gpui::rgba(0x215a8e73))
+                    .border_1()
+                    .border_color(gpui::rgba(0x388bfd99))
+            })
+            .when(is_modified && selected, |this| {
+                this.bg(gpui::rgba(0x2868a5a6))
+                    .border_1()
+                    .border_color(colors.border_focused)
+            })
+            .when(!is_modified && selected, |this| {
+                this.bg(colors.element_hover)
+                    .border_1()
+                    .border_color(colors.border_focused)
+            })
+            .when(is_deleted, |this| {
+                this.bg(gpui::rgba(0x8a1c1c59))
+            })
+            .when(row.is_new && !selected && !is_modified, |this| {
+                this.bg(gpui::rgba(0x1a5c2e40))
+            })
+            .child(
+                Label::new(text)
+                    .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .color(if is_deleted {
+                        Color::Muted
+                    } else if is_modified {
+                        Color::Accent
+                    } else if is_null {
+                        Color::Muted
+                    } else {
+                        Color::Default
+                    })
+                    .truncate(),
+            )
+            .into_any_element()
+    }
+
+    fn render_ddl_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ddl = self.ddl_modal.as_ref()?;
+        let colors = cx.theme().colors();
+        let table_name = self.table.clone();
+        let ddl_text = ddl.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x000000aa))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .w(px(640.0))
+                        .max_h(px(460.0))
+                        .bg(colors.elevated_surface_background)
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded_md()
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .child(
+                            h_flex()
+                                .h(px(36.0))
+                                .px_3()
+                                .items_center()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(colors.border)
+                                .bg(colors.surface_background)
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(Icon::new(IconName::FileCode).size(IconSize::Small))
+                                        .child(
+                                            Label::new(format!("DDL · {}", table_name))
+                                                .size(LabelSize::Default)
+                                                .color(Color::Default),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("copy-ddl", "Copy DDL")
+                                                .start_icon(Icon::new(IconName::Copy))
+                                                .size(ButtonSize::Compact)
+                                                .style(ButtonStyle::Subtle)
+                                                .on_click(cx.listener({
+                                                    let ddl_to_copy = ddl_text.clone();
+                                                    move |this, _: &ClickEvent, _window, cx| {
+                                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(ddl_to_copy.clone()));
+                                                        this.message = Some(("DDL copied to clipboard".into(), Color::Success));
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .child(
+                                            IconButton::new("close-ddl-modal", IconName::Close)
+                                                .shape(IconButtonShape::Square)
+                                                .icon_size(IconSize::Small)
+                                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                                    this.ddl_modal = None;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("ddl-body")
+                                .flex_1()
+                                .p_3()
+                                .overflow_y_scroll()
+                                .bg(colors.editor_background)
+                                .child(
+                                    Label::new(ddl_text)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Default),
+                                ),
+                        ),
+                )
+                .into_any_element(),
         )
-        .when(self.editable, |cell| {
-            cell.cursor_pointer()
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.focus_handle.focus(window, cx);
-                    this.select_cell(row_index, column_index, cx);
-                    if event.click_count() > 1 {
-                        this.start_editing(row_index, column_index, window, cx);
-                    }
-                }))
-        })
-        .into_any_element()
+    }
+
+    fn render_preview_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let preview = self.preview_modal.as_ref()?;
+        let colors = cx.theme().colors();
+        let preview_text = preview.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x000000aa))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .w(px(640.0))
+                        .max_h(px(460.0))
+                        .bg(colors.elevated_surface_background)
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded_md()
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .child(
+                            h_flex()
+                                .h(px(36.0))
+                                .px_3()
+                                .items_center()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(colors.border)
+                                .bg(colors.surface_background)
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(IconName::Eye)
+                                                .size(IconSize::Small)
+                                                .color(Color::Accent),
+                                        )
+                                        .child(
+                                            Label::new("Pending Changes (SQL Preview)")
+                                                .size(LabelSize::Default)
+                                                .color(Color::Default),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("submit-from-preview", "Submit Changes")
+                                                .start_icon(
+                                                    Icon::new(IconName::ArrowUp)
+                                                        .color(Color::Success),
+                                                )
+                                                .size(ButtonSize::Compact)
+                                                .style(ButtonStyle::Filled)
+                                                .on_click(cx.listener(
+                                                    |this, _: &ClickEvent, _window, cx| {
+                                                        this.submit_changes(cx);
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("copy-preview-sql", "Copy SQL")
+                                                .start_icon(Icon::new(IconName::Copy))
+                                                .size(ButtonSize::Compact)
+                                                .style(ButtonStyle::Subtle)
+                                                .on_click(cx.listener({
+                                                    let text_to_copy = preview_text.clone();
+                                                    move |this, _: &ClickEvent, _window, cx| {
+                                                        cx.write_to_clipboard(
+                                                            gpui::ClipboardItem::new_string(
+                                                                text_to_copy.clone(),
+                                                            ),
+                                                        );
+                                                        this.message = Some((
+                                                            "SQL copied to clipboard".into(),
+                                                            Color::Success,
+                                                        ));
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                "close-preview-modal",
+                                                IconName::Close,
+                                            )
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::Small)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _window, cx| {
+                                                    this.preview_modal = None;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("preview-body")
+                                .flex_1()
+                                .p_3()
+                                .overflow_y_scroll()
+                                .bg(colors.editor_background)
+                                .child(
+                                    Label::new(preview_text)
+                                        .size(LabelSize::Custom(PANEL_TEXT_REMS))
+                                        .color(Color::Default),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -868,7 +2316,8 @@ impl Item for DatabaseTableView {
 }
 
 impl Render for DatabaseTableView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_filter_editors(window, cx);
         let colors = cx.theme().colors();
         v_flex()
             .id("database-table-view")
@@ -880,8 +2329,14 @@ impl Render for DatabaseTableView {
                 if this.editing.is_some() {
                     return;
                 }
-                if event.keystroke.key == "enter" && !event.keystroke.modifiers.modified() {
+                if event.keystroke.key == "enter" && event.keystroke.modifiers.platform {
+                    this.submit_changes(cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "enter" && !event.keystroke.modifiers.modified() {
                     this.edit_selected_cell(window, cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "escape" && this.has_pending_changes() {
+                    this.revert_changes(cx);
                     cx.stop_propagation();
                 } else if event.keystroke.key == "delete"
                     || (event.keystroke.key == "backspace"
@@ -892,8 +2347,19 @@ impl Render for DatabaseTableView {
                 }
             }))
             .child(self.render_toolbar(cx))
-            .child(self.render_body(cx))
+            .child(self.render_filter_bar(cx))
+            .child(self.render_body(window, cx))
+            .children(self.render_ddl_modal(cx))
+            .children(self.render_preview_modal(cx))
     }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 // ---------------------------------------------------------------------------
@@ -911,9 +2377,21 @@ pub(crate) fn table_tab_title(connection: &str, table: &str) -> String {
     format!("{connection}/{table}")
 }
 
+pub(crate) fn sql_quote_ident_for(driver: Option<&str>, name: &str) -> String {
+    let is_mysql = driver.map_or(false, |d| {
+        let d = d.to_ascii_lowercase();
+        d.contains("mysql") || d.contains("mariadb")
+    });
+    if is_mysql {
+        format!("`{}`", name.replace('`', "``"))
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
 /// Quotes an identifier, doubling embedded quotes.
 pub(crate) fn sql_quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    sql_quote_ident_for(None, name)
 }
 
 /// Escapes a value for a single-quoted SQL string literal.
@@ -947,6 +2425,24 @@ pub(crate) fn sql_value_for_column(column_type: &str, text: &str) -> String {
     sql_text_literal(text)
 }
 
+pub(crate) fn update_sql_for(
+    driver: Option<&str>,
+    table: &str,
+    column: &str,
+    literal: &str,
+    key_column: &str,
+    key_literal: &str,
+) -> String {
+    let q_table = sql_quote_ident_for(driver, table);
+    let q_col = sql_quote_ident_for(driver, column);
+    if key_column.eq_ignore_ascii_case("rowid") {
+        format!("update {q_table} set {q_col} = {literal} where rowid = {key_literal}")
+    } else {
+        let q_key = sql_quote_ident_for(driver, key_column);
+        format!("update {q_table} set {q_col} = {literal} where {q_key} = {key_literal}")
+    }
+}
+
 pub(crate) fn update_sql(
     table: &str,
     column: &str,
@@ -954,46 +2450,32 @@ pub(crate) fn update_sql(
     key_column: &str,
     key_literal: &str,
 ) -> String {
+    update_sql_for(None, table, column, literal, key_column, key_literal)
+}
+
+pub(crate) fn delete_sql_for(
+    driver: Option<&str>,
+    table: &str,
+    key_column: &str,
+    key_literal: &str,
+) -> String {
+    let q_table = sql_quote_ident_for(driver, table);
     if key_column.eq_ignore_ascii_case("rowid") {
-        format!(
-            "update {} set {} = {} where rowid = {}",
-            sql_quote_ident(table),
-            sql_quote_ident(column),
-            literal,
-            key_literal
-        )
+        format!("delete from {q_table} where rowid = {key_literal}")
     } else {
-        format!(
-            "update {} set {} = {} where {} = {}",
-            sql_quote_ident(table),
-            sql_quote_ident(column),
-            literal,
-            sql_quote_ident(key_column),
-            key_literal
-        )
+        let q_key = sql_quote_ident_for(driver, key_column);
+        format!("delete from {q_table} where {q_key} = {key_literal}")
     }
 }
 
 pub(crate) fn delete_sql(table: &str, key_column: &str, key_literal: &str) -> String {
-    if key_column.eq_ignore_ascii_case("rowid") {
-        format!(
-            "delete from {} where rowid = {}",
-            sql_quote_ident(table),
-            key_literal
-        )
-    } else {
-        format!(
-            "delete from {} where {} = {}",
-            sql_quote_ident(table),
-            sql_quote_ident(key_column),
-            key_literal
-        )
-    }
+    delete_sql_for(None, table, key_column, key_literal)
 }
 
 /// Builds an INSERT skipping columns whose draft value is empty. Falls back to
 /// `DEFAULT VALUES` when every column is empty.
-pub(crate) fn insert_sql(
+pub(crate) fn insert_sql_for(
+    driver: Option<&str>,
     table: &str,
     columns: &[DatabaseColumn],
     values: &Map<String, Value>,
@@ -1012,19 +2494,35 @@ pub(crate) fn insert_sql(
         if text.is_empty() {
             continue;
         }
-        names.push(sql_quote_ident(&column.name));
+        names.push(sql_quote_ident_for(driver, &column.name));
         literals.push(sql_value_for_column(&column.column_type, &text));
     }
+    let q_table = sql_quote_ident_for(driver, table);
     if names.is_empty() {
-        format!("insert into {} default values", sql_quote_ident(table))
+        let is_mysql = driver.map_or(false, |d| {
+            let d = d.to_ascii_lowercase();
+            d.contains("mysql") || d.contains("mariadb")
+        });
+        if is_mysql {
+            format!("insert into {q_table} () values ()")
+        } else {
+            format!("insert into {q_table} default values")
+        }
     } else {
         format!(
-            "insert into {} ({}) values ({})",
-            sql_quote_ident(table),
+            "insert into {q_table} ({}) values ({})",
             names.join(", "),
             literals.join(", ")
         )
     }
+}
+
+pub(crate) fn insert_sql(
+    table: &str,
+    columns: &[DatabaseColumn],
+    values: &Map<String, Value>,
+) -> String {
+    insert_sql_for(None, table, columns, values)
 }
 
 /// Whether a load needs the hidden `rowid` key: usable sqlite table, no PK.
@@ -1041,6 +2539,8 @@ fn row_data_from_json(row: Map<String, Value>, rowid_mode: bool) -> RowData {
     };
     RowData {
         values,
+        formatted_cells: Vec::new(),
+        is_null_cells: Vec::new(),
         rowid,
         is_new: false,
     }
@@ -1116,7 +2616,7 @@ fn run_query(
     connection: &str,
     sql: &str,
 ) -> Result<Vec<Map<String, Value>>, String> {
-    let mut command = std::process::Command::new("php-db");
+    let mut command = std::process::Command::new(crate::resolve_helper_tool("php-db"));
     command
         .arg("--config")
         .arg(config_path(root))
@@ -1138,7 +2638,7 @@ fn run_query(
 /// Runs a mutating statement and treats a zero exit as success. `php-db`
 /// prints `no rows returned` for writes, which is not JSON.
 fn run_write(root: &Path, connection: &str, sql: &str) -> Result<(), String> {
-    let mut command = std::process::Command::new("php-db");
+    let mut command = std::process::Command::new(crate::resolve_helper_tool("php-db"));
     command
         .arg("--config")
         .arg(config_path(root))
@@ -1221,6 +2721,19 @@ mod tests {
         values.insert("id".into(), json!(""));
         assert_eq!(
             insert_sql("users", &columns(), &values),
+            "insert into \"users\" default values"
+        );
+        // Dialect-specific fallback: MySQL/MariaDB vs SQLite
+        assert_eq!(
+            insert_sql_for(Some("mysql"), "users", &columns(), &values),
+            "insert into `users` () values ()"
+        );
+        assert_eq!(
+            insert_sql_for(Some("mariadb"), "users", &columns(), &values),
+            "insert into `users` () values ()"
+        );
+        assert_eq!(
+            insert_sql_for(Some("sqlite"), "users", &columns(), &values),
             "insert into \"users\" default values"
         );
     }

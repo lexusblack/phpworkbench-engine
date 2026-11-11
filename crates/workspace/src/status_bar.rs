@@ -258,7 +258,7 @@ impl StatusBar {
                         IconName::ThreadsSidebarLeftClosed
                     },
                 )
-                .icon_size(IconSize::Small)
+                .icon_size(IconSize::default())
                 .tab_index(0isize)
                 .aria_label("Open threads sidebar")
                 .when(has_notifications, |this| {

@@ -5,8 +5,8 @@ use smallvec::SmallVec;
 
 use crate::prelude::*;
 
-const START_TAB_SLOT_SIZE: Pixels = px(12.);
-const END_TAB_SLOT_SIZE: Pixels = px(14.);
+const START_TAB_SLOT_SIZE: Pixels = px(16.);
+const END_TAB_SLOT_SIZE: Pixels = px(16.);
 
 /// The position of a [`Tab`] within a list of tabs.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -142,9 +142,13 @@ impl RenderOnce for Tab {
         };
 
         self.div
+            .relative()
             .h(Tab::container_height(cx))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
+            .when(!self.selected, |this| {
+                this.hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.35)))
+            })
             .map(|this| match self.position {
                 TabPosition::First => {
                     if self.selected {
@@ -170,13 +174,24 @@ impl RenderOnce for Tab {
                     .group("")
                     .relative()
                     .h(Tab::content_height(cx))
-                    .px(DynamicSpacing::Base04.px(cx))
-                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .px(px(10.))
+                    .gap(px(6.))
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)
                     .child(end_slot),
             )
+            .when(self.selected, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(2.))
+                        .bg(cx.theme().colors().border_focused),
+                )
+            })
     }
 }
 

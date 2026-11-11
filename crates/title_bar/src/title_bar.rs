@@ -359,38 +359,44 @@ impl Render for TitleBar {
                 client::Status::SignedOut | client::Status::AuthenticationError
             );
 
-        children.push(
-            h_flex()
-                .pr_1()
-                .gap_1()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(self.render_call_controls(window, cx))
-                .children(self.render_connection_status(status, cx))
-                .when(
-                    user.is_none()
-                        && is_signed_out_or_auth_error
-                        && TitleBarSettings::get_global(cx).show_sign_in,
-                    |this| this.child(self.render_sign_in_button(cx)),
-                )
-                .when(is_signing_in, |this| {
-                    this.child(
-                        Label::new("Signing in…")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .with_animation(
-                                "signing-in",
-                                Animation::new(Duration::from_secs(2))
-                                    .repeat()
-                                    .with_easing(pulsating_between(0.4, 0.8)),
-                                |label, delta| label.alpha(delta),
-                            ),
+        let (show_sign_in, show_user_menu) = {
+            let settings = TitleBarSettings::get_global(cx);
+            (settings.show_sign_in, settings.show_user_menu)
+        };
+        if show_sign_in || show_user_menu {
+            children.push(
+                h_flex()
+                    .pr_1()
+                    .gap_1()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(self.render_call_controls(window, cx))
+                    .children(self.render_connection_status(status, cx))
+                    .when(
+                        user.is_none()
+                            && is_signed_out_or_auth_error
+                            && show_sign_in,
+                        |this| this.child(self.render_sign_in_button(cx)),
                     )
-                })
-                .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
-                    this.child(self.render_user_menu_button(cx))
-                })
-                .into_any_element(),
-        );
+                    .when(is_signing_in, |this| {
+                        this.child(
+                            Label::new("Signing in…")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .with_animation(
+                                    "signing-in",
+                                    Animation::new(Duration::from_secs(2))
+                                        .repeat()
+                                        .with_easing(pulsating_between(0.4, 0.8)),
+                                    |label, delta| label.alpha(delta),
+                                ),
+                        )
+                    })
+                    .when(show_user_menu, |this| {
+                        this.child(self.render_user_menu_button(cx))
+                    })
+                    .into_any_element(),
+            );
+        }
 
         if show_menus {
             self.platform_titlebar.update(cx, |this, _| {
@@ -986,13 +992,13 @@ impl TitleBar {
                 .trigger_with_tooltip(
                     Button::new("worktree_picker_trigger", display_label)
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                        .label_size(LabelSize::Small)
+                        .label_size(LabelSize::Default)
                         .color(Color::Muted)
                         .tab_index(0isize)
                         .loading(is_creating)
                         .start_icon(
                             Icon::new(IconName::GitWorktree)
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(Color::Muted),
                         ),
                     move |_window, cx| {
@@ -1019,22 +1025,22 @@ impl TitleBar {
                 let trigger = if is_detached_head {
                     Button::new("project_branch_trigger", "Create Branch")
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                        .label_size(LabelSize::Small)
+                        .label_size(LabelSize::Default)
                         .tab_index(0isize)
                         .start_icon(
                             Icon::new(IconName::GitBranchPlus)
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(Color::Muted),
                         )
                 } else {
                     Button::new("project_branch_trigger", branch_name)
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                        .label_size(LabelSize::Small)
+                        .label_size(LabelSize::Default)
                         .color(Color::Muted)
                         .tab_index(0isize)
                         .start_icon(
                             Icon::new(branch_icon)
-                                .size(IconSize::XSmall)
+                                .size(IconSize::Small)
                                 .color(branch_icon_color),
                         )
                 };
@@ -1078,7 +1084,7 @@ impl TitleBar {
                 .when(show_separator, |this| {
                     this.child(
                         Label::new("/")
-                            .size(LabelSize::Small)
+                            .size(LabelSize::Default)
                             .color(Color::Muted)
                             .alpha(0.25),
                     )
