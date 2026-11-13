@@ -1793,11 +1793,13 @@ impl PhpStormBranchPopup {
 
 impl Render for PhpStormBranchPopup {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let submenu = self
-            .active_submenu
-            .as_ref()
-            .map(|(target, row_ix)| self.render_submenu(target, *row_ix, cx));
-        let colors = cx.theme().colors();
+        let colors = cx.theme().colors().clone();
+        let submenu = {
+            let active = self.active_submenu.clone();
+            active
+                .as_ref()
+                .map(|(target, row_ix)| self.render_submenu(target, *row_ix, cx))
+        };
 
         let main_card = v_flex()
             .id("phpstorm-branch-popup-card")

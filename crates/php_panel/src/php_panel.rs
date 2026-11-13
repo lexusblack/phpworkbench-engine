@@ -549,12 +549,12 @@ fn database_connection_icon(database: &DatabaseEntry) -> AnyElement {
     let driver = database.driver.as_deref().unwrap_or("mysql").to_lowercase();
     if driver == "sqlite" {
         Icon::new(IconName::DatabaseZap)
-            .size(IconSize::Small)
+            .size(IconSize::Medium)
             .color(Color::Accent)
             .into_any_element()
     } else {
         Icon::from_path("icons/file_icons/db_mysql_dolphin.svg")
-            .size(IconSize::Small)
+            .size(IconSize::Medium)
             .color(Color::Accent)
             .into_any_element()
     }
@@ -2251,7 +2251,7 @@ fn dialog_toggle_with(
                         .justify_center()
                         .child(
                             Icon::new(IconName::Check)
-                                .size(IconSize::Small)
+                                .size(IconSize::Medium)
                                 .color(Color::Accent),
                         )
                 }),
@@ -2923,7 +2923,7 @@ impl Render for DeploymentDialog {
             .child(div().flex_1().min_w_0())
             .child(
                 Icon::new(IconName::ChevronDown)
-                    .size(IconSize::Small)
+                    .size(IconSize::Medium)
                     .color(Color::Muted),
             )
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -2994,7 +2994,7 @@ impl Render for DeploymentDialog {
                                     .track_focus(&dialog_slot(&focus, DeployFocusSlot::SshConfig))
                                     .end_icon(
                                         Icon::new(IconName::ChevronDown)
-                                            .size(IconSize::Small)
+                                            .size(IconSize::Medium)
                                             .color(Color::Muted),
                                     )
                                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -3005,7 +3005,7 @@ impl Render for DeploymentDialog {
                                     IconButton::new("dp-ssh-edit", IconName::Ellipsis)
                                         .shape(IconButtonShape::Square)
                                         .track_focus(&dialog_slot(&focus, DeployFocusSlot::SshBrowse))
-                                        .icon_size(IconSize::Small)
+                                        .icon_size(IconSize::Medium)
                                         .icon_color(Color::Muted)
                                         .tooltip(Tooltip::text("Edit SSH configurations"))
                                         .on_click(cx.listener(
@@ -3248,7 +3248,7 @@ impl Render for DeploymentDialog {
                             IconButton::new("dp-local-browse", IconName::Folder)
                                 .shape(IconButtonShape::Square)
                                 .track_focus(&dialog_slot(&focus, DeployFocusSlot::LocalRootBrowse))
-                                .icon_size(IconSize::Small)
+                                .icon_size(IconSize::Medium)
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text("Choose folder"))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -3279,7 +3279,7 @@ impl Render for DeploymentDialog {
                                 IconButton::new("dp-root-browse", IconName::Folder)
                                     .shape(IconButtonShape::Square)
                                     .track_focus(&dialog_slot(&focus, DeployFocusSlot::RemoteRootBrowse))
-                                    .icon_size(IconSize::Small)
+                                    .icon_size(IconSize::Medium)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text("Choose root path"))
                                     .on_click(cx.listener(
@@ -3291,7 +3291,7 @@ impl Render for DeploymentDialog {
                             .child(
                                 IconButton::new("dp-root-help", IconName::CircleHelp)
                                     .shape(IconButtonShape::Square)
-                                    .icon_size(IconSize::Small)
+                                    .icon_size(IconSize::Medium)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text(
                                         "The deployment root is the server path that mirrors the local project root",
@@ -3331,7 +3331,7 @@ impl Render for DeploymentDialog {
                         ))
                         .child(
                             Icon::new(IconName::Public)
-                                .size(IconSize::Small)
+                                .size(IconSize::Medium)
                                 .color(Color::Muted),
                         ),
                 ),
@@ -3454,7 +3454,7 @@ impl Render for DeploymentDialog {
                                         )
                                         .child(
                                             IconButton::new("close-rsync-settings", IconName::Close)
-                                                .icon_size(IconSize::Small)
+                                                .icon_size(IconSize::Medium)
                                                 .icon_color(Color::Muted)
                                                 .tooltip(Tooltip::text("Close Rsync Settings"))
                                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -3816,7 +3816,7 @@ impl Render for DeploymentDialog {
                     .child(
                         IconButton::new("deploy-dialog-close", IconName::Close)
                             .shape(IconButtonShape::Square)
-                            .icon_size(IconSize::Small)
+                            .icon_size(IconSize::Medium)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.cancel(window, cx);
                             })),
@@ -3846,7 +3846,7 @@ impl Render for DeploymentDialog {
                                     .child(
                                         IconButton::new("deploy-add", IconName::Plus)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::Small)
+                                            .icon_size(IconSize::Medium)
                                             .tooltip(Tooltip::text("Add server"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
@@ -3857,7 +3857,7 @@ impl Render for DeploymentDialog {
                                     .child(
                                         IconButton::new("deploy-remove", IconName::SquareMinus)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::Small)
+                                            .icon_size(IconSize::Medium)
                                             .tooltip(Tooltip::text("Remove server"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
@@ -3868,7 +3868,7 @@ impl Render for DeploymentDialog {
                                     .child(
                                         IconButton::new("deploy-copy", IconName::Copy)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::Small)
+                                            .icon_size(IconSize::Medium)
                                             .tooltip(Tooltip::text("Duplicate server"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
@@ -3879,7 +3879,7 @@ impl Render for DeploymentDialog {
                                     .child(
                                         IconButton::new("deploy-check", IconName::Check)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::Small)
+                                            .icon_size(IconSize::Medium)
                                             .tooltip(Tooltip::text("Validate configuration"))
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, _window, cx| {
@@ -3956,7 +3956,7 @@ impl Render for DeploymentDialog {
                     .child(
                         IconButton::new("deploy-help", IconName::CircleHelp)
                             .shape(IconButtonShape::Square)
-                            .icon_size(IconSize::Small)
+                            .icon_size(IconSize::Medium)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text("Deployment help")),
                     )
@@ -7150,7 +7150,7 @@ impl Render for SshConfigsDialog {
             )
             .child(
                 Icon::new(IconName::ChevronDown)
-                    .size(IconSize::Small)
+                    .size(IconSize::Medium)
                     .color(Color::Muted),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
@@ -7394,7 +7394,7 @@ impl Render for SshConfigsDialog {
                         )
                         .child(
                             Icon::new(IconName::ChevronDown)
-                                .size(IconSize::Small)
+                                .size(IconSize::Medium)
                                 .color(Color::Muted),
                         )
                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -7596,7 +7596,7 @@ impl Render for SshConfigsDialog {
                                     .child(
                                         IconButton::new("ssh-add", IconName::Plus)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::Small)
+                                            .icon_size(IconSize::Medium)
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
                                                     this.add_config(window, cx);
@@ -7606,7 +7606,7 @@ impl Render for SshConfigsDialog {
                                     .child(
                                         IconButton::new("ssh-remove", IconName::SquareMinus)
                                             .shape(IconButtonShape::Square)
-                                            .icon_size(IconSize::Small)
+                                            .icon_size(IconSize::Medium)
                                             .on_click(cx.listener(
                                                 |this, _: &ClickEvent, window, cx| {
                                                     this.remove_config(window, cx);
@@ -8147,7 +8147,7 @@ impl Render for RootPickerDialog {
                     } else {
                         IconName::Folder
                     })
-                    .size(IconSize::Small)
+                    .size(IconSize::Medium)
                     .color(Color::Accent),
                 )
                 .child(
@@ -8358,13 +8358,13 @@ impl RootPickerDialog {
                         } else {
                             IconName::Folder
                         })
-                        .size(IconSize::Small)
+                        .size(IconSize::Medium)
                         .color(Color::Accent),
                     );
             } else {
                 item = item.child(div().flex_none().w(px(14.))).child(
                     Icon::new(IconName::File)
-                        .size(IconSize::Small)
+                        .size(IconSize::Medium)
                         .color(Color::Muted),
                 );
             }
@@ -8884,7 +8884,7 @@ impl Render for DataSourcesDialog {
                         .child(div().flex_1().min_w_0())
                         .child(
                             Icon::new(IconName::ChevronDown)
-                                .size(IconSize::Small)
+                                .size(IconSize::Medium)
                                 .color(Color::Muted),
                         )
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -9154,7 +9154,7 @@ impl Render for DataSourcesDialog {
                                 .track_focus(&dialog_slot(&focus, DataSourceFocusSlot::SshConfig))
                                 .end_icon(
                                     Icon::new(IconName::ChevronDown)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Medium)
                                         .color(Color::Muted),
                                 )
                                 .on_click(cx.listener(
@@ -9167,7 +9167,7 @@ impl Render for DataSourcesDialog {
                                 IconButton::new("ds-ssh-edit", IconName::Ellipsis)
                                     .shape(IconButtonShape::Square)
                                     .track_focus(&dialog_slot(&focus, DataSourceFocusSlot::SshEdit))
-                                    .icon_size(IconSize::Small)
+                                    .icon_size(IconSize::Medium)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text("Edit SSH configurations"))
                                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -9314,7 +9314,7 @@ impl Render for DataSourcesDialog {
                         .child(
                             IconButton::new("ds-schemas-refresh", IconName::RotateCw)
                                 .shape(IconButtonShape::Square)
-                                .icon_size(IconSize::Small)
+                                .icon_size(IconSize::Medium)
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                     this.refresh_schemas(cx);
                                 })),
@@ -9461,7 +9461,7 @@ impl Render for DataSourcesDialog {
                             IconButton::new("ds-advanced-add", IconName::Plus)
                                 .shape(IconButtonShape::Square)
                                 .track_focus(&dialog_slot(&focus, DataSourceFocusSlot::AdvancedAdd))
-                                .icon_size(IconSize::Small)
+                                .icon_size(IconSize::Medium)
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.add_advanced_row(window, cx);
                                 })),
@@ -9473,7 +9473,7 @@ impl Render for DataSourcesDialog {
                                     &focus,
                                     DataSourceFocusSlot::AdvancedRemove,
                                 ))
-                                .icon_size(IconSize::Small)
+                                .icon_size(IconSize::Medium)
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.remove_advanced_row(window, cx);
                                 })),
@@ -9553,7 +9553,7 @@ impl Render for DataSourcesDialog {
                                             .gap_1()
                                             .child(
                                                 Icon::new(IconName::DatabaseZap)
-                                                    .size(IconSize::Small)
+                                                    .size(IconSize::Medium)
                                                     .color(Color::Muted),
                                             )
                                             .child(
@@ -9569,7 +9569,7 @@ impl Render for DataSourcesDialog {
                                             .child(
                                                 IconButton::new("ds-add", IconName::Plus)
                                                     .shape(IconButtonShape::Square)
-                                                    .icon_size(IconSize::Small)
+                                                    .icon_size(IconSize::Medium)
                                                     .on_click(cx.listener(
                                                         |this, _: &ClickEvent, window, cx| {
                                                             this.add_source(window, cx);
@@ -9579,7 +9579,7 @@ impl Render for DataSourcesDialog {
                                             .child(
                                                 IconButton::new("ds-remove", IconName::SquareMinus)
                                                     .shape(IconButtonShape::Square)
-                                                    .icon_size(IconSize::Small)
+                                                    .icon_size(IconSize::Medium)
                                                     .on_click(cx.listener(
                                                         |this, _: &ClickEvent, window, cx| {
                                                             this.remove_source(window, cx);
@@ -9589,7 +9589,7 @@ impl Render for DataSourcesDialog {
                                             .child(
                                                 IconButton::new("ds-copy", IconName::Copy)
                                                     .shape(IconButtonShape::Square)
-                                                    .icon_size(IconSize::Small)
+                                                    .icon_size(IconSize::Medium)
                                                     .on_click(cx.listener(
                                                         |this, _: &ClickEvent, window, cx| {
                                                             this.copy_source(window, cx);
@@ -14262,12 +14262,12 @@ impl PhpPanel {
                 } else {
                     IconName::Folder
                 })
-                .size(IconSize::Small)
+                .size(IconSize::Medium)
                 .color(Color::Accent)
             } else {
                 match FileIcons::get_icon(Path::new(&entry.name), cx) {
-                    Some(icon_path) => Icon::from_path(icon_path).size(IconSize::Small),
-                    None => Icon::new(IconName::File).size(IconSize::Small),
+                    Some(icon_path) => Icon::from_path(icon_path).size(IconSize::Medium),
+                    None => Icon::new(IconName::File).size(IconSize::Medium),
                 }
             };
 
@@ -16498,7 +16498,7 @@ impl Render for PhpPanel {
             .child(
                 div().flex_none().child(
                     Icon::new(IconName::ChevronDown)
-                        .size(IconSize::Small)
+                        .size(IconSize::Medium)
                         .color(Color::Muted),
                 ),
             )
@@ -16527,7 +16527,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("remote-configure", IconName::Ellipsis)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
+                    .icon_size(IconSize::Medium)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Deployment configuration"))
                     .aria_label("Deployment configuration")
@@ -16538,7 +16538,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("remote-refresh", IconName::RotateCw)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
+                    .icon_size(IconSize::Medium)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Refresh"))
                     .aria_label("Refresh remote listing")
@@ -16552,7 +16552,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("remote-sync", IconName::Share)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
+                    .icon_size(IconSize::Medium)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Sync"))
                     .aria_label("Sync files to server")
@@ -16823,7 +16823,7 @@ impl Render for PhpPanel {
                     .child(
                         div().flex_none().child(
                             Icon::new(IconName::ChevronDown)
-                                .size(IconSize::Small)
+                                .size(IconSize::Medium)
                                 .color(Color::Muted),
                         ),
                     )
@@ -16870,7 +16870,7 @@ impl Render for PhpPanel {
                                     h_flex()
                                         .gap_1()
                                         .items_center()
-                                        .child(Icon::new(IconName::File).size(IconSize::Small).color(Color::Accent))
+                                        .child(Icon::new(IconName::File).size(IconSize::Medium).color(Color::Accent))
                                         .child(Label::new(format!("sftp://{active_server}/{active_path}")).size(LabelSize::Custom(Rems(0.75))).weight(FontWeight::MEDIUM).truncate()),
                                 )
                                 .child(Label::new(msg).size(LabelSize::Custom(Rems(0.72))).color(color)),
@@ -16977,7 +16977,7 @@ impl Render for PhpPanel {
                         } else {
                             IconName::ChevronRight
                         })
-                        .size(IconSize::Small)
+                        .size(IconSize::Medium)
                         .color(Color::Muted),
                     ),
                 )
@@ -17060,13 +17060,13 @@ impl Render for PhpPanel {
                             } else {
                                 IconName::ChevronRight
                             })
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Muted),
                         ),
                     )
                     .child(
                         Icon::from_path("icons/file_icons/db_schema_cubes.svg")
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Accent),
                     )
                     .child(
@@ -17124,13 +17124,13 @@ impl Render for PhpPanel {
                                         } else {
                                             IconName::ChevronRight
                                         })
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Medium)
                                         .color(Color::Muted),
                                     ),
                                 )
                                 .child(
                                     Icon::new(IconName::Folder)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Medium)
                                         .color(Color::Accent),
                                 )
                                 .child(
@@ -17206,7 +17206,7 @@ impl Render for PhpPanel {
                                         .hover(|this| this.bg(cx.theme().colors().element_hover))
                                         .child(
                                             Icon::from_path("icons/file_icons/db_schema_cubes.svg")
-                                                .size(IconSize::Small)
+                                                .size(IconSize::Medium)
                                                 .color(Color::Muted),
                                         )
                                         .child(
@@ -17300,12 +17300,12 @@ impl Render for PhpPanel {
                                 .items_center()
                                 .child(
                                     Icon::new(IconName::ChevronRight)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Medium)
                                         .color(Color::Muted),
                                 )
                                 .child(
                                     Icon::new(IconName::Server)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Medium)
                                         .color(Color::Accent),
                                 )
                                 .child(
@@ -17328,12 +17328,12 @@ impl Render for PhpPanel {
                                 .items_center()
                                 .child(
                                     Icon::new(IconName::ChevronRight)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Medium)
                                         .color(Color::Muted),
                                 )
                                 .child(
                                     Icon::new(IconName::Folder)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Medium)
                                         .color(Color::Custom(gpui::rgb(0xa371f7).into())),
                                 )
                                 .child(
@@ -17523,7 +17523,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("tests-run-all", IconName::PlayFilled)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
+                    .icon_size(IconSize::Medium)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Run all tests"))
                     .aria_label("Run all tests")
@@ -17535,7 +17535,7 @@ impl Render for PhpPanel {
             .child(
                 IconButton::new("tests-refresh", IconName::RotateCw)
                     .shape(IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
+                    .icon_size(IconSize::Medium)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Refresh test files"))
                     .aria_label("Refresh test files")
@@ -17740,7 +17740,7 @@ impl Render for PhpPanel {
                     .tooltip(Tooltip::text("New (Data Source / Console / DDL)"))
                     .child(
                         Icon::from_path("icons/file_icons/db_add_dropdown.svg")
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -17760,7 +17760,7 @@ impl Render for PhpPanel {
                     .tooltip(Tooltip::text("Data Source Properties (⌘I)"))
                     .child(
                         Icon::from_path("icons/file_icons/db_properties.svg")
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -17785,7 +17785,7 @@ impl Render for PhpPanel {
                     .tooltip(Tooltip::text("Refresh (⌘R)"))
                     .child(
                         Icon::new(IconName::RotateCw)
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -17805,7 +17805,7 @@ impl Render for PhpPanel {
                     .tooltip(Tooltip::text("Deactivate Connection (⌘F2)"))
                     .child(
                         Icon::from_path("icons/file_icons/db_deactivate.svg")
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Error),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -17833,7 +17833,7 @@ impl Render for PhpPanel {
                     .tooltip(Tooltip::text("Open SQL Console (⌘⇧F10)"))
                     .child(
                         Icon::new(IconName::Terminal)
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener({
@@ -17858,7 +17858,7 @@ impl Render for PhpPanel {
                     .tooltip(Tooltip::text("View Table / Query Data (⌘↓)"))
                     .child(
                         Icon::new(IconName::Table)
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -17900,7 +17900,7 @@ impl Render for PhpPanel {
                     .tooltip(Tooltip::text("Compare Schema Structure (⌘D)"))
                     .child(
                         Icon::new(IconName::ArrowRightLeft)
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -17924,7 +17924,7 @@ impl Render for PhpPanel {
                     .tooltip(Tooltip::text("View Options"))
                     .child(
                         Icon::from_path("icons/file_icons/db_view_options.svg")
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -18021,7 +18021,7 @@ impl Render for PhpPanel {
                                 .child(div().flex_1())
                                 .child(
                                     Icon::new(IconName::ChevronRight)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Medium)
                                         .color(Color::Muted),
                                 )
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -19522,7 +19522,7 @@ impl PhpPanel {
                 .child(
                     IconButton::new(format!("http-pair-remove-{}-{}", kind as usize, index), IconName::Close)
                         .shape(IconButtonShape::Square)
-                        .icon_size(IconSize::Small)
+                        .icon_size(IconSize::Medium)
                         .icon_color(Color::Muted)
                         .tooltip(Tooltip::text("Remove row"))
                         .aria_label("Remove row")
@@ -22084,7 +22084,7 @@ impl PhpPanel {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(Icon::new(IconName::Info).size(IconSize::Small).color(Color::Accent))
+                            .child(Icon::new(IconName::Info).size(IconSize::Medium).color(Color::Accent))
                             .child(
                                 Label::new(format!("sftp://{active_server}/{active_path}"))
                                     .size(LabelSize::Custom(PANEL_TEXT_REMS))
@@ -22191,7 +22191,7 @@ impl PhpPanel {
                             cx.notify();
                         }
                     }))
-                    .child(Icon::new(IconName::FolderOpen).size(IconSize::Small).color(Color::Accent))
+                    .child(Icon::new(IconName::FolderOpen).size(IconSize::Medium).color(Color::Accent))
                     .child(
                         Label::new(".. (Parent folder)")
                             .size(LabelSize::Custom(PANEL_TEXT_REMS))
@@ -22217,11 +22217,11 @@ impl PhpPanel {
             };
 
             let start_icon = if is_dir {
-                Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Accent)
+                Icon::new(IconName::Folder).size(IconSize::Medium).color(Color::Accent)
             } else {
                 match FileIcons::get_icon(Path::new(&name), cx) {
-                    Some(icon_path) => Icon::from_path(icon_path).size(IconSize::Small),
-                    None => Icon::new(IconName::File).size(IconSize::Small),
+                    Some(icon_path) => Icon::from_path(icon_path).size(IconSize::Medium),
+                    None => Icon::new(IconName::File).size(IconSize::Medium),
                 }
             };
 
@@ -22349,7 +22349,7 @@ impl PhpPanel {
                     .p_4()
                     .gap_2()
                     .items_center()
-                    .child(Icon::new(IconName::Close).size(IconSize::Small).color(Color::Error))
+                    .child(Icon::new(IconName::Close).size(IconSize::Medium).color(Color::Error))
                     .child(Label::new(format!("Error reading directory: {err}")).color(Color::Error))
                     .into_any_element(),
             );
@@ -22427,7 +22427,7 @@ impl PhpPanel {
                     .items_center()
                     .child(
                         Icon::new(IconName::Server)
-                            .size(IconSize::Small)
+                            .size(IconSize::Medium)
                             .color(Color::Accent),
                     )
                     .child(
@@ -23788,7 +23788,7 @@ impl PhpPanel {
                             })
                             .child(
                                 Icon::from_path("icons/file_icons/database_stripe.svg")
-                                    .size(IconSize::Small)
+                                    .size(IconSize::Medium)
                                     .color(if is_active { Color::Default } else { Color::Muted }),
                             )
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -23827,7 +23827,7 @@ impl PhpPanel {
                             })
                             .child(
                                 Icon::new(IconName::Server)
-                                    .size(IconSize::Small)
+                                    .size(IconSize::Medium)
                                     .color(if is_active { Color::Default } else { Color::Muted }),
                             )
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -23866,7 +23866,7 @@ impl PhpPanel {
                             })
                             .child(
                                 Icon::new(IconName::ArrowRightLeft)
-                                    .size(IconSize::Small)
+                                    .size(IconSize::Medium)
                                     .color(if is_active { Color::Default } else { Color::Muted }),
                             )
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -23887,7 +23887,7 @@ impl PhpPanel {
                     .cursor_pointer()
                     .tooltip(|window, cx| Tooltip::text("Deployment Configuration…")(window, cx))
                     .hover(|s| s.bg(colors.element_hover))
-                    .child(Icon::new(IconName::Settings).size(IconSize::Small).color(Color::Muted))
+                    .child(Icon::new(IconName::Settings).size(IconSize::Medium).color(Color::Muted))
                     .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
                         if let Some(root) = root.clone() {
                             open_deployment_window(root, cx);
