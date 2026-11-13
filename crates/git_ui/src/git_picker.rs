@@ -508,14 +508,14 @@ pub fn popover(
 
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &zed_actions::git::Branch, window, cx| {
-        open_with_tab(workspace, GitPickerTab::Branches, window, cx);
+        crate::phpstorm_branch_popup::open_modal(workspace, window, cx);
     });
     workspace.register_action(|workspace, _: &zed_actions::git::Switch, window, cx| {
-        open_with_tab(workspace, GitPickerTab::Branches, window, cx);
+        crate::phpstorm_branch_popup::open_modal(workspace, window, cx);
     });
     workspace.register_action(
         |workspace, _: &zed_actions::git::CheckoutBranch, window, cx| {
-            open_with_tab(workspace, GitPickerTab::Branches, window, cx);
+            crate::phpstorm_branch_popup::open_modal(workspace, window, cx);
         },
     );
     workspace.register_action(|workspace, _: &zed_actions::git::ViewStash, window, cx| {

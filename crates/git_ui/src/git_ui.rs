@@ -52,6 +52,7 @@ mod git_runtime_diagnostics;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod phpstorm;
+pub mod phpstorm_branch_popup;
 pub mod project_diff;
 pub mod push_dialog;
 pub(crate) mod remote_output;
@@ -74,14 +75,7 @@ pub fn init(cx: &mut App) {
 
     git_ui_core::set_branch_picker_builder(
         |workspace, repository, window, cx| {
-            let picker = git_picker::popover(
-                workspace,
-                repository,
-                git_picker::GitPickerTab::Branches,
-                gpui::rems(34.),
-                window,
-                cx,
-            );
+            let picker = phpstorm_branch_popup::popover(workspace, repository, window, cx);
             cx.new(|cx| git_ui_core::GitPickerPopover::new(picker, cx))
         },
         cx,

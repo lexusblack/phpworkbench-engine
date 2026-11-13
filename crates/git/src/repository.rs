@@ -888,6 +888,25 @@ pub trait GitRepository: Send + Sync {
         force: bool,
     ) -> BoxFuture<'_, Result<()>>;
 
+    fn merge_branch(&self, ref_name: String) -> BoxFuture<'_, Result<()>> {
+        let _ = ref_name;
+        async { anyhow::bail!("merging branches is unsupported") }.boxed()
+    }
+
+    fn rebase_branch(&self, upstream: String) -> BoxFuture<'_, Result<()>> {
+        let _ = upstream;
+        async { anyhow::bail!("rebasing onto branch is unsupported") }.boxed()
+    }
+
+    fn checkout_revision(&self, revision: String) -> BoxFuture<'_, Result<()>> {
+        let _ = revision;
+        async { anyhow::bail!("checking out revision is unsupported") }.boxed()
+    }
+
+    fn list_tags(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+        async { Ok(Vec::new()) }.boxed()
+    }
+
     fn worktrees(&self) -> BoxFuture<'_, Result<Vec<Worktree>>>;
 
     /// Returns the creation time of a linked worktree's git metadata
@@ -1430,6 +1449,19 @@ fn parse_remote_urls(stdout: &str) -> HashMap<String, String> {
         }
     }
     urls
+}
+
+impl RealGitRepository {
+    fn run_simple_command(&self, args: Vec<String>) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&args).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
 }
 
 impl GitRepository for RealGitRepository {
@@ -2585,6 +2617,41 @@ impl GitRepository for RealGitRepository {
                 let flag = delete_branch_flag(is_remote, force);
                 git_binary.run(&["branch", flag, &name]).await?;
                 anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn merge_branch(&self, ref_name: String) -> BoxFuture<'_, Result<()>> {
+        self.run_simple_command(vec!["merge".to_string(), ref_name])
+    }
+
+    fn rebase_branch(&self, upstream: String) -> BoxFuture<'_, Result<()>> {
+        self.run_simple_command(vec!["rebase".to_string(), upstream])
+    }
+
+    fn checkout_revision(&self, revision: String) -> BoxFuture<'_, Result<()>> {
+        self.run_simple_command(vec!["checkout".to_string(), revision])
+    }
+
+    fn list_tags(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+        let git_binary = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                let output = git_binary
+                    .run(&[
+                        "for-each-ref",
+                        "--sort=-creatordate",
+                        "--format=%(refname:short)",
+                        "refs/tags",
+                    ])
+                    .await?;
+                Ok(output
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToString::to_string)
+                    .collect())
             })
             .boxed()
     }

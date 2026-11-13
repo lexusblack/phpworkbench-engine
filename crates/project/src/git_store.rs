@@ -10027,6 +10027,68 @@ impl Repository {
         )
     }
 
+    pub fn merge_branch(&mut self, ref_name: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "merge_branch",
+            Some(format!("git merge {ref_name}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.merge_branch(ref_name).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("merging branches on remote repositories is unsupported")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn rebase_branch(&mut self, upstream: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "rebase_branch",
+            Some(format!("git rebase {upstream}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.rebase_branch(upstream).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("rebasing branches on remote repositories is unsupported")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn checkout_revision(&mut self, revision: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "checkout_revision",
+            Some(format!("git checkout {revision}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.checkout_revision(revision).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("checking out revisions on remote repositories is unsupported")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn list_tags(&mut self) -> oneshot::Receiver<Result<Vec<String>>> {
+        self.send_job("list_tags", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.list_tags().await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
     pub fn check_for_pushed_commits(&mut self) -> oneshot::Receiver<Result<Vec<SharedString>>> {
         let id = self.id;
         self.send_job(
