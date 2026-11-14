@@ -47,6 +47,7 @@ mod http_client_view;
 mod database_console_view;
 mod remote_view;
 pub mod remote_file_banner;
+mod idea_importer;
 
 pub use remote_file_banner::RemoteFileBanner;
 use http_client_view::HttpClientView;
@@ -1031,7 +1032,7 @@ impl DeploymentDialog {
             .iter()
             .map(|server| server.name.clone())
             .collect::<Vec<_>>();
-        let config = read_json(&self.root.join(".zed/deploy.json"));
+        let config = load_deploy_config_for_root(&self.root);
         let configured_active = config
             .as_ref()
             .and_then(|config| config.get("active"))
@@ -1961,7 +1962,7 @@ impl DeploymentDialog {
             .iter()
             .map(|server| server.name.clone())
             .collect::<Vec<_>>();
-        let configured = read_json(&self.root.join(".zed/deploy.json")).and_then(|config| {
+        let configured = load_deploy_config_for_root(&self.root).and_then(|config| {
             config
                 .get("active")
                 .and_then(Value::as_str)
@@ -4056,14 +4057,45 @@ fn relative_upload_path(
         .collect::<Vec<_>>()
         .join("/");
 
-    if unix_rel.is_empty() || unix_rel == ".zed/deploy.json" {
+    if unix_rel.is_empty() || unix_rel == ".zed/deploy.json" || unix_rel == ".phpworkbench/deploy.json" {
         return None;
     }
     Some(unix_rel)
 }
 
+fn deploy_config_path(root: &Path) -> PathBuf {
+    let pw = root.join(".phpworkbench/deploy.json");
+    if pw.is_file() {
+        return pw;
+    }
+    let zed = root.join(".zed/deploy.json");
+    if zed.is_file() {
+        return zed;
+    }
+    if let Some(imported) = idea_importer::import_idea_servers(root) {
+        if let Some(map) = imported.as_object() {
+            let _ = write_config_object(&pw, map);
+        }
+        return pw;
+    }
+    pw
+}
+
+fn load_deploy_config_for_root(root: &Path) -> Option<Value> {
+    read_json(&root.join(".phpworkbench/deploy.json"))
+        .or_else(|| read_json(&root.join(".zed/deploy.json")))
+        .or_else(|| {
+            let imported = idea_importer::import_idea_servers(root)?;
+            let pw = root.join(".phpworkbench/deploy.json");
+            if let Some(map) = imported.as_object() {
+                let _ = write_config_object(&pw, map);
+            }
+            Some(imported)
+        })
+}
+
 fn load_deploy_servers(root: &Path) -> Vec<RemoteServer> {
-    let Some(config) = read_json(&root.join(".zed/deploy.json")) else {
+    let Some(config) = load_deploy_config_for_root(root) else {
         return Vec::new();
     };
     let Some(servers) = config.get("servers").and_then(Value::as_array) else {
@@ -4077,7 +4109,7 @@ fn load_deploy_servers(root: &Path) -> Vec<RemoteServer> {
 
 pub fn open_deployment_window(root: PathBuf, cx: &mut App) {
     register_dialog_key_bindings(cx, "DeploymentDialog");
-    let config = read_json(&root.join(".zed/deploy.json"));
+    let config = load_deploy_config_for_root(&root);
     let names = load_deploy_servers(&root)
         .iter()
         .map(|server| server.name.clone())
@@ -4449,6 +4481,37 @@ fn data_source_test_config(source: &DataSource) -> Value {
     serde_json::json!({ "connections": [Value::Object(entry)] })
 }
 
+fn databases_config_path(root: &Path) -> PathBuf {
+    let pw = root.join(".phpworkbench/databases.json");
+    if pw.is_file() {
+        return pw;
+    }
+    let zed = root.join(".zed/databases.json");
+    if zed.is_file() {
+        return zed;
+    }
+    if let Some(imported) = idea_importer::import_idea_databases(root) {
+        if let Some(map) = imported.as_object() {
+            let _ = write_config_object(&pw, map);
+        }
+        return pw;
+    }
+    pw
+}
+
+fn load_databases_config_for_root(root: &Path) -> Option<Value> {
+    read_json(&root.join(".phpworkbench/databases.json"))
+        .or_else(|| read_json(&root.join(".zed/databases.json")))
+        .or_else(|| {
+            let imported = idea_importer::import_idea_databases(root)?;
+            let pw = root.join(".phpworkbench/databases.json");
+            if let Some(map) = imported.as_object() {
+                let _ = write_config_object(&pw, map);
+            }
+            Some(imported)
+        })
+}
+
 fn save_data_sources(root: &Path, sources: &[DataSource]) -> std::result::Result<(), String> {
     for source in sources {
         if source.name.trim().is_empty() {
@@ -4462,7 +4525,7 @@ fn save_data_sources(root: &Path, sources: &[DataSource]) -> std::result::Result
             return Err(format!("duplicate data source name: {name}"));
         }
     }
-    let path = root.join(".zed/databases.json");
+    let path = databases_config_path(root);
     let mut config = load_config_object(&path)?;
     let existing: Vec<Value> = match config.remove("connections") {
         Some(Value::Array(connections)) => connections,
@@ -4528,7 +4591,7 @@ fn delete_data_source(root: &Path, name: &str) -> std::result::Result<bool, Stri
     if name.is_empty() {
         return Err("data source name is required".to_string());
     }
-    let path = root.join(".zed/databases.json");
+    let path = databases_config_path(root);
     let mut config = load_config_object(&path)?;
     let mut connections = match config.remove("connections") {
         Some(Value::Array(connections)) => connections,
@@ -4542,7 +4605,7 @@ fn delete_data_source(root: &Path, name: &str) -> std::result::Result<bool, Stri
 }
 
 fn load_data_sources(root: &Path) -> Vec<DataSource> {
-    read_json(&root.join(".zed/databases.json"))
+    load_databases_config_for_root(root)
         .and_then(|config| config.get("connections").and_then(Value::as_array).cloned())
         .map(|connections| {
             connections
@@ -6432,7 +6495,7 @@ impl DataSourcesDialog {
         self.schemas_state = SchemaListState::Loading;
         cx.notify();
 
-        let config_path = self.root.join(".zed/databases.json");
+        let config_path = databases_config_path(&self.root);
         let root = self.root.clone();
         let weak = cx.weak_entity();
         let task = cx.background_spawn(async move {
@@ -11590,7 +11653,7 @@ impl PhpPanel {
                 }
             }
 
-            if let Some(config) = read_json(&root.join(".zed/deploy.json")) {
+            if let Some(config) = load_deploy_config_for_root(&root) {
                 if let Some(servers) = config.get("servers").and_then(Value::as_array) {
                     for server in servers {
                         if let Some(parsed) = parse_deploy_server(server, &root) {
@@ -11603,7 +11666,7 @@ impl PhpPanel {
                 }
             }
 
-            if let Some(config) = read_json(&root.join(".zed/databases.json")) {
+            if let Some(config) = load_databases_config_for_root(&root) {
                 if let Some(connections) = config.get("connections").and_then(Value::as_array) {
                     for connection in connections {
                         let Some(name) = string_field(connection, "name") else {
@@ -14791,7 +14854,7 @@ impl PhpPanel {
             .iter()
             .map(|server| server.name.clone())
             .collect::<Vec<_>>();
-        let config = read_json(&root.join(".zed/deploy.json"));
+        let config = load_deploy_config_for_root(&root);
         let configured_active = config
             .as_ref()
             .and_then(|config| config.get("active"))
@@ -14947,7 +15010,7 @@ impl PhpPanel {
         cx.notify();
 
         let connection_name = name.clone();
-        let config_path = root.join(".zed/databases.json");
+        let config_path = databases_config_path(&root);
         let task = cx.background_spawn(async move {
             let output = std::process::Command::new(resolve_helper_tool("php-db"))
                 .arg("--config")
@@ -15080,7 +15143,7 @@ impl PhpPanel {
         cx.notify();
 
         let connection_name = name.clone();
-        let config_path = root.join(".zed/databases.json");
+        let config_path = databases_config_path(&root);
         let task = cx.background_spawn(async move {
             let output = std::process::Command::new(resolve_helper_tool("php-db"))
                 .arg("--config")
@@ -15127,7 +15190,7 @@ impl PhpPanel {
         cx.notify();
 
         let connection_name = name.clone();
-        let config_path = root.join(".zed/databases.json");
+        let config_path = databases_config_path(&root);
         let task = cx.background_spawn(async move {
             let output = std::process::Command::new(resolve_helper_tool("php-db"))
                 .arg("--config")
@@ -15355,7 +15418,7 @@ impl PhpPanel {
         cx.notify();
 
         let task_connection = connection.clone();
-        let config_path = root.join(".zed/databases.json");
+        let config_path = databases_config_path(&root);
         let task = cx.background_spawn(async move {
             let output = std::process::Command::new(resolve_helper_tool("php-db"))
                 .arg("--config")
@@ -15655,7 +15718,7 @@ fn save_deploy_config(
     servers: &[RemoteServer],
     active: Option<&str>,
 ) -> std::result::Result<(), String> {
-    let path = root.join(".zed/deploy.json");
+    let path = deploy_config_path(root);
     let mut config = load_config_object(&path)?;
     let entries = servers.iter().map(deploy_server_entry).collect::<Vec<_>>();
     config.insert("servers".to_string(), Value::Array(entries));
@@ -16038,7 +16101,7 @@ fn save_server_config(root: &Path, fields: &[String]) -> std::result::Result<Str
     let remote_root = form_field(fields, 5);
     let local_root = form_field(fields, 6);
 
-    let path = root.join(".zed/deploy.json");
+    let path = deploy_config_path(root);
     let mut config = load_config_object(&path)?;
     let mut servers = match config.remove("servers") {
         Some(Value::Array(servers)) => servers,
@@ -23700,6 +23763,9 @@ fn load_http_history(root: &Path) -> HttpHistoryFile {
             }
         }
     }
+    if let Some(imported) = idea_importer::import_idea_http_history(root) {
+        return imported;
+    }
     seed_initial_http_history()
 }
 
@@ -24340,7 +24406,7 @@ mod tests {
         .expect("save server");
         assert_eq!(name, "dev");
 
-        let path = root.join(".zed/deploy.json");
+        let path = deploy_config_path(root);
         let contents = std::fs::read_to_string(&path).expect("read deploy.json");
         assert!(contents.starts_with("{\n  "));
         assert!(contents.ends_with("}\n"));
@@ -24516,7 +24582,7 @@ mod tests {
     #[test]
     fn save_server_validates_without_writing() {
         let root = temp_root("server_validate");
-        let path = root.join(".zed/deploy.json");
+        let path = deploy_config_path(root);
 
         let error = save_server_config(&root, &fields(&["", "local", "", "", "", "/tmp", "."]))
             .expect_err("empty name rejected");
