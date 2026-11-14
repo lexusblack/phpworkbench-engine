@@ -273,11 +273,14 @@ pub mod entry_menu_action {
     pub const DELETE: &str = "delete";
     pub const ADD_TO_VCS: &str = "add_to_vcs";
     pub const ADD_TO_GITIGNORE: &str = "add_to_gitignore";
+    pub const SHELVE: &str = "shelve";
     pub const REFRESH: &str = "refresh";
     pub const BRANCHES: &str = "git.branches";
     pub const FETCH: &str = "git.fetch";
     pub const PUSH: &str = "git.push";
     pub const PULL: &str = "git.pull";
+    pub const STASH_CHANGES: &str = "git.stash_changes";
+    pub const UNSTASH_CHANGES: &str = "git.unstash_changes";
 
     /// Action identifiers in this prefix are rendered inside the `Git`
     /// submenu rather than directly in the top-level menu.
@@ -310,7 +313,7 @@ impl MenuItemSpec {
 }
 
 /// State of the changed file the context menu was opened on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryMenuState {
     /// Every affected file is fully staged.
     pub staged: bool,
@@ -318,6 +321,22 @@ pub struct EntryMenuState {
     pub untracked: bool,
     /// Every affected file is deleted from the worktree.
     pub deleted: bool,
+    /// Whether multiple files or a section header is selected.
+    pub multiple: bool,
+    /// Whether any files exist in this selection/target.
+    pub has_files: bool,
+}
+
+impl Default for EntryMenuState {
+    fn default() -> Self {
+        Self {
+            staged: false,
+            untracked: false,
+            deleted: false,
+            multiple: false,
+            has_files: true,
+        }
+    }
 }
 
 impl EntryMenuState {
@@ -326,6 +345,18 @@ impl EntryMenuState {
             staged,
             untracked,
             deleted,
+            multiple: false,
+            has_files: true,
+        }
+    }
+
+    pub fn for_multiple(staged: bool, untracked: bool, deleted: bool, has_files: bool) -> Self {
+        Self {
+            staged,
+            untracked,
+            deleted,
+            multiple: true,
+            has_files,
         }
     }
 }
@@ -337,7 +368,12 @@ impl EntryMenuState {
 pub fn menu_items_for(state: EntryMenuState) -> Vec<MenuItemSpec> {
     use entry_menu_action as ids;
 
-    let tracked = !state.untracked;
+    let tracked = !state.untracked && state.has_files;
+    let commit_label = if state.multiple {
+        "Commit Files..."
+    } else {
+        "Commit File..."
+    };
 
     let item = |label, enabled, action_id| MenuItemSpec {
         label,
@@ -346,23 +382,27 @@ pub fn menu_items_for(state: EntryMenuState) -> Vec<MenuItemSpec> {
     };
 
     vec![
-        item("Commit File...", true, ids::COMMIT_FILE),
+        item(commit_label, state.has_files, ids::COMMIT_FILE),
         item("Rollback...", tracked, ids::ROLLBACK),
         MenuItemSpec::separator(),
         item("Show Diff", tracked, ids::SHOW_DIFF),
         item("Show Diff in a New Tab", tracked, ids::SHOW_DIFF_NEW_TAB),
-        item("Jump to Source", !state.deleted, ids::JUMP_TO_SOURCE),
-        item("Copy Path/Reference...", true, ids::COPY_PATH),
+        item("Jump to Source", state.has_files && !state.deleted, ids::JUMP_TO_SOURCE),
+        item("Copy Path/Reference...", state.has_files, ids::COPY_PATH),
         MenuItemSpec::separator(),
-        item("Delete...", true, ids::DELETE),
-        item("Add to VCS", !state.staged, ids::ADD_TO_VCS),
-        item("Add to .gitignore", state.untracked, ids::ADD_TO_GITIGNORE),
+        item("Delete...", state.has_files, ids::DELETE),
+        item("Add to VCS", state.has_files && !state.staged, ids::ADD_TO_VCS),
+        item("Add to .gitignore", state.has_files && state.untracked, ids::ADD_TO_GITIGNORE),
+        MenuItemSpec::separator(),
+        item("Shelve Changes...", tracked, ids::SHELVE),
         MenuItemSpec::separator(),
         item("Refresh", true, ids::REFRESH),
         item("Branches...", true, ids::BRANCHES),
         item("Fetch", true, ids::FETCH),
         item("Push...", true, ids::PUSH),
         item("Pull", true, ids::PULL),
+        item("Stash Changes...", tracked, ids::STASH_CHANGES),
+        item("Unstash Changes...", true, ids::UNSTASH_CHANGES),
     ]
 }
 
@@ -401,12 +441,23 @@ mod entry_menu_tests {
                 "Delete...",
                 "Add to VCS",
                 "Add to .gitignore",
+                "Shelve Changes...",
                 "Refresh",
                 "Branches...",
                 "Fetch",
                 "Push...",
                 "Pull",
+                "Stash Changes...",
+                "Unstash Changes...",
             ]
+        );
+    }
+
+    #[test]
+    fn menu_multiple_uses_plural_commit() {
+        assert_eq!(
+            labels(EntryMenuState::for_multiple(false, false, false, true))[0],
+            "Commit Files..."
         );
     }
 
@@ -418,7 +469,7 @@ mod entry_menu_tests {
             .enumerate()
             .filter_map(|(index, item)| item.is_separator().then_some(index))
             .collect();
-        assert_eq!(separator_indices, vec![2, 7, 11]);
+        assert_eq!(separator_indices, vec![2, 7, 11, 13]);
     }
 
     #[test]

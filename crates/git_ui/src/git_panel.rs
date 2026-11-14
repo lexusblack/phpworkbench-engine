@@ -329,11 +329,14 @@ fn action_for_entry_menu_item(action_id: &str) -> Option<Box<dyn Action>> {
         ids::DELETE => Some(DeleteFile.boxed_clone()),
         ids::ADD_TO_VCS => Some(git::StageFile.boxed_clone()),
         ids::ADD_TO_GITIGNORE => Some(git::AddToGitignore.boxed_clone()),
+        ids::SHELVE => Some(git::StashAll.boxed_clone()),
         ids::REFRESH => Some(Refresh.boxed_clone()),
         ids::BRANCHES => Some(zed_actions::git::Branch.boxed_clone()),
         ids::FETCH => Some(git::Fetch.boxed_clone()),
         ids::PUSH => Some(crate::push_dialog::OpenPushDialog.boxed_clone()),
         ids::PULL => Some(git::Pull.boxed_clone()),
+        ids::STASH_CHANGES => Some(git::StashAll.boxed_clone()),
+        ids::UNSTASH_CHANGES => Some(git::StashPop.boxed_clone()),
         _ => None,
     }
 }
@@ -9251,6 +9254,13 @@ impl GitPanel {
                 })
                 .ok();
             })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.deploy_header_context_menu(event.position, section, window, cx);
+                }),
+            )
             .into_any_element()
     }
 
@@ -9320,6 +9330,71 @@ impl GitPanel {
         })
     }
 
+    fn mark_section_entries(&mut self, section: Section) {
+        self.clear_marks();
+        let mut in_section = false;
+        let mut first_file_ix = None;
+        let mut rows_to_mark = Vec::new();
+        let mut dirs_to_mark = Vec::new();
+        for (ix, entry) in self.entries.iter().enumerate() {
+            match entry {
+                GitListEntry::Header(h) => {
+                    in_section = h.header == section;
+                }
+                GitListEntry::Status(_) | GitListEntry::TreeStatus(_) => {
+                    if in_section {
+                        rows_to_mark.push(ix);
+                        if first_file_ix.is_none() {
+                            first_file_ix = Some(ix);
+                        }
+                    }
+                }
+                GitListEntry::Directory(dir) => {
+                    if in_section {
+                        dirs_to_mark.push(dir.key.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for ix in rows_to_mark {
+            self.mark_row(ix);
+        }
+        for key in dirs_to_mark {
+            self.marked_directories.insert(key);
+        }
+        self.selected_entry = first_file_ix;
+    }
+
+    fn deploy_header_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        section: Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.mark_section_entries(section);
+        let entries = self.effective_status_entries();
+        let has_files = !entries.is_empty();
+        let state = phpstorm::EntryMenuState {
+            staged: section == Section::Staged
+                || (has_files && entries.iter().all(|entry| entry.staging.is_fully_staged())),
+            untracked: section == Section::New
+                || (has_files && entries.iter().all(|entry| entry.status.is_created())),
+            deleted: has_files && entries.iter().all(|entry| entry.status.is_deleted()),
+            multiple: true,
+            has_files,
+        };
+
+        self.set_context_menu(
+            self.build_context_menu(state, window, cx),
+            position,
+            None,
+            window,
+            cx,
+        );
+    }
+
     fn deploy_entry_context_menu(
         &mut self,
         position: Point<Pixels>,
@@ -9343,13 +9418,15 @@ impl GitPanel {
             return;
         }
 
-        let state = phpstorm::EntryMenuState::for_entry(
-            entries
+        let state = phpstorm::EntryMenuState {
+            staged: entries
                 .iter()
                 .all(|entry| entry.staging.is_fully_staged()),
-            entries.iter().all(|entry| entry.status.is_created()),
-            entries.iter().all(|entry| entry.status.is_deleted()),
-        );
+            untracked: entries.iter().all(|entry| entry.status.is_created()),
+            deleted: entries.iter().all(|entry| entry.status.is_deleted()),
+            multiple: entries.len() > 1,
+            has_files: true,
+        };
 
         self.set_context_menu(
             self.build_context_menu(state, window, cx),
@@ -9364,37 +9441,31 @@ impl GitPanel {
         &mut self,
         position: Point<Pixels>,
         target_entry_index: Option<usize>,
-        include_copy_paths: bool,
+        _include_copy_paths: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let has_stash_items = self.stash_entries.entries.len() > 0;
-        let has_tracked_changes = self.has_tracked_changes();
-        let has_staged_changes = self.has_staged_changes();
-        let has_unstaged_changes = self.has_unstaged_changes();
-        let has_new_changes = self.new_count > 0;
-        let has_staged_tracked_changes = target_entry_index
-            .and_then(|entry_index| self.directory_descendants(entry_index))
-            .map_or_else(
-                || self.has_staged_tracked_changes(),
-                |entries| Self::contains_staged_tracked_entry(entries),
-            );
+        let entries = if self.has_marks() {
+            self.effective_status_entries()
+        } else {
+            self.change_entries_by_path().cloned().collect::<Vec<_>>()
+        };
+        let has_files = !entries.is_empty();
+        let state = phpstorm::EntryMenuState {
+            staged: has_files && entries.iter().all(|entry| entry.staging.is_fully_staged()),
+            untracked: has_files && entries.iter().all(|entry| entry.status.is_created()),
+            deleted: has_files && entries.iter().all(|entry| entry.status.is_deleted()),
+            multiple: true,
+            has_files,
+        };
 
-        let context_menu = git_panel_context_menu(
-            has_tracked_changes,
-            has_staged_tracked_changes,
-            has_staged_changes,
-            has_unstaged_changes,
-            has_new_changes,
-            has_stash_items,
-            GitPanelSettings::get_global(cx).group_by,
-            include_copy_paths,
-            self.focus_handle.clone(),
+        self.set_context_menu(
+            self.build_context_menu(state, window, cx),
+            position,
+            target_entry_index,
             window,
             cx,
         );
-
-        self.set_context_menu(context_menu, position, target_entry_index, window, cx);
     }
 
     fn set_context_menu(

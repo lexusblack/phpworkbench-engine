@@ -1145,6 +1145,12 @@
       "delete": ["git::RestoreFile", { "skip_prompt": false }],
       "cmd-backspace": ["git::RestoreFile", { "skip_prompt": true }],
       "cmd-delete": ["git::RestoreFile", { "skip_prompt": true }],
+      "cmd-d": "menu::Confirm",
+      "cmd-alt-z": ["git::RestoreFile", { "skip_prompt": false }],
+      "f4": "git::ViewFile",
+      "cmd-shift-c": "workspace::CopyPath",
+      "cmd-alt-a": "git::StageFile",
+      "cmd-r": "git_panel::Refresh",
     },
   },
   {
