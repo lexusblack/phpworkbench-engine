@@ -69,6 +69,40 @@ pub fn find_jetbrains_global_files(filename: &str) -> Vec<PathBuf> {
     candidates
 }
 
+/// On macOS, inspects the system Keychain metadata for generic passwords under `service`
+/// and extracts the unencrypted `"acct"` (username) attribute without triggering a user prompt.
+pub fn get_keychain_account(service: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("security")
+            .args(&["find-generic-password", "-s", service])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.contains("\"acct\"<blob>=") {
+                if let Some(eq_pos) = line.find("=\"") {
+                    let rest = &line[eq_pos + 2..];
+                    if let Some(end) = rest.find('"') {
+                        let acct = &rest[..end];
+                        if !acct.is_empty() && acct != "<NULL>" {
+                            return Some(acct.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = service;
+    }
+    None
+}
+
 /// Attempts to parse IntelliJ / PhpStorm `.idea/dataSources.xml` (and `.idea/dataSources.local.xml`)
 /// into the JSON format expected by PhpWorkbench's `databases.json`.
 pub fn import_idea_databases(root: &Path) -> Option<Value> {
@@ -150,14 +184,24 @@ pub fn import_idea_databases(root: &Path) -> Option<Value> {
         let (user, ssh, ssh_id) = local_info.get(&uuid).cloned().unwrap_or_default();
         let (driver, host, port, database) = parse_jdbc_url(&jdbc_url);
 
+        let keychain_service = format!("IntelliJ Platform DB \u{2014} {uuid}");
+        let mut resolved_user = user;
+        if resolved_user.is_empty() {
+            if let Some(acct) = get_keychain_account(&keychain_service) {
+                resolved_user = acct;
+            }
+        }
+
         let mut conn = json!({
             "name": name,
             "driver": driver,
             "host": host,
             "port": port,
             "database": database,
-            "user": user,
+            "user": resolved_user,
             "password": "",
+            "keychain_service": keychain_service,
+            "keychain": true,
         });
         if ssh {
             if let Some(id) = ssh_id.as_ref().and_then(|id| ssh_configs.get(id)) {
@@ -220,6 +264,12 @@ fn parse_jdbc_url(url: &str) -> (String, String, u16, String) {
 /// and `.idea/deployment.xml` into the JSON format expected by PhpWorkbench's `deploy.json`.
 pub fn import_idea_servers(root: &Path) -> Option<Value> {
     let idea_dir = root.join(".idea");
+    if !idea_dir.is_dir() {
+        return None;
+    }
+    if !idea_dir.join("deployment.xml").is_file() && !idea_dir.join("webServers.xml").is_file() {
+        return None;
+    }
 
     // 1. Read deployment.xml for default server and project-mapped servers
     let dep_xml_path = idea_dir.join("deployment.xml");
@@ -275,6 +325,19 @@ pub fn import_idea_servers(root: &Path) -> Option<Value> {
                 continue;
             }
 
+            let id_re = Regex::new(r#"id="([^"]+)""#).ok();
+            let server_id = id_re.as_ref().and_then(|r| r.captures(ws_attrs)).map(|c| c[1].to_string());
+
+            let mut user = String::new();
+            let mut keychain_service = None;
+            if let Some(ref id) = server_id {
+                let service = format!("IntelliJ Platform Deployment \u{2014} {id}");
+                if let Some(acct) = get_keychain_account(&service) {
+                    user = acct;
+                }
+                keychain_service = Some(service);
+            }
+
             let web_url = url_re
                 .captures(ws_attrs)
                 .map(|c| c[1].to_string())
@@ -311,21 +374,25 @@ pub fn import_idea_servers(root: &Path) -> Option<Value> {
                 }
             }
 
-            all_servers.insert(
-                name.clone(),
-                json!({
-                    "name": name,
-                    "protocol": protocol,
-                    "host": host,
-                    "port": port,
-                    "user": "",
-                    "remote_root": remote_root,
-                    "local_root": ".",
-                    "web_url": web_url,
-                    "upload_on_save": false,
-                    "exclude": ["vendor/", "node_modules/", ".git/"],
-                }),
-            );
+            let mut s_val = json!({
+                "name": name,
+                "protocol": protocol,
+                "host": host,
+                "port": port,
+                "user": user,
+                "password": "",
+                "remote_root": remote_root,
+                "local_root": ".",
+                "web_url": web_url,
+                "upload_on_save": false,
+                "exclude": ["vendor/", "node_modules/", ".git/"],
+                "keychain": true,
+            });
+            if let Some(svc) = keychain_service {
+                s_val["keychain_service"] = json!(svc);
+            }
+
+            all_servers.insert(name.clone(), s_val);
         }
 
         // If we found the default server or mapped servers in this webServers.xml, no need to check older ones
@@ -530,6 +597,16 @@ mod tests {
             assert!(!servers.is_empty());
             assert_eq!(servers[0]["name"], json!("newdemo"));
             assert_eq!(servers[0]["protocol"], json!("ftps"));
+            assert_eq!(servers[0]["user"], json!("olek_all"));
+            assert_eq!(servers[0]["keychain"], json!(true));
+            assert!(servers[0]["keychain_service"].as_str().unwrap().starts_with("IntelliJ Platform Deployment"));
+
+            let db_res = import_idea_databases(p).expect("import databases");
+            let conns = db_res["connections"].as_array().expect("connections");
+            assert_eq!(conns[0]["name"], json!("newsystem@localhost"));
+            assert_eq!(conns[0]["user"], json!("newsystem"));
+            assert_eq!(conns[0]["keychain"], json!(true));
+            assert!(conns[0]["keychain_service"].as_str().unwrap().starts_with("IntelliJ Platform DB"));
         }
     }
 }

@@ -296,6 +296,8 @@ struct RemoteServer {
     keep_alive_enabled: bool,
     keep_alive_seconds: u32,
     encoding: String,
+    keychain: bool,
+    keychain_service: Option<String>,
     root: PathBuf,
 }
 
@@ -4259,6 +4261,8 @@ struct DataSource {
     ssh_local_port: String,
     excluded_schemas: Vec<String>,
     options: Vec<(String, String)>,
+    keychain: bool,
+    keychain_service: Option<String>,
     root: PathBuf,
 }
 
@@ -4284,6 +4288,8 @@ impl DataSource {
             ssh_local_port: String::new(),
             excluded_schemas: Vec::new(),
             options: Vec::new(),
+            keychain: false,
+            keychain_service: None,
             root,
         }
     }
@@ -4293,7 +4299,7 @@ impl DataSource {
     }
 }
 
-const DATA_SOURCE_MANAGED_KEYS: [&str; 13] = [
+const DATA_SOURCE_MANAGED_KEYS: [&str; 15] = [
     "name",
     "driver",
     "path",
@@ -4307,6 +4313,8 @@ const DATA_SOURCE_MANAGED_KEYS: [&str; 13] = [
     "ssh_tunnel",
     "excluded_schemas",
     "options",
+    "keychain",
+    "keychain_service",
 ];
 
 fn parse_data_source(value: &Value, root: &Path) -> Option<DataSource> {
@@ -4350,6 +4358,8 @@ fn parse_data_source(value: &Value, root: &Path) -> Option<DataSource> {
             _ => String::new(),
         };
     }
+    source.keychain = value.get("keychain").and_then(Value::as_bool).unwrap_or(false);
+    source.keychain_service = string_field(value, "keychain_service");
     source.excluded_schemas = parse_excluded_schemas(value.get("excluded_schemas"));
     let mut options = value
         .get("options")
@@ -4420,6 +4430,12 @@ fn data_source_entry(source: &DataSource) -> Value {
             "password".to_string(),
             Value::String(source.password.clone()),
         );
+    }
+    if source.keychain {
+        entry.insert("keychain".to_string(), Value::Bool(true));
+    }
+    if let Some(ref svc) = source.keychain_service {
+        entry.insert("keychain_service".to_string(), Value::String(svc.clone()));
     }
     if source.read_only {
         entry.insert("read_only".to_string(), Value::Bool(true));
@@ -15627,6 +15643,12 @@ fn deploy_server_entry(server: &RemoteServer) -> Value {
     if !password.is_empty() && !server.password_session {
         entry.insert("password".to_string(), Value::String(password.to_string()));
     }
+    if server.keychain {
+        entry.insert("keychain".to_string(), Value::Bool(true));
+    }
+    if let Some(ref svc) = server.keychain_service {
+        entry.insert("keychain_service".to_string(), Value::String(svc.clone()));
+    }
     let ssh_config = server.ssh_config.as_deref().unwrap_or_default();
     if !ssh_config.is_empty() {
         entry.insert(
@@ -15804,6 +15826,8 @@ fn parse_deploy_server(server: &Value, root: &Path) -> Option<RemoteServer> {
         host: string_field(server, "host"),
         port: port_field(server),
         user: string_field(server, "user"),
+        keychain: server.get("keychain").and_then(Value::as_bool).unwrap_or(false),
+        keychain_service: string_field(server, "keychain_service"),
         root: root.to_path_buf(),
     })
 }
@@ -15954,6 +15978,8 @@ fn blank_server(root: PathBuf) -> RemoteServer {
         keep_alive_enabled: true,
         keep_alive_seconds: ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS,
         encoding: ADVANCED_DEFAULT_ENCODING.to_string(),
+        keychain: false,
+        keychain_service: None,
         root,
     }
 }
@@ -24530,6 +24556,8 @@ mod tests {
                     keep_alive_enabled: true,
                     keep_alive_seconds: ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS,
                     encoding: ADVANCED_DEFAULT_ENCODING.to_string(),
+                    keychain: false,
+                    keychain_service: None,
                     root: root.clone(),
                 },
                 RemoteServer {
@@ -24560,6 +24588,8 @@ mod tests {
                     keep_alive_enabled: true,
                     keep_alive_seconds: ADVANCED_DEFAULT_KEEP_ALIVE_SECONDS,
                     encoding: ADVANCED_DEFAULT_ENCODING.to_string(),
+                    keychain: false,
+                    keychain_service: None,
                     root: root.clone(),
                 },
             ],
