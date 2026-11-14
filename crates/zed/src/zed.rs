@@ -77,7 +77,6 @@ use settings::{
     SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
-use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 
@@ -499,9 +498,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 })
                 .unwrap_or(true)
         });
-
-        let window_handle = window.window_handle();
-        let multi_workspace_handle = cx.entity();
 
         // Threads sidebar disabled (PhpStorm-like single-window layout).
     })
@@ -1409,7 +1405,6 @@ fn open_about_window(cx: &mut App) {
     impl AboutWindow {
         fn new(cx: &mut Context<Self>) -> Self {
             let release_channel = ReleaseChannel::global(cx);
-            let release_channel_name = release_channel.display_name();
             let full_version: SharedString = AppVersion::global(cx).to_string().into();
             let version = option_env!("PHPWORKBENCH_VERSION").unwrap_or("1.0.1");
 
