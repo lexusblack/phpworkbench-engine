@@ -1,3 +1,5 @@
+#![allow(dead_code, unused)]
+
 use anyhow::{Context as _, Result};
 use db::kvp::KeyValueStore;
 use gpui::{

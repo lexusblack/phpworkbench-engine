@@ -1,3 +1,5 @@
+#![allow(dead_code, unused, unused_variables, unused_imports)]
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
