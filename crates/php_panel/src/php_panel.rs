@@ -102,6 +102,22 @@ pub fn resolve_helper_tool(name: &str) -> PathBuf {
     PathBuf::from(exe_name)
 }
 
+pub type MenuReloadCallback = std::sync::Arc<dyn Fn(&mut gpui::App) + Send + Sync>;
+static MENU_RELOAD_CB: std::sync::RwLock<Option<MenuReloadCallback>> = std::sync::RwLock::new(None);
+
+pub fn set_menu_reloader(cb: impl Fn(&mut gpui::App) + Send + Sync + 'static) {
+    if let Ok(mut lock) = MENU_RELOAD_CB.write() {
+        *lock = Some(std::sync::Arc::new(cb));
+    }
+}
+
+pub fn request_reload_menus(cx: &mut gpui::App) {
+    let cb = MENU_RELOAD_CB.read().ok().and_then(|lock| lock.clone());
+    if let Some(cb) = cb {
+        (cb)(cx);
+    }
+}
+
 actions!(
     php_panel,
     [
@@ -117,7 +133,9 @@ actions!(
         SelectNextTab,
         SelectPrevTab,
         FocusNextDialogField,
-        FocusPreviousDialogField
+        FocusPreviousDialogField,
+        ToggleAutomaticUpload,
+        ConvertSchemaFileDialog
     ]
 );
 
@@ -198,6 +216,24 @@ pub struct CompareWithDeployServer {
 pub struct SyncWithDeployServer {
     #[serde(default)]
     pub rel_path: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+/// Uploads all open files in editor tabs to the target deployment server.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct UploadAllOpenFilesToDeployServer {
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+/// Starts an interactive SSH session to a remote server.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = php_panel)]
+#[serde(deny_unknown_fields)]
+pub struct StartSshSession {
     #[serde(default)]
     pub server: Option<String>,
 }
@@ -2016,12 +2052,19 @@ impl DeploymentDialog {
             .map(|server| server.name.clone())
             .or_else(|| names.first().cloned());
         let panel = self.panel.clone();
+        let auto_upload = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.upload_on_save)
+            .unwrap_or(false);
         cx.set_global(DeployShared {
             servers: names,
             active,
+            auto_upload,
             panel,
             root: Some(self.root.clone()),
         });
+        request_reload_menus(cx);
     }
 }
 
@@ -4131,9 +4174,12 @@ pub fn open_deployment_window(root: PathBuf, cx: &mut App) {
     } else {
         None
     };
+    let active = resolve_active_server(configured_active, configured_default, &names);
+    let auto_upload = is_deploy_auto_upload(&root, active.as_deref());
     cx.set_global(DeployShared {
         servers: names.clone(),
-        active: resolve_active_server(configured_active, configured_default, &names),
+        active,
+        auto_upload,
         panel,
         root: Some(root.clone()),
     });
@@ -4202,9 +4248,29 @@ fn dialog_next_number(servers: &[RemoteServer]) -> usize {
     next
 }
 
+pub fn is_deploy_auto_upload(root: &Path, active: Option<&str>) -> bool {
+    let Some(config) = load_deploy_config_for_root(root) else {
+        return false;
+    };
+    let active_name = active
+        .map(str::to_string)
+        .or_else(|| config.get("active").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| config.get("default").and_then(Value::as_str).map(str::to_string));
+    if let Some(servers) = config.get("servers").and_then(Value::as_array) {
+        for s in servers {
+            let name = s.get("name").and_then(Value::as_str);
+            if name == active_name.as_deref() || (active_name.is_none() && true) {
+                return s.get("upload_on_save").and_then(Value::as_bool).unwrap_or(false);
+            }
+        }
+    }
+    false
+}
+
 pub struct DeployShared {
     pub servers: Vec<String>,
     pub active: Option<String>,
+    pub auto_upload: bool,
     pub panel: Option<WeakEntity<PhpPanel>>,
     pub root: Option<PathBuf>,
 }
@@ -11028,6 +11094,105 @@ impl PhpPanel {
                 };
                 open_deployment_window(root, cx);
             });
+            workspace.register_action(|workspace, _: &ToggleAutomaticUpload, _window, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+
+                let config_path = deploy_config_path(&root);
+                let mut config = load_config_object(&config_path).unwrap_or_default();
+                if !config.contains_key("servers") {
+                    if let Some(imported) = load_deploy_config_for_root(&root) {
+                        if let Some(obj) = imported.as_object() {
+                            config = obj.clone();
+                        }
+                    }
+                }
+
+                let active_name = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().active.clone()
+                } else {
+                    None
+                }
+                .or_else(|| config.get("active").and_then(Value::as_str).map(str::to_string))
+                .or_else(|| config.get("default").and_then(Value::as_str).map(str::to_string))
+                .or_else(|| {
+                    config
+                        .get("servers")
+                        .and_then(Value::as_array)
+                        .and_then(|arr| arr.first())
+                        .and_then(|s| s.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+
+                let Some(active_name) = active_name else {
+                    return;
+                };
+
+                let Some(servers) = config.get_mut("servers").and_then(Value::as_array_mut) else {
+                    return;
+                };
+
+                let mut new_auto_upload = false;
+                for server in servers.iter_mut() {
+                    let s_name = server.get("name").and_then(Value::as_str);
+                    if s_name == Some(&active_name) {
+                        let cur = server.get("upload_on_save").and_then(Value::as_bool).unwrap_or(false);
+                        new_auto_upload = !cur;
+                        server["upload_on_save"] = Value::Bool(new_auto_upload);
+                        break;
+                    }
+                }
+
+                let _ = write_config_object(&config_path, &config);
+
+                if cx.has_global::<DeployShared>() {
+                    let shared = cx.global::<DeployShared>();
+                    let servers_list = shared.servers.clone();
+                    let active = shared.active.clone();
+                    let panel = shared.panel.clone();
+                    let root_val = shared.root.clone();
+                    cx.set_global(DeployShared {
+                        servers: servers_list,
+                        active: active.clone(),
+                        auto_upload: new_auto_upload,
+                        panel: panel.clone(),
+                        root: root_val,
+                    });
+
+                    if let Some(panel) = panel.and_then(|p| p.upgrade()) {
+                        panel.update(cx, |panel, cx| {
+                            for s in &mut panel.remote_servers {
+                                if s.name == active_name {
+                                    s.upload_on_save = new_auto_upload;
+                                }
+                            }
+                            panel.saved_message = Some(format!(
+                                "Automatic Upload: {} ({})",
+                                if new_auto_upload { "enabled" } else { "disabled" },
+                                active_name
+                            ));
+                            cx.notify();
+                        });
+                    }
+                }
+
+                request_reload_menus(cx);
+            });
             workspace.register_action(|workspace, _: &OpenDataSourcesDialog, _, cx| {
                 let root = if cx.has_global::<DeployShared>() {
                     cx.global::<DeployShared>().root.clone()
@@ -11225,8 +11390,29 @@ impl PhpPanel {
                     return;
                 };
 
-                let rel_path = action.rel_path.clone().unwrap_or_default();
-                let abs_path = action.abs_path.clone();
+                let (abs_path, rel_path) = if action.abs_path.is_some()
+                    || (!action.rel_path.as_deref().unwrap_or("").is_empty()
+                        && action.rel_path.as_deref() != Some("."))
+                {
+                    (action.abs_path.clone(), action.rel_path.clone().unwrap_or_default())
+                } else if let Some(active_item) = workspace.active_item(cx) {
+                    if let Some(editor) = active_item.act_as::<Editor>(cx) {
+                        if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
+                            let rel = target_abs
+                                .strip_prefix(&root)
+                                .ok()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            (Some(target_abs.to_string_lossy().to_string()), rel)
+                        } else {
+                            (None, String::new())
+                        }
+                    } else {
+                        (None, String::new())
+                    }
+                } else {
+                    (None, String::new())
+                };
                 let root_clone = root.clone();
                 let server_clone = server.clone();
                 let rel_clone = rel_path.clone();
@@ -11312,8 +11498,29 @@ impl PhpPanel {
                     return;
                 };
 
-                let rel_path = action.rel_path.clone().unwrap_or_default();
-                let abs_path = action.abs_path.clone();
+                let (abs_path, rel_path) = if action.abs_path.is_some()
+                    || (!action.rel_path.as_deref().unwrap_or("").is_empty()
+                        && action.rel_path.as_deref() != Some("."))
+                {
+                    (action.abs_path.clone(), action.rel_path.clone().unwrap_or_default())
+                } else if let Some(active_item) = workspace.active_item(cx) {
+                    if let Some(editor) = active_item.act_as::<Editor>(cx) {
+                        if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
+                            let rel = target_abs
+                                .strip_prefix(&root)
+                                .ok()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            (Some(target_abs.to_string_lossy().to_string()), rel)
+                        } else {
+                            (None, String::new())
+                        }
+                    } else {
+                        (None, String::new())
+                    }
+                } else {
+                    (None, String::new())
+                };
                 let root_clone = root.clone();
                 let server_clone = server.clone();
                 let rel_clone = rel_path.clone();
@@ -11387,7 +11594,38 @@ impl PhpPanel {
                     return;
                 };
 
-                let rel_path = action.rel_path.clone().unwrap_or_default();
+                let rel_path = if !action.rel_path.as_deref().unwrap_or("").is_empty() {
+                    action.rel_path.clone().unwrap_or_default()
+                } else if let Some(active_item) = workspace.active_item(cx) {
+                    if let Some(editor) = active_item.act_as::<Editor>(cx) {
+                        if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
+                            target_abs
+                                .strip_prefix(&root)
+                                .ok()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+
+                if rel_path.is_empty() {
+                    if cx.has_global::<DeployShared>() {
+                        if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
+                            panel.update(cx, |panel, cx| {
+                                panel.saved_message = Some("No active file to compare with deployed version".to_string());
+                                cx.notify();
+                            });
+                        }
+                    }
+                    return;
+                }
+
                 let pristine_path = remote_file_banner::remote_pristine_root()
                     .join(&server)
                     .join(rel_path.trim_start_matches('/'));
@@ -11477,6 +11715,197 @@ impl PhpPanel {
                         panel.update(cx, |panel, cx| {
                             panel.sync_server(server, root, cx);
                         }).log_err();
+                    }
+                }
+            });
+            workspace.register_action(|workspace, action: &UploadAllOpenFilesToDeployServer, _window, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+
+                let server = action.server.clone().or_else(|| {
+                    if cx.has_global::<DeployShared>() {
+                        let shared = cx.global::<DeployShared>();
+                        shared.active.clone().or_else(|| shared.servers.first().cloned())
+                    } else {
+                        None
+                    }
+                });
+                let Some(server) = server else {
+                    return;
+                };
+
+                let mut open_files = Vec::new();
+                let mut editors = Vec::new();
+                for pane in workspace.panes() {
+                    for item in pane.read(cx).items() {
+                        if let Some(editor) = item.act_as::<Editor>(cx) {
+                            editors.push(editor);
+                        }
+                    }
+                }
+
+                for editor in editors {
+                    if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
+                        if let Ok(rel) = target_abs.strip_prefix(&root) {
+                            let rel_str = rel.to_string_lossy().to_string();
+                            if !open_files.iter().any(|(_, r)| r == &rel_str) {
+                                open_files.push((target_abs.to_string_lossy().to_string(), rel_str));
+                            }
+                        }
+                    }
+                }
+
+                if open_files.is_empty() {
+                    if cx.has_global::<DeployShared>() {
+                        if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
+                            panel.update(cx, |panel, cx| {
+                                panel.saved_message = Some("No open files to upload".to_string());
+                                cx.notify();
+                            });
+                        }
+                    }
+                    return;
+                }
+
+                let root_clone = root.clone();
+                let server_clone = server.clone();
+                let count = open_files.len();
+
+                let task: Task<Result<String, String>> = cx.background_spawn(async move {
+                    let mut uploaded = 0;
+                    let mut errors = Vec::new();
+                    for (abs, rel) in open_files {
+                        let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+                        cmd.current_dir(&root_clone)
+                            .arg("upload")
+                            .arg("--server")
+                            .arg(&server_clone)
+                            .arg("--path")
+                            .arg(&rel)
+                            .arg("--from")
+                            .arg(&abs);
+                        match cmd.output() {
+                            Ok(out) if out.status.success() => uploaded += 1,
+                            Ok(out) => {
+                                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                                errors.push(format!("{rel}: {err}"));
+                            }
+                            Err(e) => errors.push(format!("{rel}: {e}")),
+                        }
+                    }
+                    if errors.is_empty() {
+                        Ok(format!("uploaded {uploaded} open file(s) to {server_clone}"))
+                    } else {
+                        Err(format!("uploaded {uploaded}/{count} files, errors: {}", errors.join("; ")))
+                    }
+                });
+
+                cx.spawn(async move |workspace, cx| {
+                    let result = task.await;
+                    workspace.update(cx, |_workspace, cx| {
+                        if cx.has_global::<DeployShared>() {
+                            if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
+                                panel.update(cx, |panel, cx| {
+                                    match result {
+                                        Ok(msg) => panel.saved_message = Some(msg),
+                                        Err(err) => panel.saved_message = Some(err),
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        }
+                    }).log_err();
+                }).detach();
+            });
+            workspace.register_action(|workspace, action: &StartSshSession, _window, cx| {
+                let root = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().root.clone()
+                } else {
+                    None
+                };
+                let root = root.or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                });
+                let Some(root) = root else {
+                    return;
+                };
+
+                let server_name = action.server.clone().or_else(|| {
+                    if cx.has_global::<DeployShared>() {
+                        let shared = cx.global::<DeployShared>();
+                        shared.active.clone().or_else(|| shared.servers.first().cloned())
+                    } else {
+                        None
+                    }
+                });
+                let Some(server_name) = server_name else {
+                    return;
+                };
+
+                let servers = load_deploy_servers(&root);
+                let target_server = servers.into_iter().find(|s| s.name == server_name);
+                let (host, port, user) = if let Some(s) = target_server {
+                    let h = s.host.unwrap_or_else(|| "127.0.0.1".to_string());
+                    let p = s.port.and_then(|p| p.parse::<u16>().ok()).unwrap_or(22);
+                    let u = s.user;
+                    (h, p, u)
+                } else {
+                    ("127.0.0.1".to_string(), 22, None)
+                };
+
+                let target = if let Some(u) = user.filter(|u| !u.is_empty()) {
+                    format!("{}@{}", u, host)
+                } else {
+                    host
+                };
+                let p_arg = if port != 22 && port != 0 {
+                    format!(" -p {}", port)
+                } else {
+                    String::new()
+                };
+                let ssh_cmd = format!("ssh{}{}", p_arg, target);
+
+                #[cfg(target_os = "macos")]
+                {
+                    let script = format!("tell application \"Terminal\" to do script \"{}\"", ssh_cmd);
+                    let _ = std::process::Command::new("osascript").args(["-e", &script]).spawn();
+                }
+
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
+                        panel.update(cx, |panel, cx| {
+                            panel.saved_message = Some(format!("Started SSH session for {}", server_name));
+                            cx.notify();
+                        });
+                    }
+                }
+            });
+            workspace.register_action(|workspace, _: &ConvertSchemaFileDialog, _window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
+                        panel.update(cx, |panel, cx| {
+                            panel.saved_message = Some("Convert Schema File: RELAX NG / W3C XML Schema conversion ready".to_string());
+                            cx.notify();
+                        });
                     }
                 }
             });
@@ -11770,9 +12199,18 @@ impl PhpPanel {
             .map(str::to_string);
         self.active_server = resolve_active_server(configured_active, configured_default, &names);
 
+        let auto_upload = self
+            .active_server
+            .as_deref()
+            .and_then(|name| self.remote_servers.iter().find(|s| s.name == name))
+            .or_else(|| self.remote_servers.first())
+            .map(|s| s.upload_on_save)
+            .unwrap_or(false);
+
         cx.set_global(DeployShared {
             servers: names.clone(),
             active: self.active_server.clone(),
+            auto_upload,
             panel: Some(cx.weak_entity()),
             root: self
                 .remote_servers
@@ -14890,9 +15328,17 @@ impl PhpPanel {
         self.remote_current_path.clear();
         self.remote_selected_file = None;
         self.server_menu_open = false;
+        let auto_upload = self
+            .active_server
+            .as_deref()
+            .and_then(|name| self.remote_servers.iter().find(|s| s.name == name))
+            .or_else(|| self.remote_servers.first())
+            .map(|s| s.upload_on_save)
+            .unwrap_or(false);
         cx.set_global(DeployShared {
             servers: names.clone(),
             active: self.active_server.clone(),
+            auto_upload,
             panel: Some(cx.weak_entity()),
             root: Some(root),
         });

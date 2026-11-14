@@ -400,45 +400,175 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
         Menu {
             name: "Tools".into(),
             disabled: false,
-            items: vec![
-                MenuItem::submenu(Menu::new("Deployment").items([
-                    MenuItem::action(
-                        "Configuration…",
-                        php_panel::OpenDeploymentDialog,
-                    ),
-                    MenuItem::action("Browse Remote Host", php_panel::BrowseRemoteHost),
-                    MenuItem::action("Upload to Default Server", php_panel::OpenDeploymentDialog),
-                    MenuItem::action("Download from Default Server", php_panel::OpenDeploymentDialog),
-                    MenuItem::action("Options…", php_panel::OpenDeploymentDialog),
-                ])),
-                MenuItem::submenu(Menu::new("HTTP Client").items([
+            items: {
+                let (deploy_servers, _default_server, is_auto_upload) = if cx.has_global::<php_panel::DeployShared>() {
+                    let shared = cx.global::<php_panel::DeployShared>();
+                    (shared.servers.clone(), shared.active.clone(), shared.auto_upload)
+                } else {
+                    (Vec::new(), None, false)
+                };
+
+                let mut items = Vec::new();
+
+                items.push(MenuItem::submenu(Menu::new("Deployment").items({
+                    let mut dep_items = vec![
+                        MenuItem::action("Upload to Default Server", php_panel::UploadToDeployServer::default()),
+                    ];
+
+                    if !deploy_servers.is_empty() {
+                        let mut upload_to_items = Vec::new();
+                        for s in &deploy_servers {
+                            upload_to_items.push(MenuItem::action(
+                                s.clone(),
+                                php_panel::UploadToDeployServer {
+                                    server: Some(s.clone()),
+                                    ..Default::default()
+                                },
+                            ));
+                        }
+                        dep_items.push(MenuItem::submenu(Menu::new("Upload to…").items(upload_to_items)));
+                    } else {
+                        dep_items.push(MenuItem::action("Upload to…", php_panel::OpenDeploymentDialog));
+                    }
+
+                    dep_items.push(MenuItem::action(
+                        "Upload All Open Files to Default Server",
+                        php_panel::UploadAllOpenFilesToDeployServer::default(),
+                    ));
+
+                    if !deploy_servers.is_empty() {
+                        let mut upload_all_items = Vec::new();
+                        for s in &deploy_servers {
+                            upload_all_items.push(MenuItem::action(
+                                s.clone(),
+                                php_panel::UploadAllOpenFilesToDeployServer {
+                                    server: Some(s.clone()),
+                                },
+                            ));
+                        }
+                        dep_items.push(MenuItem::submenu(Menu::new("Upload All Open Files to…").items(upload_all_items)));
+                    }
+
+                    dep_items.push(MenuItem::action("Download from Default Server", php_panel::DownloadFromDeployServer::default()));
+
+                    if !deploy_servers.is_empty() {
+                        let mut dl_items = Vec::new();
+                        for s in &deploy_servers {
+                            dl_items.push(MenuItem::action(
+                                s.clone(),
+                                php_panel::DownloadFromDeployServer {
+                                    server: Some(s.clone()),
+                                    ..Default::default()
+                                },
+                            ));
+                        }
+                        dep_items.push(MenuItem::submenu(Menu::new("Download from…").items(dl_items)));
+                    } else {
+                        dep_items.push(MenuItem::action("Download from…", php_panel::OpenDeploymentDialog));
+                    }
+
+                    dep_items.push(MenuItem::separator());
+
+                    dep_items.push(MenuItem::action(
+                        "Compare Local File with Deployed Version",
+                        php_panel::CompareWithDeployServer::default(),
+                    ));
+
+                    if !deploy_servers.is_empty() {
+                        let mut cmp_items = Vec::new();
+                        for s in &deploy_servers {
+                            cmp_items.push(MenuItem::action(
+                                s.clone(),
+                                php_panel::CompareWithDeployServer {
+                                    server: Some(s.clone()),
+                                    ..Default::default()
+                                },
+                            ));
+                        }
+                        dep_items.push(MenuItem::submenu(Menu::new("Compare with Deployed to…").items(cmp_items)));
+                    }
+
+                    dep_items.push(MenuItem::action(
+                        "Sync Local Subtree with Deployed",
+                        php_panel::SyncWithDeployServer::default(),
+                    ));
+
+                    if !deploy_servers.is_empty() {
+                        let mut sync_items = Vec::new();
+                        for s in &deploy_servers {
+                            sync_items.push(MenuItem::action(
+                                s.clone(),
+                                php_panel::SyncWithDeployServer {
+                                    server: Some(s.clone()),
+                                    ..Default::default()
+                                },
+                            ));
+                        }
+                        dep_items.push(MenuItem::submenu(Menu::new("Sync with Deployed to…").items(sync_items)));
+                    }
+
+                    dep_items.push(MenuItem::separator());
+                    dep_items.push(MenuItem::action("Configuration…", php_panel::OpenDeploymentDialog));
+                    dep_items.push(MenuItem::action("Options…", php_panel::OpenDeploymentDialog));
+                    dep_items.push(MenuItem::action("Automatic Upload", php_panel::ToggleAutomaticUpload).checked(is_auto_upload));
+                    dep_items.push(MenuItem::separator());
+                    dep_items.push(MenuItem::action("Browse Remote Host", php_panel::BrowseRemoteHost));
+
+                    dep_items
+                })));
+
+                if !deploy_servers.is_empty() {
+                    let mut ssh_items = Vec::new();
+                    for s in &deploy_servers {
+                        ssh_items.push(MenuItem::action(
+                            s.clone(),
+                            php_panel::StartSshSession {
+                                server: Some(s.clone()),
+                            },
+                        ));
+                    }
+                    ssh_items.push(MenuItem::separator());
+                    ssh_items.push(MenuItem::action("SSH Configurations…", php_panel::OpenSshConfigsDialog));
+                    items.push(MenuItem::submenu(Menu::new("Start SSH Session…").items(ssh_items)));
+                } else {
+                    items.push(MenuItem::action("Start SSH Session…", php_panel::StartSshSession::default()));
+                }
+
+                items.push(MenuItem::submenu(Menu::new("HTTP Client").items([
                     MenuItem::action("Open HTTP Client", php_panel::OpenHttpClient),
                     MenuItem::action("Create Request in HTTP Client", php_panel::CreateHttpRequest),
                     MenuItem::action("Show HTTP Requests History", php_panel::OpenHttpClient),
                     MenuItem::action("Convert cURL to HTTP Request", php_panel::CreateHttpRequest),
-                ])),
-                MenuItem::submenu(Menu::new("Composer").items([
+                ])));
+                items.push(MenuItem::submenu(Menu::new("Composer").items([
                     MenuItem::action("Init Composer…", php_panel::RunComposer),
                     MenuItem::action("Install Dependencies", php_panel::RunComposer),
                     MenuItem::action("Update Dependencies", php_panel::RunComposer),
                     MenuItem::action("Diagnose", php_panel::RunComposer),
-                ])),
-                MenuItem::submenu(Menu::new("Database").items([
+                ])));
+                items.push(MenuItem::submenu(Menu::new("Database").items([
                     MenuItem::action(
                         "Data Sources and Drivers…",
                         php_panel::OpenDataSourcesDialog,
                     ),
                     MenuItem::action("Jump to Console", php_panel::OpenDatabaseConsole),
-                ])),
-                MenuItem::action(
+                ])));
+                items.push(MenuItem::action(
                     "SSH Configurations…",
                     php_panel::OpenSshConfigsDialog,
-                ),
-                MenuItem::separator(),
-                MenuItem::action("Tasks & Contexts", zed_actions::OpenProjectTasks),
+                ));
+                items.push(MenuItem::submenu(Menu::new("XML Actions").items([
+                    MenuItem::action("Convert Schema File…", php_panel::ConvertSchemaFileDialog),
+                    MenuItem::action("Generate DTD from XML File…", php_panel::ConvertSchemaFileDialog),
+                    MenuItem::action("Validate XML…", php_panel::ConvertSchemaFileDialog),
+                ])));
+                items.push(MenuItem::separator());
+                items.push(MenuItem::action("Tasks & Contexts", zed_actions::OpenProjectTasks));
                 #[cfg(not(target_os = "windows"))]
-                MenuItem::action("Create Command Line Launcher…", install_cli::InstallCliBinary),
-            ],
+                items.push(MenuItem::action("Create Command Line Launcher…", install_cli::InstallCliBinary));
+
+                items
+            },
         },
 
         // =========================================================================

@@ -275,7 +275,43 @@ pub fn import_idea_servers(root: &Path) -> Option<Value> {
     let dep_xml_path = idea_dir.join("deployment.xml");
     let dep_xml = std::fs::read_to_string(&dep_xml_path).unwrap_or_default();
     let default_server_re = Regex::new(r#"serverName="([^"]+)""#).ok()?;
-    let default_server = default_server_re.captures(&dep_xml).map(|c| c[1].to_string());
+    let mut default_server = default_server_re.captures(&dep_xml).map(|c| c[1].to_string());
+
+    // Also collect all deployment XML contents (including backups) to detect autoUpload & fallback default_server
+    let mut dep_xml_contents = vec![dep_xml.clone()];
+    if let Ok(entries) = std::fs::read_dir(&idea_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with("deployment.xml") && file_name != "deployment.xml" {
+                if let Ok(bak_content) = std::fs::read_to_string(entry.path()) {
+                    dep_xml_contents.push(bak_content);
+                }
+            }
+        }
+    }
+
+    if default_server.is_none() {
+        for content in &dep_xml_contents {
+            if let Some(cap) = default_server_re.captures(content) {
+                default_server = Some(cap[1].to_string());
+                break;
+            }
+        }
+    }
+
+    let auto_upload_re = Regex::new(r#"autoUpload="([^"]+)""#).ok();
+    let mut is_auto_upload = false;
+    for content in &dep_xml_contents {
+        if let Some(ref re) = auto_upload_re {
+            if let Some(cap) = re.captures(content) {
+                let mode = &cap[1];
+                if mode == "Always" || mode == "OnExplicitSaveOnly" {
+                    is_auto_upload = true;
+                    break;
+                }
+            }
+        }
+    }
 
     let paths_re = Regex::new(r#"<paths\s+name="([^"]+)""#).ok()?;
     let mut project_servers = Vec::new();
@@ -374,6 +410,8 @@ pub fn import_idea_servers(root: &Path) -> Option<Value> {
                 }
             }
 
+            let is_default = default_server.as_deref() == Some(&name);
+            let upload_on_save = is_default && is_auto_upload;
             let mut s_val = json!({
                 "name": name,
                 "protocol": protocol,
@@ -384,7 +422,7 @@ pub fn import_idea_servers(root: &Path) -> Option<Value> {
                 "remote_root": remote_root,
                 "local_root": ".",
                 "web_url": web_url,
-                "upload_on_save": false,
+                "upload_on_save": upload_on_save,
                 "exclude": ["vendor/", "node_modules/", ".git/"],
                 "keychain": true,
             });

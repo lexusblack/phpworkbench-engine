@@ -857,6 +857,10 @@ fn main() {
 
         let menus = app_menus(cx);
         cx.set_menus(menus);
+        php_panel::set_menu_reloader(|cx| {
+            let menus = app_menus(cx);
+            cx.set_menus(menus);
+        });
 
         if let Some(mut crash_handler) = crash_handler {
             let crash_handler2 = block_on(poll_once(&mut crash_handler));
