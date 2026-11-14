@@ -1560,6 +1560,41 @@ impl DisplaySnapshot {
         self.inlay_snapshot().inlay_hint_at_offset(inlay_offset)
     }
 
+    pub fn inlay_color_at(&self, point: DisplayPoint) -> Option<(&Inlay, usize)> {
+        if point.row() > self.max_point().row()
+            || self.is_block_line(point.row())
+            || point.column() >= self.line_len(point.row())
+        {
+            return None;
+        }
+        let wrap_row = self
+            .block_snapshot
+            .to_wrap_point(BlockPoint::new(BlockRow(point.row().0), 0), Bias::Left)
+            .row();
+        let wrap_indent = wrap_row
+            .0
+            .checked_sub(1)
+            .and_then(|previous_row| self.wrap_snapshot().soft_wrap_indent(WrapRow(previous_row)));
+        if wrap_indent.is_some_and(|indent| point.column() < indent) {
+            return None;
+        }
+        let fold_point = self.display_point_to_fold_point(point, Bias::Left);
+        if self
+            .fold_snapshot()
+            .placeholder_range_at(fold_point)
+            .is_some()
+        {
+            return None;
+        }
+        let inlay_offset = self
+            .inlay_snapshot()
+            .to_offset(fold_point.to_inlay_point(self.fold_snapshot()));
+        if self.fold_snapshot().is_inlay_offset_folded(inlay_offset) {
+            return None;
+        }
+        self.inlay_snapshot().inlay_color_at_offset(inlay_offset)
+    }
+
     pub fn is_inlay_visible(&self, inlay_id: InlayId, position: Anchor) -> bool {
         if !position.is_valid(self.buffer_snapshot()) {
             return false;

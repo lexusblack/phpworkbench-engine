@@ -618,6 +618,27 @@ impl EditorElement {
             return;
         }
 
+        if let Some(picker) = &editor.active_color_picker {
+            if let Some(bounds) = picker.bounds {
+                if bounds.contains(&event.position) {
+                    return;
+                }
+            }
+            editor.hide_color_picker(cx);
+        }
+
+        let color_glyph = text_hitbox
+            .is_hovered(window)
+            .then(|| position_map.inlay_color_glyph_for_position(event.position))
+            .flatten();
+        if let Some(color_glyph) = color_glyph {
+            if let Some((inlay, _)) = position_map.snapshot.inlay_color_at(color_glyph) {
+                editor.open_color_picker_for_inlay(inlay.id, Some(event.position), window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         let hint_glyph = text_hitbox
             .is_hovered(window)
             .then(|| position_map.inlay_hint_glyph_for_position(event.position))

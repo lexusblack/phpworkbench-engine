@@ -109,6 +109,34 @@ impl LspColorData {
         true
     }
 
+    pub fn find_color_for_inlay(&self, inlay_id: InlayId) -> Option<(Range<Anchor>, DocumentColor)> {
+        for buffer_colors in self.buffer_colors.values() {
+            if let Some(&idx) = buffer_colors.inlay_colors.get(&inlay_id) {
+                if let Some((range, color, _)) = buffer_colors.colors.get(idx) {
+                    return Some((range.clone(), color.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn find_color_at_anchor(
+        &self,
+        anchor: &Anchor,
+        snapshot: &multi_buffer::MultiBufferSnapshot,
+    ) -> Option<(Range<Anchor>, DocumentColor)> {
+        for buffer_colors in self.buffer_colors.values() {
+            for (range, color, _) in &buffer_colors.colors {
+                if range.start.cmp(anchor, snapshot).is_le()
+                    && range.end.cmp(anchor, snapshot).is_ge()
+                {
+                    return Some((range.clone(), color.clone()));
+                }
+            }
+        }
+        None
+    }
+
     pub fn editor_display_highlights(
         &self,
         snapshot: &EditorSnapshot,

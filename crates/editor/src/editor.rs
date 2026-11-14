@@ -16,6 +16,7 @@ pub mod blink_manager;
 mod bracket_colorization;
 mod clangd_ext;
 pub mod code_context_menus;
+pub mod color_picker;
 mod code_lens;
 pub mod display_map;
 mod document_colors;
@@ -1052,6 +1053,7 @@ pub struct Editor {
     completion_tasks: Vec<(CompletionId, Task<()>)>,
     inline_blame_popover: Option<InlineBlamePopover>,
     inline_blame_popover_show_task: Option<Task<()>>,
+    pub(crate) active_color_picker: Option<color_picker::ColorPickerState>,
     signature_help_state: SignatureHelpState,
     auto_signature_help: Option<bool>,
     find_all_references_task_sources: Vec<Anchor>,
@@ -2438,6 +2440,7 @@ impl Editor {
             completion_tasks: Vec::new(),
             inline_blame_popover: None,
             inline_blame_popover_show_task: None,
+            active_color_picker: None,
             signature_help_state: SignatureHelpState::default(),
             auto_signature_help: None,
             find_all_references_task_sources: Vec::new(),
@@ -3575,6 +3578,7 @@ impl Editor {
         dismissed |= self.take_rename(false, window, cx).is_some();
         dismissed |= self.take_inline_input(window, cx).is_some();
         dismissed |= self.hide_blame_popover(true, cx);
+        dismissed |= self.hide_color_picker(cx);
         dismissed |= hide_hover(self, cx);
         dismissed |= self.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
         dismissed |= self.hide_context_menu(window, cx).is_some();
@@ -9226,6 +9230,162 @@ impl Editor {
                 cx,
             );
         });
+    }
+
+    pub fn open_color_picker_for_inlay(
+        &mut self,
+        inlay_id: InlayId,
+        position: Option<gpui::Point<Pixels>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(colors) = &self.colors else { return };
+        if let Some((range, doc_color)) = colors.find_color_for_inlay(inlay_id) {
+            let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
+            let original_text = buffer_snapshot.text_for_range(range.clone()).collect::<String>();
+            let rgba = gpui::Rgba {
+                r: doc_color.color.red,
+                g: doc_color.color.green,
+                b: doc_color.color.blue,
+                a: doc_color.color.alpha,
+            };
+            let hsla = Hsla::from(rgba);
+            let format = color_picker::parse_color_str(&original_text)
+                .map(|(_, f)| f)
+                .unwrap_or(color_picker::ColorFormat::Hex6);
+            let pos = position.or(self.pixel_position_of_newest_cursor);
+            self.active_color_picker = Some(color_picker::ColorPickerState::new(
+                range.clone(),
+                original_text,
+                hsla,
+                format,
+                range.start,
+                pos,
+            ));
+            cx.notify();
+        }
+    }
+
+    pub fn pick_color(
+        &mut self,
+        _: &PickColor,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cursor_anchor = self.selections.newest_anchor().head();
+        let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
+
+        // 1. Check LSP colors
+        if let Some(colors) = &self.colors {
+            if let Some((range, doc_color)) = colors.find_color_at_anchor(&cursor_anchor, &buffer_snapshot) {
+                let original_text = buffer_snapshot.text_for_range(range.clone()).collect::<String>();
+                let rgba = gpui::Rgba {
+                    r: doc_color.color.red,
+                    g: doc_color.color.green,
+                    b: doc_color.color.blue,
+                    a: doc_color.color.alpha,
+                };
+                let format = color_picker::parse_color_str(&original_text)
+                    .map(|(_, f)| f)
+                    .unwrap_or(color_picker::ColorFormat::Hex6);
+                let pos = self.pixel_position_of_newest_cursor;
+                self.active_color_picker = Some(color_picker::ColorPickerState::new(
+                    range.clone(),
+                    original_text,
+                    Hsla::from(rgba),
+                    format,
+                    range.start,
+                    pos,
+                ));
+                cx.notify();
+                return;
+            }
+        }
+
+        // 2. Check selection
+        let selection = self.selections.newest_anchor();
+        let selection_text = buffer_snapshot.text_for_range(selection.range()).collect::<String>();
+        if let Some((hsla, format)) = color_picker::parse_color_str(&selection_text) {
+            let pos = self.pixel_position_of_newest_cursor;
+            self.active_color_picker = Some(color_picker::ColorPickerState::new(
+                selection.range(),
+                selection_text,
+                hsla,
+                format,
+                selection.start,
+                pos,
+            ));
+            cx.notify();
+            return;
+        }
+
+        // 3. Fallback to token around offset
+        let offset = cursor_anchor.to_offset(&buffer_snapshot);
+        if let Some((range, text, hsla, format)) = color_picker::find_color_around_offset(&buffer_snapshot, offset) {
+            let pos = self.pixel_position_of_newest_cursor;
+            self.active_color_picker = Some(color_picker::ColorPickerState::new(
+                range.clone(),
+                text,
+                hsla,
+                format,
+                range.start,
+                pos,
+            ));
+            cx.notify();
+        }
+    }
+
+    pub fn hide_color_picker(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.active_color_picker.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn apply_color_picker_edit(
+        &mut self,
+        new_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = &mut self.active_color_picker {
+            let range = state.range.clone();
+            self.transact(window, cx, |this, _window, cx| {
+                this.buffer.update(cx, |buffer, cx| {
+                    buffer.edit([(range.clone(), new_text.clone())], None, cx);
+                    let snapshot = buffer.snapshot(cx);
+                    let start_offset = range.start.to_offset(&snapshot);
+                    let end_offset = multi_buffer::MultiBufferOffset(start_offset.0 + new_text.len());
+                    let new_end = snapshot.anchor_after(end_offset);
+                    if let Some(state) = &mut this.active_color_picker {
+                        state.range = range.start..new_end;
+                    }
+                });
+            });
+            cx.notify();
+        }
+    }
+
+    pub fn cycle_color_picker_format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.active_color_picker {
+            state.format = match state.format {
+                color_picker::ColorFormat::Hex6 | color_picker::ColorFormat::Hex8 => color_picker::ColorFormat::Rgb,
+                color_picker::ColorFormat::Rgb | color_picker::ColorFormat::Rgba => color_picker::ColorFormat::Hsl,
+                color_picker::ColorFormat::Hsl | color_picker::ColorFormat::Hsla => color_picker::ColorFormat::Hex6,
+            };
+            let new_text = state.format_current_color();
+            self.apply_color_picker_edit(new_text, window, cx);
+        }
+    }
+
+    pub fn set_color_picker_color(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.active_color_picker {
+            state.current_color = color;
+            let new_text = state.format_current_color();
+            self.apply_color_picker_edit(new_text, window, cx);
+        }
     }
 
     pub fn open_selections_in_multibuffer(

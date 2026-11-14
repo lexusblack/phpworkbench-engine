@@ -780,6 +780,7 @@ impl EditorElement {
             register_action(editor, window, Editor::insert_uuid_v4);
             register_action(editor, window, Editor::insert_uuid_v7);
             register_action(editor, window, Editor::align_selections);
+            register_action(editor, window, Editor::pick_color);
             if editor.read(cx).enable_wrap_selections_in_tag(cx) {
                 register_action(editor, window, Editor::wrap_selections_in_tag);
             }
@@ -2312,6 +2313,53 @@ impl EditorElement {
 
             window.defer_draw(element, origin, 2, None);
         }
+    }
+
+    fn layout_color_picker(
+        &mut self,
+        _editor_snapshot: &EditorSnapshot,
+        text_hitbox: &Hitbox,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (picker_state, editor_entity) = self.editor.read_with(cx, |editor, _| {
+            (editor.active_color_picker.clone(), self.editor.downgrade())
+        });
+        let Some(picker_state) = picker_state else { return };
+
+        let mut element = crate::color_picker::render_color_picker(&picker_state, editor_entity, cx).into_any_element();
+        let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let overall_height = size.height + HOVER_POPOVER_GAP;
+
+        let target_point = picker_state.target_position.unwrap_or_else(|| {
+            point(text_hitbox.origin.x + px(100.0), text_hitbox.origin.y + px(100.0))
+        });
+
+        let popover_origin = if target_point.y > overall_height {
+            point(target_point.x, target_point.y - size.height - px(4.0))
+        } else {
+            point(target_point.x, target_point.y + line_height + px(4.0))
+        };
+
+        let horizontal_offset = (text_hitbox.top_right().x
+            - POPOVER_RIGHT_OFFSET
+            - (popover_origin.x + size.width))
+            .min(Pixels::ZERO);
+
+        let origin = point(
+            (popover_origin.x + horizontal_offset).max(text_hitbox.origin.x),
+            popover_origin.y,
+        );
+        let popover_bounds = Bounds::new(origin, size);
+
+        self.editor.update(cx, |editor, _| {
+            if let Some(state) = &mut editor.active_color_picker {
+                state.bounds = Some(popover_bounds);
+            }
+        });
+
+        window.defer_draw(element, origin, 2, None);
     }
 
     fn layout_blame_entries(
@@ -9789,6 +9837,7 @@ impl Element for EditorElement {
                         );
 
                         self.layout_blame_popover(&snapshot, &hitbox, line_height, window, cx);
+                        self.layout_color_picker(&snapshot, &hitbox, line_height, window, cx);
                     }
 
                     let mouse_context_menu = self.layout_mouse_context_menu(
@@ -10788,6 +10837,26 @@ impl PositionMap {
         }
         let glyph = DisplayPoint::new(DisplayRow(row), line.index_for_x(x)? as u32);
         self.snapshot.inlay_hint_at(glyph).map(|_| glyph)
+    }
+
+    pub(crate) fn inlay_color_glyph_for_position(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> Option<DisplayPoint> {
+        let position = position - self.content_origin;
+        if position.y < Pixels::ZERO {
+            return None;
+        }
+        let row = ((position.y / self.line_height) as f64 + self.scroll_position.y) as u32;
+        let line_index = row.checked_sub(self.visible_row_range.start.0)?;
+        let line = self.line_layouts.get(line_index as usize)?;
+        let x = position.x + (self.scroll_position.x as f32 * self.em_layout_width)
+            - line.alignment_offset(self.text_align, self.content_width);
+        if x < Pixels::ZERO {
+            return None;
+        }
+        let glyph = DisplayPoint::new(DisplayRow(row), line.index_for_x(x)? as u32);
+        self.snapshot.inlay_color_at(glyph).map(|_| glyph)
     }
 
     pub(crate) fn point_for_position(&self, position: gpui::Point<Pixels>) -> PointForPosition {

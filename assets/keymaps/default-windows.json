@@ -58,6 +58,7 @@
     "context": "Editor",
     "use_key_equivalents": true,
     "bindings": {
+      "ctrl-shift-c": "editor::PickColor",
       "escape": "editor::Cancel",
       "shift-backspace": "editor::Backspace",
       "backspace": "editor::Backspace",

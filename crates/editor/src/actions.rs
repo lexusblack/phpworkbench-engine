@@ -493,6 +493,8 @@ actions!(
         ConvertToBase64,
         /// Base64-decodes the selected text or word under cursor.
         ConvertFromBase64,
+        /// Opens the interactive color picker for color under cursor or swatch.
+        PickColor,
         /// Copies selected text to the clipboard.
         Copy,
         /// Copies selected text to the clipboard with leading/trailing whitespace trimmed.

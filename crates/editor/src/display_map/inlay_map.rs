@@ -380,12 +380,14 @@ impl<'a> Iterator for InlayChunks<'a> {
                                     div()
                                         .relative()
                                         .size_3p5()
+                                        .cursor_pointer()
                                         .child(
                                             div()
                                                 .absolute()
                                                 .right_1()
                                                 .size_3()
                                                 .border_1()
+                                                .rounded_xs()
                                                 .border_color(
                                                     if cx.theme().appearance().is_light() {
                                                         gpui::black().opacity(0.5)
@@ -1325,6 +1327,18 @@ impl InlaySnapshot {
                 .find::<InlayOffset, _>((), &offset, Bias::Right);
         match transform {
             Some(Transform::Inlay(inlay)) if matches!(inlay.id, InlayId::Hint(_)) => {
+                Some((inlay, offset - start))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn inlay_color_at_offset(&self, offset: InlayOffset) -> Option<(&Inlay, usize)> {
+        let (start, _, transform) =
+            self.transforms
+                .find::<InlayOffset, _>((), &offset, Bias::Right);
+        match transform {
+            Some(Transform::Inlay(inlay)) if matches!(inlay.id, InlayId::Color(_)) => {
                 Some((inlay, offset - start))
             }
             _ => None,
