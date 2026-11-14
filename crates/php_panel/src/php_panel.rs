@@ -23593,7 +23593,15 @@ fn compose_http_request(
 }
 
 fn http_settings_path(root: &Path) -> PathBuf {
-    root.join(".zed/http-settings.json")
+    let pw = root.join(".phpworkbench/http-settings.json");
+    if pw.is_file() {
+        return pw;
+    }
+    let zed = root.join(".zed/http-settings.json");
+    if zed.is_file() {
+        return zed;
+    }
+    pw
 }
 
 fn load_http_settings(root: &Path) -> HttpSettingsFile {
@@ -23614,7 +23622,15 @@ fn save_http_settings(root: &Path, settings: &HttpSettingsFile) -> Result<()> {
 }
 
 fn http_history_path(root: &Path) -> PathBuf {
-    root.join(".zed/http-history.json")
+    let pw = root.join(".phpworkbench/http-history.json");
+    if pw.is_file() {
+        return pw;
+    }
+    let zed = root.join(".zed/http-history.json");
+    if zed.is_file() {
+        return zed;
+    }
+    pw
 }
 
 fn seed_initial_http_history() -> HttpHistoryFile {
@@ -23676,9 +23692,15 @@ fn load_http_history(root: &Path) -> HttpHistoryFile {
             }
         }
     }
-    let seeded = seed_initial_http_history();
-    let _ = save_http_history(root, &seeded);
-    seeded
+    let old_path = root.join(".zed/http-history.json");
+    if old_path.is_file() {
+        if let Ok(contents) = std::fs::read_to_string(&old_path) {
+            if let Ok(file) = serde_json::from_str::<HttpHistoryFile>(&contents) {
+                return file;
+            }
+        }
+    }
+    seed_initial_http_history()
 }
 
 fn save_http_history(root: &Path, history: &HttpHistoryFile) -> Result<()> {
