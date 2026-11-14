@@ -451,7 +451,7 @@
   //
   // 1. Do nothing: `none`
   // 2. Find references for the same symbol: `find_all_references` (default)
-  "go_to_definition_fallback": "find_all_references",
+  "go_to_definition_fallback": "none",
   // How to scroll the target into view when navigating to a definition or reference
   // (e.g. Go to Definition, Go to Type Definition, Find All References).
   //
@@ -468,7 +468,7 @@
   //
   // 1. Open the results in a multibuffer: `multi_buffer` (default)
   // 2. Open the results in a filterable picker: `picker`
-  "lsp_results_location": "multi_buffer",
+  "lsp_results_location": "picker",
   // Which level to use to filter out diagnostics displayed in the editor.
   //
   // Affects the editor rendering only, and does not interrupt

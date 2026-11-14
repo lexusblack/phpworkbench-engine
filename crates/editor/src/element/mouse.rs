@@ -789,7 +789,11 @@ impl EditorElement {
             editor.select(
                 SelectPhase::Begin {
                     position,
-                    add: Editor::is_alt_pressed(&modifiers, cx),
+                    add: if modifiers.alt && !modifiers.secondary() && !modifiers.control {
+                        false
+                    } else {
+                        Editor::is_alt_pressed(&modifiers, cx)
+                    },
                     click_count,
                 },
                 window,
@@ -1010,6 +1014,20 @@ impl EditorElement {
                     cx,
                 )
             {
+                editor.selection_drag_state = SelectionDragState::None;
+                cx.stop_propagation();
+                return;
+            }
+
+            let is_alt_only = event.modifiers().alt
+                && !event.modifiers().secondary()
+                && !event.modifiers().control;
+            if is_alt_only {
+                let anchor = position_map
+                    .snapshot
+                    .buffer_snapshot()
+                    .anchor_before(point.next_valid.to_point(&position_map.snapshot.display_snapshot));
+                crate::hover_popover::hover_at(editor, Some(anchor), Some(mouse_position), window, cx);
                 editor.selection_drag_state = SelectionDragState::None;
                 cx.stop_propagation();
                 return;
