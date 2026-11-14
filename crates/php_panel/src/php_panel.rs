@@ -24406,7 +24406,7 @@ mod tests {
         .expect("save server");
         assert_eq!(name, "dev");
 
-        let path = deploy_config_path(root);
+        let path = deploy_config_path(&root);
         let contents = std::fs::read_to_string(&path).expect("read deploy.json");
         assert!(contents.starts_with("{\n  "));
         assert!(contents.ends_with("}\n"));
@@ -24582,7 +24582,7 @@ mod tests {
     #[test]
     fn save_server_validates_without_writing() {
         let root = temp_root("server_validate");
-        let path = deploy_config_path(root);
+        let path = deploy_config_path(&root);
 
         let error = save_server_config(&root, &fields(&["", "local", "", "", "", "/tmp", "."]))
             .expect_err("empty name rejected");

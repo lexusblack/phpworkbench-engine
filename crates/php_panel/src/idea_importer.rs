@@ -1,10 +1,73 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use regex::Regex;
 use crate::{
     HttpAuthSettings, HttpBodyKind, HttpHistoryEntry, HttpHistoryFile, KeyValueRow,
     RawContentType,
 };
+
+/// Searches known JetBrains global configuration directories for a given options XML file
+/// (e.g. `webServers.xml` or `sshConfigs.xml`). Returns candidates sorted by priority
+/// (PhpStorm first, then newest version first).
+pub fn find_jetbrains_global_files(filename: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    // macOS: ~/Library/Application Support/JetBrains/*/options/<filename>
+    if let Ok(home) = std::env::var("HOME") {
+        let mac_base = PathBuf::from(&home).join("Library/Application Support/JetBrains");
+        if mac_base.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&mac_base) {
+                for entry in entries.flatten() {
+                    let file = entry.path().join("options").join(filename);
+                    if file.is_file() {
+                        candidates.push(file);
+                    }
+                }
+            }
+        }
+        // Linux: ~/.config/JetBrains/*/options/<filename>
+        let linux_base = PathBuf::from(&home).join(".config/JetBrains");
+        if linux_base.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&linux_base) {
+                for entry in entries.flatten() {
+                    let file = entry.path().join("options").join(filename);
+                    if file.is_file() {
+                        candidates.push(file);
+                    }
+                }
+            }
+        }
+    }
+
+    // Windows: %APPDATA%\JetBrains\*\options\<filename>
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let win_base = PathBuf::from(&appdata).join("JetBrains");
+        if win_base.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&win_base) {
+                for entry in entries.flatten() {
+                    let file = entry.path().join("options").join(filename);
+                    if file.is_file() {
+                        candidates.push(file);
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        let a_str = a.to_string_lossy();
+        let b_str = b.to_string_lossy();
+        let a_php = a_str.contains("PhpStorm");
+        let b_php = b_str.contains("PhpStorm");
+        match (a_php, b_php) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => b_str.cmp(&a_str),
+        }
+    });
+
+    candidates
+}
 
 /// Attempts to parse IntelliJ / PhpStorm `.idea/dataSources.xml` (and `.idea/dataSources.local.xml`)
 /// into the JSON format expected by PhpWorkbench's `databases.json`.
@@ -26,6 +89,41 @@ pub fn import_idea_databases(root: &Path) -> Option<Value> {
     let local_ds_re = Regex::new(r#"(?s)<data-source\s+[^>]*?uuid="([^"]+)"[^>]*?>(.*?)</data-source>"#).ok()?;
     let user_re = Regex::new(r#"<user-name>([^<]+)</user-name>"#).ok()?;
     let ssh_re = Regex::new(r#"(?s)<ssh-properties>.*?<enabled>true</enabled>.*?</ssh-properties>"#).ok()?;
+    let ssh_id_re = Regex::new(r#"<ssh-config-id>([^<]+)</ssh-config-id>"#).ok()?;
+
+    // Parse global sshConfigs.xml if available to resolve SSH tunnel host/port/username
+    let mut ssh_configs: std::collections::HashMap<String, (String, u16, String)> = std::collections::HashMap::new();
+    let ssh_cfg_re = Regex::new(r#"<sshConfig\s+([^>]+)>"#).ok();
+    let attr_re = Regex::new(r#"(\w+)="([^"]*)""#).ok();
+    if let (Some(cfg_re), Some(a_re)) = (ssh_cfg_re.as_ref(), attr_re.as_ref()) {
+        for global_ssh in find_jetbrains_global_files("sshConfigs.xml") {
+            if let Ok(ssh_content) = std::fs::read_to_string(&global_ssh) {
+                for cap in cfg_re.captures_iter(&ssh_content) {
+                    let attrs_str = &cap[1];
+                    let mut id = String::new();
+                    let mut host = String::new();
+                    let mut port = 22u16;
+                    let mut user = String::new();
+                    for attr in a_re.captures_iter(attrs_str) {
+                        match &attr[1] {
+                            "id" => id = attr[2].to_string(),
+                            "host" => host = attr[2].to_string(),
+                            "port" => {
+                                if let Ok(p) = attr[2].parse::<u16>() {
+                                    port = p;
+                                }
+                            }
+                            "username" => user = attr[2].to_string(),
+                            _ => {}
+                        }
+                    }
+                    if !id.is_empty() && !host.is_empty() {
+                        ssh_configs.entry(id).or_insert((host, port, user));
+                    }
+                }
+            }
+        }
+    }
 
     let mut local_info = std::collections::HashMap::new();
     for cap in local_ds_re.captures_iter(&local_content) {
@@ -33,7 +131,8 @@ pub fn import_idea_databases(root: &Path) -> Option<Value> {
         let body = &cap[2];
         let user = user_re.captures(body).map(|c| c[1].to_string()).unwrap_or_default();
         let ssh = ssh_re.is_match(body);
-        local_info.insert(uuid, (user, ssh));
+        let ssh_id = ssh_id_re.captures(body).map(|c| c[1].to_string());
+        local_info.insert(uuid, (user, ssh, ssh_id));
     }
 
     let mut connections = Vec::new();
@@ -48,7 +147,7 @@ pub fn import_idea_databases(root: &Path) -> Option<Value> {
             None => continue,
         };
 
-        let (user, ssh) = local_info.get(&uuid).cloned().unwrap_or_default();
+        let (user, ssh, ssh_id) = local_info.get(&uuid).cloned().unwrap_or_default();
         let (driver, host, port, database) = parse_jdbc_url(&jdbc_url);
 
         let mut conn = json!({
@@ -61,7 +160,16 @@ pub fn import_idea_databases(root: &Path) -> Option<Value> {
             "password": "",
         });
         if ssh {
-            conn["ssh_tunnel"] = json!({ "enabled": true });
+            if let Some(id) = ssh_id.as_ref().and_then(|id| ssh_configs.get(id)) {
+                conn["ssh_tunnel"] = json!({
+                    "enabled": true,
+                    "host": id.0,
+                    "port": id.1,
+                    "user": id.2,
+                });
+            } else {
+                conn["ssh_tunnel"] = json!({ "enabled": true });
+            }
         }
         connections.push(conn);
     }
@@ -108,21 +216,39 @@ fn parse_jdbc_url(url: &str) -> (String, String, u16, String) {
     ("mysql".to_string(), "localhost".to_string(), 3306, "".to_string())
 }
 
-/// Attempts to parse IntelliJ / PhpStorm `.idea/webServers.xml` and `.idea/deployment.xml`
-/// into the JSON format expected by PhpWorkbench's `deploy.json`.
+/// Attempts to parse IntelliJ / PhpStorm `.idea/webServers.xml` (or global PhpStorm `options/webServers.xml`)
+/// and `.idea/deployment.xml` into the JSON format expected by PhpWorkbench's `deploy.json`.
 pub fn import_idea_servers(root: &Path) -> Option<Value> {
     let idea_dir = root.join(".idea");
-    let web_servers_path = idea_dir.join("webServers.xml");
-    if !web_servers_path.is_file() {
-        return None;
-    }
-    let xml = std::fs::read_to_string(&web_servers_path).ok()?;
 
-    // Read default server name from deployment.xml
+    // 1. Read deployment.xml for default server and project-mapped servers
     let dep_xml_path = idea_dir.join("deployment.xml");
     let dep_xml = std::fs::read_to_string(&dep_xml_path).unwrap_or_default();
     let default_server_re = Regex::new(r#"serverName="([^"]+)""#).ok()?;
     let default_server = default_server_re.captures(&dep_xml).map(|c| c[1].to_string());
+
+    let paths_re = Regex::new(r#"<paths\s+name="([^"]+)""#).ok()?;
+    let mut project_servers = Vec::new();
+    for cap in paths_re.captures_iter(&dep_xml) {
+        let name = cap[1].to_string();
+        if !project_servers.contains(&name) {
+            project_servers.push(name);
+        }
+    }
+
+    // 2. Locate webServers.xml: check project .idea first, then global JetBrains options
+    let mut ws_paths = Vec::new();
+    let local_ws = idea_dir.join("webServers.xml");
+    if local_ws.is_file() {
+        ws_paths.push(local_ws);
+    }
+    for global_ws in find_jetbrains_global_files("webServers.xml") {
+        ws_paths.push(global_ws);
+    }
+
+    if ws_paths.is_empty() {
+        return None;
+    }
 
     let ws_re = Regex::new(r#"(?s)<webServer\s+([^>]*?)>(.*?)</webServer>"#).ok()?;
     let name_re = Regex::new(r#"name="([^"]+)""#).ok()?;
@@ -130,73 +256,137 @@ pub fn import_idea_servers(root: &Path) -> Option<Value> {
     let ft_re = Regex::new(r#"<fileTransfer\s+([^>]+)>"#).ok()?;
     let attr_re = Regex::new(r#"(\w+)="([^"]*)""#).ok()?;
 
-    let mut servers = Vec::new();
+    let mut all_servers = std::collections::HashMap::new();
 
-    for cap in ws_re.captures_iter(&xml) {
-        let ws_attrs = &cap[1];
-        let body = &cap[2];
-
-        let name = match name_re.captures(ws_attrs) {
-            Some(c) => c[1].to_string(),
-            None => continue,
+    for ws_path in ws_paths {
+        let Ok(xml) = std::fs::read_to_string(&ws_path) else {
+            continue;
         };
-        let web_url = url_re.captures(ws_attrs).map(|c| c[1].to_string()).unwrap_or_default();
 
-        let mut host = String::new();
-        let mut port: u16 = 22;
-        let mut remote_root = String::new();
-        let mut protocol = "sftp".to_string();
+        for cap in ws_re.captures_iter(&xml) {
+            let ws_attrs = &cap[1];
+            let body = &cap[2];
 
-        if let Some(ft_cap) = ft_re.captures(body) {
-            let attrs_str = &ft_cap[1];
-            for attr in attr_re.captures_iter(attrs_str) {
-                match &attr[1] {
-                    "host" => host = attr[2].to_string(),
-                    "port" => {
-                        if let Ok(p) = attr[2].parse::<u16>() {
-                            port = p;
-                            if p == 21 {
-                                protocol = "ftp".to_string();
+            let name = match name_re.captures(ws_attrs) {
+                Some(c) => c[1].to_string(),
+                None => continue,
+            };
+            if all_servers.contains_key(&name) {
+                continue;
+            }
+
+            let web_url = url_re
+                .captures(ws_attrs)
+                .map(|c| c[1].to_string())
+                .unwrap_or_default();
+
+            let mut host = String::new();
+            let mut port: u16 = 22;
+            let mut remote_root = String::new();
+            let mut protocol = "sftp".to_string();
+
+            if let Some(ft_cap) = ft_re.captures(body) {
+                let attrs_str = &ft_cap[1];
+                for attr in attr_re.captures_iter(attrs_str) {
+                    match &attr[1] {
+                        "host" => host = attr[2].to_string(),
+                        "port" => {
+                            if let Ok(p) = attr[2].parse::<u16>() {
+                                port = p;
+                                if p == 21 {
+                                    protocol = "ftp".to_string();
+                                }
                             }
                         }
+                        "rootFolder" => remote_root = attr[2].to_string(),
+                        _ => {}
                     }
-                    "rootFolder" => remote_root = attr[2].to_string(),
-                    _ => {}
+                }
+            }
+
+            // Check if FTPS (dataProtectionLevel or shareSSLContext)
+            if body.contains("dataProtectionLevel") || body.contains("shareSSLContext") {
+                if protocol == "ftp" {
+                    protocol = "ftps".to_string();
+                }
+            }
+
+            all_servers.insert(
+                name.clone(),
+                json!({
+                    "name": name,
+                    "protocol": protocol,
+                    "host": host,
+                    "port": port,
+                    "user": "",
+                    "remote_root": remote_root,
+                    "local_root": ".",
+                    "web_url": web_url,
+                    "upload_on_save": false,
+                    "exclude": ["vendor/", "node_modules/", ".git/"],
+                }),
+            );
+        }
+
+        // If we found the default server or mapped servers in this webServers.xml, no need to check older ones
+        if let Some(ref def) = default_server {
+            if all_servers.contains_key(def) {
+                break;
+            }
+        } else if !all_servers.is_empty() {
+            break;
+        }
+    }
+
+    if all_servers.is_empty() {
+        return None;
+    }
+
+    // Filter and order servers:
+    let mut servers = Vec::new();
+    if !project_servers.is_empty() {
+        // If deployment.xml mapped servers for this project:
+        // Put default server first if present
+        if let Some(ref def) = default_server {
+            if let Some(s) = all_servers.get(def) {
+                servers.push(s.clone());
+            }
+        }
+        for name in &project_servers {
+            if Some(name) != default_server.as_ref() {
+                if let Some(s) = all_servers.get(name) {
+                    servers.push(s.clone());
                 }
             }
         }
-
-        // Check if FTPS (dataProtectionLevel or shareSSLContext)
-        if body.contains("dataProtectionLevel") || body.contains("shareSSLContext") {
-            if protocol == "ftp" {
-                protocol = "ftps".to_string();
+    } else {
+        // If no project mappings, include all parsed servers, with default_server first
+        if let Some(ref def) = default_server {
+            if let Some(s) = all_servers.get(def) {
+                servers.push(s.clone());
             }
         }
-
-        servers.push(json!({
-            "name": name,
-            "protocol": protocol,
-            "host": host,
-            "port": port,
-            "user": "",
-            "remote_root": remote_root,
-            "local_root": ".",
-            "web_url": web_url,
-            "upload_on_save": false,
-            "exclude": ["vendor/", "node_modules/", ".git/"],
-        }));
+        for (name, s) in &all_servers {
+            if Some(name) != default_server.as_ref() {
+                servers.push(s.clone());
+            }
+        }
     }
 
     if servers.is_empty() {
-        None
-    } else {
-        let mut res = json!({ "servers": servers });
-        if let Some(def) = default_server {
-            res["default"] = json!(def);
-            res["active"] = json!(def);
-        }
-        Some(res)
+        return None;
     }
+
+    let active_name = default_server
+        .clone()
+        .or_else(|| servers.first().and_then(|s| s["name"].as_str().map(str::to_string)));
+
+    let mut res = json!({ "servers": servers });
+    if let Some(def) = active_name {
+        res["default"] = json!(def);
+        res["active"] = json!(def);
+    }
+    Some(res)
 }
 
 /// Attempts to parse HTTP requests from `.idea/httpRequests/`
@@ -327,5 +517,19 @@ mod tests {
         let (p, _h, _port, path) = parse_jdbc_url("jdbc:sqlite:/tmp/test.db");
         assert_eq!(p, "sqlite");
         assert_eq!(path, "/tmp/test.db");
+    }
+
+    #[test]
+    fn test_import_newsystems_project() {
+        let p = Path::new("/Users/admin/PhpstormProjects/newsystems");
+        if p.is_dir() {
+            let res = import_idea_servers(p).expect("import servers");
+            assert_eq!(res["default"], json!("newdemo"));
+            assert_eq!(res["active"], json!("newdemo"));
+            let servers = res["servers"].as_array().expect("servers array");
+            assert!(!servers.is_empty());
+            assert_eq!(servers[0]["name"], json!("newdemo"));
+            assert_eq!(servers[0]["protocol"], json!("ftps"));
+        }
     }
 }
