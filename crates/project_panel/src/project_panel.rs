@@ -6946,7 +6946,7 @@ impl ProjectPanel {
                                         .color(filename_text_color)
                                         .when(
                                             settings.bold_folder_labels && kind.is_dir(),
-                                            |this| this.weight(FontWeight::SEMIBOLD),
+                                            |this| this.weight(FontWeight::MEDIUM),
                                         )
                                         .into_any_element(),
                                 ),
@@ -7127,7 +7127,7 @@ impl ProjectPanel {
                                 .single_line()
                                 .color(filename_text_color)
                                 .when(bold_folder_labels && !is_file, |this| {
-                                    this.weight(FontWeight::SEMIBOLD)
+                                    this.weight(FontWeight::MEDIUM)
                                 })
                                 .when(index == active_index && is_active_or_marked, |this| {
                                     this.underline()

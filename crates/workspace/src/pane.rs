@@ -3225,6 +3225,28 @@ impl Pane {
                                     pane.close_all_items(&close_all_items_action, window, cx)
                                         .detach_and_log_err(cx)
                                 }),
+                            )
+                            .separator()
+                            .entry(
+                                "Split Right",
+                                Some(SplitRight::default().boxed_clone()),
+                                window.handler_for(&pane, move |pane, window, cx| {
+                                    pane.split(SplitDirection::Right, SplitMode::ClonePane, window, cx);
+                                }),
+                            )
+                            .entry(
+                                "Split Down",
+                                Some(SplitDown::default().boxed_clone()),
+                                window.handler_for(&pane, move |pane, window, cx| {
+                                    pane.split(SplitDirection::Down, SplitMode::ClonePane, window, cx);
+                                }),
+                            )
+                            .entry(
+                                "Move to Opposite Tab Group",
+                                Some(SplitRight { mode: SplitMode::MovePane }.boxed_clone()),
+                                window.handler_for(&pane, move |pane, window, cx| {
+                                    pane.split(SplitDirection::Right, SplitMode::MovePane, window, cx);
+                                }),
                             );
 
                         let pin_tab_entries = |menu: ContextMenu| {

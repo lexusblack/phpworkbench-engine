@@ -402,7 +402,7 @@ impl RenderOnce for ListItem {
                     .when_some(self.tooltip, |this, tooltip| this.tooltip(tooltip))
                     .map(|this| {
                         if self.inset {
-                            this.rounded_sm()
+                            this.rounded_md()
                         } else {
                             // When an item is not inset draw the indent spacing inside of the item
                             this.ml(self.indent_level as f32 * self.indent_step_size)

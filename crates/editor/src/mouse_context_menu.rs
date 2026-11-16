@@ -3,7 +3,7 @@ use crate::{
     EvaluateSelectedText, FindAllReferences, GoToDeclaration, GoToDefinition, GoToImplementation,
     GoToTypeDefinition, Paste, Rename, RevealInFileManager, RunToCursor, SelectMode,
     SelectionEffects, SelectionExt, ToDisplayPoint, ToggleCodeActions,
-    actions::{Format, FormatSelections},
+    actions::{Fold, FoldAll, Format, FormatSelections, UnfoldAll, UnfoldLines},
     selections_collection::SelectionsCollection,
 };
 use gpui::prelude::FluentBuilder;
@@ -244,88 +244,93 @@ pub fn deploy_context_menu(
             });
 
         ui::ContextMenu::build(window, cx, |menu, _window, _cx| {
-            let builder = menu
+            let mut builder = menu
                 .on_blur_subscription(Subscription::new(|| {}))
-                .when(run_to_cursor, |builder| {
-                    builder.action("Run to Cursor", Box::new(RunToCursor))
-                })
-                .when(evaluate_selection && has_selections, |builder| {
-                    builder.action("Evaluate Selection", Box::new(EvaluateSelectedText))
-                })
-                .when(
-                    run_to_cursor || (evaluate_selection && has_selections),
-                    |builder| builder.separator(),
-                )
-                .action("Go to Definition", Box::new(GoToDefinition::default()))
-                .action("Go to Declaration", Box::new(GoToDeclaration::default()))
-                .action(
-                    "Go to Type Definition",
-                    Box::new(GoToTypeDefinition::default()),
-                )
-                .action(
-                    "Go to Implementation",
-                    Box::new(GoToImplementation::default()),
-                )
-                .action(
-                    "Find All References",
-                    Box::new(FindAllReferences::default()),
-                )
-                .action(
-                    "Show Incoming Calls",
-                    Box::new(zed_actions::ShowIncomingCalls),
-                )
-                .action(
-                    "Show Outgoing Calls",
-                    Box::new(zed_actions::ShowOutgoingCalls),
-                )
-                .separator()
-                .action("Rename Symbol", Box::new(Rename))
-                .action("Format Buffer", Box::new(Format))
-                .when(format_selections, |cx| {
-                    cx.action("Format Selections", Box::new(FormatSelections))
-                })
-                .action(
-                    "Show Code Actions",
-                    Box::new(ToggleCodeActions {
-                        deployed_from: None,
-                        quick_launch: false,
-                    }),
-                )
-                .when(!disable_ai && has_selections, |this| {
-                    this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
-                })
-                .separator()
                 .action("Cut", Box::new(Cut))
                 .action("Copy", Box::new(Copy))
                 .action("Copy and Trim", Box::new(CopyAndTrim))
                 .action("Paste", Box::new(Paste))
                 .separator()
-                .action_disabled_when(
-                    !has_reveal_target,
-                    ui::utils::reveal_in_file_manager_label(false),
-                    Box::new(RevealInFileManager),
+                .action(
+                    "Show Context Actions",
+                    Box::new(ToggleCodeActions {
+                        deployed_from: None,
+                        quick_launch: false,
+                    }),
                 )
-                .when(is_markdown, |builder| {
-                    builder.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
+                .when(!disable_ai, |this| {
+                    this.action("Ask Agent with Context", Box::new(AddSelectionToThread))
                 })
-                .when(is_svg, |builder| {
-                    builder.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                .separator()
+                .submenu("Go To", |sub, _, _| {
+                    sub.action("Declaration or Usages", Box::new(GoToDefinition::default()))
+                        .action("Implementation(s)", Box::new(GoToImplementation::default()))
+                        .action("Type Declaration", Box::new(GoToTypeDefinition::default()))
+                        .action("Declaration", Box::new(GoToDeclaration::default()))
+                        .separator()
+                        .action("Find All References", Box::new(FindAllReferences::default()))
+                        .action("Show Incoming Calls", Box::new(zed_actions::ShowIncomingCalls))
+                        .action("Show Outgoing Calls", Box::new(zed_actions::ShowOutgoingCalls))
                 })
+                .submenu("Refactor", move |sub, _, _| {
+                    let mut sub = sub
+                        .action("Rename Symbol…", Box::new(Rename))
+                        .action("Format Buffer", Box::new(Format));
+                    if format_selections {
+                        sub = sub.action("Format Selections", Box::new(FormatSelections));
+                    }
+                    sub
+                })
+                .submenu("Folding", |sub, _, _| {
+                    sub.action("Collapse", Box::new(Fold))
+                        .action("Expand", Box::new(UnfoldLines))
+                        .separator()
+                        .action("Collapse All", Box::new(FoldAll))
+                        .action("Expand All", Box::new(UnfoldAll))
+                })
+                .when(run_to_cursor || (evaluate_selection && has_selections), |builder| {
+                    builder
+                        .separator()
+                        .when(run_to_cursor, |builder| {
+                            builder.action("Run to Cursor", Box::new(RunToCursor))
+                        })
+                        .when(evaluate_selection && has_selections, |builder| {
+                            builder.action("Evaluate Selection", Box::new(EvaluateSelectedText))
+                        })
+                })
+                .when(is_markdown || is_svg, |builder| {
+                    builder
+                        .separator()
+                        .when(is_markdown, |builder| {
+                            builder.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
+                        })
+                        .when(is_svg, |builder| {
+                            builder.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                        })
+                })
+                .separator()
                 .action_disabled_when(
                     !has_reveal_target,
                     "Open in Terminal",
                     Box::new(OpenInTerminal),
                 )
                 .action_disabled_when(
-                    !has_git_repo,
-                    "Copy Permalink to Line",
-                    Box::new(CopyPermalinkToLine),
-                )
-                .action_disabled_when(
-                    !has_git_repo,
-                    "View File History",
-                    Box::new(git::FileHistory),
+                    !has_reveal_target,
+                    ui::utils::reveal_in_file_manager_label(false),
+                    Box::new(RevealInFileManager),
                 );
+
+            if has_git_repo {
+                builder = builder
+                    .submenu("Local History", |sub, _, _| {
+                        sub.action("Show History", Box::new(git::FileHistory))
+                    })
+                    .submenu("Git", |sub, _, _| {
+                        sub.action("Show File History", Box::new(git::FileHistory))
+                            .action("Copy Permalink to Line", Box::new(CopyPermalinkToLine))
+                    });
+            }
+
             match focus {
                 Some(focus) => builder.context(focus),
                 None => builder,

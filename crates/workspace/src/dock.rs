@@ -1753,7 +1753,7 @@ impl Dock {
             .child(
                 Label::new(title)
                     .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .weight(gpui::FontWeight::MEDIUM)
                     .color(Color::Default),
             )
             .child(
