@@ -179,6 +179,10 @@ actions!(
         ActivateStashTab,
         /// Reloads the stash list.
         RefreshStashes,
+        /// Copies git diff of selected files to clipboard as a patch.
+        CopyAsPatch,
+        /// Creates a patch file from local changes.
+        CreatePatch,
     ]
 );
 
@@ -322,15 +326,23 @@ fn action_for_entry_menu_item(action_id: &str) -> Option<Box<dyn Action>> {
     match action_id {
         ids::COMMIT_FILE => Some(CommitFile.boxed_clone()),
         ids::ROLLBACK => Some(RestoreFile::default().boxed_clone()),
+        ids::MOVE_CHANGELIST => Some(git::ToggleStaged.boxed_clone()),
         ids::SHOW_DIFF => Some(menu::Confirm.boxed_clone()),
         ids::SHOW_DIFF_NEW_TAB => Some(menu::SecondaryConfirm.boxed_clone()),
         ids::JUMP_TO_SOURCE => Some(ViewFile.boxed_clone()),
         ids::COPY_PATH => Some(CopyPath.boxed_clone()),
+        ids::ASK_AI => Some(zed_actions::assistant::ToggleFocus.boxed_clone()),
         ids::DELETE => Some(DeleteFile.boxed_clone()),
         ids::ADD_TO_VCS => Some(git::StageFile.boxed_clone()),
         ids::ADD_TO_GITIGNORE => Some(git::AddToGitignore.boxed_clone()),
+        ids::NEW_CHANGELIST => Some(git::ToggleStaged.boxed_clone()),
+        ids::EDIT_CHANGELIST => Some(git::ToggleStaged.boxed_clone()),
+        ids::CREATE_PATCH => Some(CreatePatch.boxed_clone()),
+        ids::COPY_AS_PATCH => Some(CopyAsPatch.boxed_clone()),
         ids::SHELVE => Some(git::StashAll.boxed_clone()),
         ids::REFRESH => Some(Refresh.boxed_clone()),
+        ids::COMPARE_WITH_BRANCH => Some(zed_actions::git::Branch.boxed_clone()),
+        ids::SHOW_HISTORY => Some(git::FileHistory.boxed_clone()),
         ids::BRANCHES => Some(zed_actions::git::Branch.boxed_clone()),
         ids::FETCH => Some(git::Fetch.boxed_clone()),
         ids::PUSH => Some(crate::push_dialog::OpenPushDialog.boxed_clone()),
@@ -2808,7 +2820,7 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         let entries = self.effective_status_entries();
-        if entries.len() <= 1 {
+        if entries.is_empty() {
             cx.propagate();
             return;
         }
@@ -2835,6 +2847,114 @@ impl GitPanel {
             })
             .log_err();
         cx.stop_propagation();
+    }
+
+    fn copy_as_patch(&mut self, _: &CopyAsPatch, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.as_ref() else {
+            return;
+        };
+        let work_dir = repo.read(cx).work_directory_abs_path.clone();
+        let entries = self.effective_status_entries();
+        let paths: Vec<String> = entries
+            .iter()
+            .map(|e| e.repo_path.as_std_path().to_string_lossy().to_string())
+            .collect();
+        let has_staged = entries.iter().any(|e| e.staging.is_fully_staged());
+
+        cx.spawn(async move |_this, cx| {
+            let diff_text = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut cmd = util::command::new_std_command("git");
+                    cmd.arg("diff");
+                    if has_staged {
+                        cmd.arg("HEAD");
+                    }
+                    if !paths.is_empty() {
+                        cmd.arg("--");
+                        for p in &paths {
+                            cmd.arg(p);
+                        }
+                    }
+                    cmd.current_dir(&*work_dir);
+                    if let Ok(output) = cmd.output() {
+                        if output.status.success() {
+                            return String::from_utf8_lossy(&output.stdout).to_string();
+                        }
+                    }
+                    String::new()
+                })
+                .await;
+
+            if !diff_text.is_empty() {
+                cx.update(|cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(diff_text));
+                });
+            }
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn create_patch(&mut self, _: &CreatePatch, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.as_ref() else {
+            return;
+        };
+        let work_dir = repo.read(cx).work_directory_abs_path.clone();
+        let entries = self.effective_status_entries();
+        let paths: Vec<String> = entries
+            .iter()
+            .map(|e| e.repo_path.as_std_path().to_string_lossy().to_string())
+            .collect();
+        let has_staged = entries.iter().any(|e| e.staging.is_fully_staged());
+        let workspace = self.workspace.clone();
+
+        cx.spawn_in(window, async move |_this, cx| {
+            let patch_file = work_dir.join("changes.patch");
+            let patch_file_clone = patch_file.clone();
+            let success = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut cmd = util::command::new_std_command("git");
+                    cmd.arg("diff");
+                    if has_staged {
+                        cmd.arg("HEAD");
+                    }
+                    if !paths.is_empty() {
+                        cmd.arg("--");
+                        for p in &paths {
+                            cmd.arg(p);
+                        }
+                    }
+                    cmd.current_dir(&*work_dir);
+                    if let Ok(output) = cmd.output() {
+                        if output.status.success() {
+                            let diff_text = String::from_utf8_lossy(&output.stdout).to_string();
+                            return std::fs::write(&patch_file_clone, diff_text.as_bytes()).is_ok();
+                        }
+                    }
+                    false
+                })
+                .await;
+
+            if success {
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace
+                            .open_paths(
+                                vec![patch_file],
+                                workspace::OpenOptions::default(),
+                                None,
+                                window,
+                                cx,
+                            )
+                            .detach();
+                    })
+                    .ok();
+            }
+            anyhow::Ok(())
+        })
+        .detach();
     }
 
     fn copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
@@ -9302,8 +9422,44 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> Entity<ContextMenu> {
         let items = phpstorm::menu_items_for(state);
-        ContextMenu::build(window, cx, |context_menu, _, _| {
-            let mut menu = context_menu.context(self.focus_handle.clone());
+        let focus_handle = self.focus_handle.clone();
+
+        let entries = self.effective_status_entries();
+        let target_entry = entries.first();
+        let repo = self.active_repository.as_ref().map(|r| r.read(cx));
+        let work_dir = repo.as_ref().map(|r| r.work_directory_abs_path.clone());
+        let (deploy_file_abs, deploy_file_rel, is_dir) =
+            if let (Some(work_dir), Some(entry)) = (work_dir.as_ref(), target_entry) {
+                let abs = work_dir.join(entry.repo_path.as_std_path());
+                let is_d = abs.is_dir();
+                let abs_str = abs.to_string_lossy().replace('\\', "/");
+                let rel_str = entry.repo_path.as_std_path().to_string_lossy().replace('\\', "/");
+                (Some(abs_str), Some(rel_str), is_d)
+            } else {
+                (None, None, false)
+            };
+
+        let (active_deploy_server, has_deploy_servers) = if cx.has_global::<php_panel::DeployShared>() {
+            let shared = cx.global::<php_panel::DeployShared>();
+            let active = shared.active.clone().or_else(|| shared.servers.first().cloned());
+            (active, !shared.servers.is_empty())
+        } else if let Some(work_dir) = work_dir.as_ref() {
+            let deploy_json = work_dir.join(".zed/deploy.json");
+            let alt_deploy_json = work_dir.join(".phpworkbench/deploy.json");
+            let read_json = |p: &Path| -> Option<(Option<String>, bool)> {
+                let contents = std::fs::read_to_string(p).ok()?;
+                let val = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+                let active = val.get("active").and_then(|v| v.as_str()).map(str::to_string);
+                let count = val.get("servers").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                Some((active, count > 0))
+            };
+            read_json(&alt_deploy_json).or_else(|| read_json(&deploy_json)).unwrap_or((None, false))
+        } else {
+            (None, false)
+        };
+
+        ContextMenu::build(window, cx, move |context_menu, _, _| {
+            let mut menu = context_menu.context(focus_handle);
             let mut git_items = Vec::new();
             for item in items {
                 if item.is_separator() {
@@ -9314,6 +9470,13 @@ impl GitPanel {
                     menu = menu.action_disabled_when(!item.enabled, item.label, action);
                 }
             }
+
+            // Local History > submenu
+            menu = menu.submenu("Local History", |sub, _, _| {
+                sub.action("Show History", Box::new(git::FileHistory))
+            });
+
+            // Git > submenu
             if !git_items.is_empty() {
                 menu = menu.submenu("Git", move |submenu, _window, _cx| {
                     let mut submenu = submenu;
@@ -9326,6 +9489,64 @@ impl GitPanel {
                     submenu
                 });
             }
+
+            // Deployment > submenu
+            let s_label = active_deploy_server.as_deref().unwrap_or("Server").to_string();
+            let abs = deploy_file_abs.clone();
+            let rel = deploy_file_rel.clone();
+            let srv = active_deploy_server.clone();
+
+            menu = menu.submenu("Deployment", move |sub, _, _| {
+                let mut sub = sub
+                    .action_disabled_when(
+                        !has_deploy_servers || abs.is_none(),
+                        format!("Upload to {s_label}"),
+                        Box::new(php_panel::UploadToDeployServer {
+                            abs_path: abs.clone(),
+                            rel_path: rel.clone(),
+                            server: srv.clone(),
+                        }),
+                    )
+                    .action_disabled_when(
+                        false,
+                        "Upload to…",
+                        Box::new(php_panel::OpenDeploymentDialog),
+                    )
+                    .action_disabled_when(
+                        !has_deploy_servers || abs.is_none(),
+                        format!("Download from {s_label}"),
+                        Box::new(php_panel::DownloadFromDeployServer {
+                            abs_path: abs.clone(),
+                            rel_path: rel.clone(),
+                            server: srv.clone(),
+                        }),
+                    )
+                    .action_disabled_when(
+                        false,
+                        "Download from…",
+                        Box::new(php_panel::OpenDeploymentDialog),
+                    );
+                if !is_dir {
+                    sub = sub.action_disabled_when(
+                        !has_deploy_servers || abs.is_none(),
+                        format!("Compare with Deployed on {s_label}"),
+                        Box::new(php_panel::CompareWithDeployServer {
+                            abs_path: abs.clone(),
+                            rel_path: rel.clone(),
+                            server: srv.clone(),
+                        }),
+                    );
+                }
+                sub.action_disabled_when(
+                    !has_deploy_servers || rel.is_none(),
+                    format!("Sync with {s_label}…"),
+                    Box::new(php_panel::SyncWithDeployServer {
+                        rel_path: rel.clone(),
+                        server: srv.clone(),
+                    }),
+                )
+            });
+
             menu
         })
     }
@@ -10331,6 +10552,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::view_file_history))
             .on_action(cx.listener(Self::copy_path))
             .on_action(cx.listener(Self::copy_relative_path))
+            .on_action(cx.listener(Self::copy_as_patch))
+            .on_action(cx.listener(Self::create_patch))
             .on_action(cx.listener(Self::view_unstaged_changes))
             .on_action(cx.listener(Self::view_staged_changes))
             .on_action(cx.listener(Self::refresh_repository))

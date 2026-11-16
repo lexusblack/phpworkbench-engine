@@ -7008,6 +7008,7 @@ dependencies = [
  "menu",
  "multi_buffer",
  "notifications",
+ "php_panel",
  "picker",
  "pretty_assertions",
  "project",

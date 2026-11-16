@@ -266,15 +266,23 @@ mod tests {
 pub mod entry_menu_action {
     pub const COMMIT_FILE: &str = "commit_file";
     pub const ROLLBACK: &str = "rollback";
+    pub const MOVE_CHANGELIST: &str = "move_changelist";
     pub const SHOW_DIFF: &str = "show_diff";
     pub const SHOW_DIFF_NEW_TAB: &str = "show_diff_new_tab";
     pub const JUMP_TO_SOURCE: &str = "jump_to_source";
     pub const COPY_PATH: &str = "copy_path";
+    pub const ASK_AI: &str = "ask_ai";
     pub const DELETE: &str = "delete";
     pub const ADD_TO_VCS: &str = "add_to_vcs";
     pub const ADD_TO_GITIGNORE: &str = "add_to_gitignore";
+    pub const NEW_CHANGELIST: &str = "new_changelist";
+    pub const EDIT_CHANGELIST: &str = "edit_changelist";
+    pub const CREATE_PATCH: &str = "create_patch";
+    pub const COPY_AS_PATCH: &str = "copy_as_patch";
     pub const SHELVE: &str = "shelve";
     pub const REFRESH: &str = "refresh";
+    pub const COMPARE_WITH_BRANCH: &str = "git.compare_branch";
+    pub const SHOW_HISTORY: &str = "git.show_history";
     pub const BRANCHES: &str = "git.branches";
     pub const FETCH: &str = "git.fetch";
     pub const PUSH: &str = "git.push";
@@ -384,19 +392,27 @@ pub fn menu_items_for(state: EntryMenuState) -> Vec<MenuItemSpec> {
     vec![
         item(commit_label, state.has_files, ids::COMMIT_FILE),
         item("Rollback...", tracked, ids::ROLLBACK),
+        item("Move to Another Changelist...", tracked, ids::MOVE_CHANGELIST),
         MenuItemSpec::separator(),
         item("Show Diff", tracked, ids::SHOW_DIFF),
         item("Show Diff in a New Tab", tracked, ids::SHOW_DIFF_NEW_TAB),
         item("Jump to Source", state.has_files && !state.deleted, ids::JUMP_TO_SOURCE),
         item("Copy Path/Reference...", state.has_files, ids::COPY_PATH),
+        item("Ask Agent with Context", state.has_files, ids::ASK_AI),
         MenuItemSpec::separator(),
         item("Delete...", state.has_files, ids::DELETE),
         item("Add to VCS", state.has_files && !state.staged, ids::ADD_TO_VCS),
         item("Add to .gitignore", state.has_files && state.untracked, ids::ADD_TO_GITIGNORE),
         MenuItemSpec::separator(),
+        item("+ New Changelist...", true, ids::NEW_CHANGELIST),
+        item("Edit Changelist...", true, ids::EDIT_CHANGELIST),
+        item("Create Patch from Local Changes...", tracked, ids::CREATE_PATCH),
+        item("Copy as Patch to Clipboard", tracked, ids::COPY_AS_PATCH),
         item("Shelve Changes...", tracked, ids::SHELVE),
         MenuItemSpec::separator(),
         item("Refresh", true, ids::REFRESH),
+        item("Compare with Branch...", tracked, ids::COMPARE_WITH_BRANCH),
+        item("Show History", tracked, ids::SHOW_HISTORY),
         item("Branches...", true, ids::BRANCHES),
         item("Fetch", true, ids::FETCH),
         item("Push...", true, ids::PUSH),
@@ -434,15 +450,23 @@ mod entry_menu_tests {
             vec![
                 "Commit File...",
                 "Rollback...",
+                "Move to Another Changelist...",
                 "Show Diff",
                 "Show Diff in a New Tab",
                 "Jump to Source",
                 "Copy Path/Reference...",
+                "Ask Agent with Context",
                 "Delete...",
                 "Add to VCS",
                 "Add to .gitignore",
+                "+ New Changelist...",
+                "Edit Changelist...",
+                "Create Patch from Local Changes...",
+                "Copy as Patch to Clipboard",
                 "Shelve Changes...",
                 "Refresh",
+                "Compare with Branch...",
+                "Show History",
                 "Branches...",
                 "Fetch",
                 "Push...",
@@ -469,7 +493,7 @@ mod entry_menu_tests {
             .enumerate()
             .filter_map(|(index, item)| item.is_separator().then_some(index))
             .collect();
-        assert_eq!(separator_indices, vec![2, 7, 11, 13]);
+        assert_eq!(separator_indices, vec![3, 9, 13, 19]);
     }
 
     #[test]
@@ -553,7 +577,16 @@ mod entry_menu_tests {
             .collect();
         assert_eq!(
             git_actions,
-            vec![ids::BRANCHES, ids::FETCH, ids::PUSH, ids::PULL]
+            vec![
+                ids::COMPARE_WITH_BRANCH,
+                ids::SHOW_HISTORY,
+                ids::BRANCHES,
+                ids::FETCH,
+                ids::PUSH,
+                ids::PULL,
+                ids::STASH_CHANGES,
+                ids::UNSTASH_CHANGES,
+            ]
         );
     }
 }
