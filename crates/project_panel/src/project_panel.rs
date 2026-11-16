@@ -1210,6 +1210,7 @@ impl ProjectPanel {
             };
             let deploy_file_abs = worktree.abs_path().join(entry.path.as_ref()).to_string_lossy().replace('\\', "/");
             let deploy_file_rel = entry.path.to_string().replace('\\', "/");
+            let has_git_changes = !is_dir && self.has_git_changes(entry_id);
 
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
@@ -1224,9 +1225,80 @@ impl ProjectPanel {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
                     } else {
-                        menu.action("New File", Box::new(NewFile))
-                            .action("New Folder", Box::new(NewDirectory))
+                        menu
+                            // 1. New > (submenu)
+                            .submenu("New", move |menu, _, _| {
+                                menu.action("PHP Class", Box::new(NewFile))
+                                    .action("File", Box::new(NewFile))
+                                    .action("Directory", Box::new(NewDirectory))
+                                    .separator()
+                                    .action("PHP File", Box::new(NewFile))
+                                    .action("HTML File", Box::new(NewFile))
+                                    .action("Stylesheet", Box::new(NewFile))
+                                    .action("JavaScript File", Box::new(NewFile))
+                            })
+                            // 2. Cut
+                            .action("Cut", Box::new(Cut))
+                            // 3. Copy
+                            .action("Copy", Box::new(Copy))
+                            // 4. Copy Path/Reference… (submenu)
+                            .submenu("Copy Path/Reference…", move |menu, _, _| {
+                                let mut menu = menu
+                                    .action("Copy Path", Box::new(zed_actions::workspace::CopyPath))
+                                    .action(
+                                        "Copy Relative Path",
+                                        Box::new(zed_actions::workspace::CopyRelativePath),
+                                    );
+                                if has_git_repo && !is_dir {
+                                    menu = menu.action(
+                                        "Copy File Permalink",
+                                        git::CopyFilePermalink.boxed_clone(),
+                                    );
+                                }
+                                menu
+                            })
+                            // 5. Paste
+                            .action_disabled_when(!has_pasteable_content, "Paste", Box::new(Paste))
+                            // 6. (separator)
                             .separator()
+                            // 7. Find in Files…
+                            .action("Find in Files…", Box::new(NewSearchInDirectory))
+                            // 8. Replace in Files…
+                            .action("Replace in Files…", Box::new(NewSearchInDirectory))
+                            // 9. (separator)
+                            .separator()
+                            // 10. Refactor > (submenu: Rename…, Move…, Duplicate)
+                            .submenu("Refactor", move |menu, _, _| {
+                                let mut sub = menu;
+                                if !should_hide_rename {
+                                    sub = sub.action("Rename…", Box::new(Rename));
+                                }
+                                sub.action("Move…", Box::new(Rename))
+                                    .action("Duplicate", Box::new(Duplicate))
+                            })
+                            .when(!is_root && !is_collab, |menu| {
+                                menu.action("Delete…", Box::new(Trash { skip_prompt: false }))
+                            })
+                            // 11. (separator)
+                            .when((has_git_repo && has_git_changes) || should_show_compare, |menu| {
+                                menu.separator()
+                                    // 12. Restore File… / Add to VCS
+                                    .when(has_git_repo && has_git_changes, |menu| {
+                                        menu.action(
+                                            "Restore File…",
+                                            Box::new(git::RestoreFile { skip_prompt: false }),
+                                        )
+                                    })
+                                    // 13. Compare With…
+                                    .when(should_show_compare, |menu| {
+                                        menu.action("Compare With…", Box::new(CompareMarkedFiles))
+                                    })
+                            })
+                            // 14. (separator)
+                            .separator()
+                            // 15. Open in Terminal
+                            .action("Open in Terminal", Box::new(OpenInTerminal))
+                            // 16. Show in Finder / Reveal in File Manager
                             .when(is_local, |menu| {
                                 menu.action(
                                     ui::utils::reveal_in_file_manager_label(is_remote),
@@ -1236,21 +1308,52 @@ impl ProjectPanel {
                             .when(is_local, |menu| {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
                             })
-                            .action("Open in Terminal", Box::new(OpenInTerminal))
-                            .when(is_sqlite_file, |menu| {
-                                menu.separator().action(
-                                    "Add as Data Source",
-                                    Box::new(php_panel::AddAsDataSource {
-                                        abs_path: sqlite_file_abs_path.clone(),
-                                    }),
-                                )
+                            // 17. (separator)
+                            .separator()
+                            // 18. Local History > (submenu)
+                            .submenu("Local History", move |menu, _, _| {
+                                menu.action("Show History", Box::new(git::FileHistory))
                             })
-                            .when(has_deploy_servers, |menu| {
+                            // 19. Git > (submenu)
+                            .when(has_git_repo, |menu| {
+                                menu.submenu("Git", move |menu, _, _| {
+                                    let mut sub = menu;
+                                    if has_git_changes {
+                                        sub = sub.action(
+                                            "Restore File…",
+                                            Box::new(git::RestoreFile { skip_prompt: false }),
+                                        );
+                                    }
+                                    sub = sub
+                                        .action("Add to .gitignore", Box::new(git::AddToGitignore))
+                                        .action(
+                                            "Add to .git/info/exclude",
+                                            Box::new(git::AddToGitInfoExclude),
+                                        );
+                                    if has_history {
+                                        sub = sub.action("Show History", Box::new(git::FileHistory));
+                                    }
+                                    if !is_dir {
+                                        sub = sub
+                                            .action(
+                                                "Open File Permalink",
+                                                git::OpenFilePermalink.boxed_clone(),
+                                            )
+                                            .action(
+                                                "Copy File Permalink",
+                                                git::CopyFilePermalink.boxed_clone(),
+                                            );
+                                    }
+                                    sub
+                                })
+                            })
+                            // 20. Deployment > (submenu)
+                            .submenu("Deployment", move |menu, _, _| {
                                 let s_label = active_deploy_server.as_deref().unwrap_or("Server").to_string();
                                 let abs = deploy_file_abs.clone();
                                 let rel = deploy_file_rel.clone();
                                 let srv = active_deploy_server.clone();
-                                menu.separator()
+                                let mut sub = menu
                                     .action(
                                         format!("Upload to {s_label}"),
                                         Box::new(php_panel::UploadToDeployServer {
@@ -1259,42 +1362,63 @@ impl ProjectPanel {
                                             server: srv.clone(),
                                         }),
                                     )
-                                    .submenu("Deployment", move |menu, _, _| {
-                                        let mut sub = menu
-                                            .action(
-                                                format!("Upload to {s_label}"),
-                                                Box::new(php_panel::UploadToDeployServer {
-                                                    abs_path: Some(abs.clone()),
-                                                    rel_path: Some(rel.clone()),
-                                                    server: srv.clone(),
-                                                }),
-                                            )
-                                            .action(
-                                                format!("Download from {s_label}"),
-                                                Box::new(php_panel::DownloadFromDeployServer {
-                                                    abs_path: Some(abs.clone()),
-                                                    rel_path: Some(rel.clone()),
-                                                    server: srv.clone(),
-                                                }),
-                                            );
-                                        if !is_dir {
-                                            sub = sub.action(
-                                                format!("Compare with Deployed on {s_label}"),
-                                                Box::new(php_panel::CompareWithDeployServer {
-                                                    abs_path: Some(abs.clone()),
-                                                    rel_path: Some(rel.clone()),
-                                                    server: srv.clone(),
-                                                }),
-                                            );
-                                        }
-                                        sub.action(
-                                            format!("Sync with {s_label}…"),
-                                            Box::new(php_panel::SyncWithDeployServer {
-                                                rel_path: Some(rel.clone()),
-                                                server: srv.clone(),
-                                            }),
-                                        )
-                                    })
+                                    .action(
+                                        "Upload to…",
+                                        Box::new(php_panel::UploadToDeployServer {
+                                            abs_path: Some(abs.clone()),
+                                            rel_path: Some(rel.clone()),
+                                            server: None,
+                                        }),
+                                    )
+                                    .action(
+                                        format!("Download from {s_label}"),
+                                        Box::new(php_panel::DownloadFromDeployServer {
+                                            abs_path: Some(abs.clone()),
+                                            rel_path: Some(rel.clone()),
+                                            server: srv.clone(),
+                                        }),
+                                    )
+                                    .action(
+                                        "Download from…",
+                                        Box::new(php_panel::DownloadFromDeployServer {
+                                            abs_path: Some(abs.clone()),
+                                            rel_path: Some(rel.clone()),
+                                            server: None,
+                                        }),
+                                    );
+                                if !is_dir {
+                                    sub = sub.action(
+                                        format!("Compare with Deployed on {s_label}"),
+                                        Box::new(php_panel::CompareWithDeployServer {
+                                            abs_path: Some(abs.clone()),
+                                            rel_path: Some(rel.clone()),
+                                            server: srv.clone(),
+                                        }),
+                                    );
+                                }
+                                sub = sub.action(
+                                    format!("Sync with {s_label}…"),
+                                    Box::new(php_panel::SyncWithDeployServer {
+                                        rel_path: Some(rel.clone()),
+                                        server: srv.clone(),
+                                    }),
+                                );
+                                if !has_deploy_servers {
+                                    sub = sub.separator().action(
+                                        "Configuration…",
+                                        Box::new(php_panel::OpenDeploymentDialog),
+                                    );
+                                }
+                                sub
+                            })
+                            // Additional contextual operations
+                            .when(is_sqlite_file, |menu| {
+                                menu.separator().action(
+                                    "Add as Data Source",
+                                    Box::new(php_panel::AddAsDataSource {
+                                        abs_path: sqlite_file_abs_path.clone(),
+                                    }),
+                                )
                             })
                             .when(is_markdown, |menu| {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
@@ -1302,76 +1426,25 @@ impl ProjectPanel {
                             .when(is_svg, |menu| {
                                 menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
                             })
-                            .when(is_dir, |menu| {
-                                menu.separator()
-                                    .action("Find in Folder…", Box::new(NewSearchInDirectory))
-                            })
                             .when(is_unfoldable, |menu| {
                                 menu.action("Unfold Directory", Box::new(UnfoldDirectory))
                             })
                             .when(is_foldable, |menu| {
                                 menu.action("Fold Directory", Box::new(FoldDirectory))
                             })
-                            .when(should_show_compare, |menu| {
-                                menu.separator()
-                                    .action("Compare Marked Files", Box::new(CompareMarkedFiles))
-                            })
-                            .separator()
-                            .action("Cut", Box::new(Cut))
-                            .action("Copy", Box::new(Copy))
-                            .action("Duplicate", Box::new(Duplicate))
-                            .action_disabled_when(!has_pasteable_content, "Paste", Box::new(Paste))
-                            .when(!is_collab, |menu| {
-                                let can_undo = self.undo_manager.can_undo();
-                                let can_redo = self.undo_manager.can_redo();
-
-                                menu.action_disabled_when(!can_undo, "Undo", Box::new(Undo))
-                                    .action_disabled_when(!can_redo, "Redo", Box::new(Redo))
-                            })
                             .when(is_remote, |menu| {
                                 menu.separator()
                                     .action("Download...", Box::new(DownloadFromRemote))
                             })
-                            .separator()
-                            .action("Copy Path", Box::new(zed_actions::workspace::CopyPath))
-                            .action(
-                                "Copy Relative Path",
-                                Box::new(zed_actions::workspace::CopyRelativePath),
-                            )
-                            .when(has_git_repo, |menu| {
+                            .when(!is_collab, |menu| {
+                                let can_undo = self.undo_manager.can_undo();
+                                let can_redo = self.undo_manager.can_redo();
+
                                 menu.separator()
-                                    .when(!is_dir && self.has_git_changes(entry_id), |menu| {
-                                        menu.action(
-                                            "Restore File",
-                                            Box::new(git::RestoreFile { skip_prompt: false }),
-                                        )
-                                    })
-                                    .action("Add to .gitignore", Box::new(git::AddToGitignore))
-                                    .action(
-                                        "Add to .git/info/exclude",
-                                        Box::new(git::AddToGitInfoExclude),
-                                    )
-                                    .when(has_history, |menu| {
-                                        menu.action("View History", Box::new(git::FileHistory))
-                                    })
-                                    .when(!is_dir, |menu| {
-                                        menu.action(
-                                            "Open File Permalink",
-                                            git::OpenFilePermalink.boxed_clone(),
-                                        )
-                                        .action(
-                                            "Copy File Permalink",
-                                            git::CopyFilePermalink.boxed_clone(),
-                                        )
-                                    })
+                                    .action_disabled_when(!can_undo, "Undo", Box::new(Undo))
+                                    .action_disabled_when(!can_redo, "Redo", Box::new(Redo))
                             })
-                            .when(!should_hide_rename, |menu| {
-                                menu.separator().action("Rename", Box::new(Rename))
-                            })
-                            .when(!is_root && !is_collab, |menu| {
-                                menu.action("Trash", Box::new(Trash { skip_prompt: false }))
-                            })
-                            .when(!is_root, |menu| {
+                            .when(!is_root && is_collab, |menu| {
                                 menu.action("Delete", Box::new(Delete { skip_prompt: false }))
                             })
                             .when(!is_collab && is_root, |menu| {

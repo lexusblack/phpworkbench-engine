@@ -1,11 +1,39 @@
-use collab_ui::collab_panel;
-use gpui::{App, Menu, MenuItem, OsAction};
-use release_channel::ReleaseChannel;
-use php_panel;
-use terminal_view::terminal_panel;
-use zed_actions::{Quit, debug_panel, dev, git_panel, project_panel};
 use editor::actions as editor_actions;
+use encoding_selector;
+use git;
 use git_ui::{git_panel as git_ui_panel, git_picker, push_dialog};
+use gpui::{App, Menu, MenuItem, OsAction};
+use line_ending_selector;
+use php_panel;
+use project_panel;
+use release_channel::ReleaseChannel;
+use terminal_view::terminal_panel;
+use zed_actions::{debug_panel, dev, git_panel, project_panel as zed_project_panel, Quit};
+
+pub mod phpstorm_menu {
+    use gpui::actions;
+
+    actions!(
+        phpstorm_menu,
+        [
+            PowerSaveMode,
+            Print,
+            RecentLocations,
+            LastEditLocation,
+            OverrideMethods,
+            ImplementMethods,
+            GenerateCode,
+            SurroundWith,
+            ChangeSignature,
+            ExtractMethod,
+            ExtractVariable,
+            MoveRefactoring,
+            CopyFile,
+            StartListeningForPhpDebugConnections,
+            Merge,
+        ]
+    );
+}
 
 pub fn app_menus(cx: &mut App) -> Vec<Menu> {
     let mut dev_items = Vec::new();
@@ -19,7 +47,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
 
     vec![
         // =========================================================================
-        // 1. PhpStorm / PhpWorkbench (macOS Application Menu)
+        // 1. PhpWorkbench (macOS Application Menu)
         // =========================================================================
         Menu {
             name: "PhpWorkbench".into(),
@@ -74,12 +102,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "File".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("New…", workspace::NewFile),
+                MenuItem::action("New Project…", workspace::NewWindow),
+                MenuItem::action("Get from Version Control…", git::Clone),
+                MenuItem::action("New…", project_panel::NewFile),
                 MenuItem::action("New Scratch File", workspace::NewFile),
-                MenuItem::action("New Window", workspace::NewWindow),
-                MenuItem::separator(),
-                #[cfg(not(target_os = "macos"))]
-                MenuItem::action("Open File...", workspace::OpenFiles),
                 MenuItem::action(
                     if cfg!(not(target_os = "macos")) {
                         "Open Folder..."
@@ -88,36 +114,43 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     },
                     workspace::Open::default(),
                 ),
-                MenuItem::action("Open Recent…", zed_actions::OpenRecent::default()),
-                MenuItem::action("Connect to Remote…", zed_actions::OpenRemote::default()),
-                MenuItem::separator(),
-                MenuItem::action("Add Folder to Project…", workspace::AddFolderToProject),
-                MenuItem::separator(),
-                MenuItem::action("Save", workspace::Save { save_intent: None }),
                 MenuItem::action("Save As…", workspace::SaveAs),
+                MenuItem::submenu(Menu::new("Recent Projects").items([
+                    MenuItem::action("Manage Projects…", zed_actions::OpenRecent::default()),
+                ])),
+                MenuItem::action("Close Project", workspace::CloseWindow),
+                MenuItem::action("Close All Projects", workspace::CloseAllItemsAndPanes::default()),
+                MenuItem::action("Rename Project…", project_panel::Rename),
+                MenuItem::separator(),
+                MenuItem::action("Connect to Remote…", php_panel::OpenDeploymentDialog),
+                MenuItem::separator(),
+                MenuItem::action("Plugins…", zed_actions::Extensions::default()),
+                MenuItem::submenu(Menu::new("File Properties").items([
+                    MenuItem::action("Line Separators…", line_ending_selector::Toggle),
+                    MenuItem::action("File Encoding…", encoding_selector::Toggle),
+                ])),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu::new("Local History").items([
+                    MenuItem::action("Show History", git::FileHistory),
+                ])),
+                MenuItem::separator(),
                 MenuItem::action("Save All", workspace::SaveAll { save_intent: None }),
                 MenuItem::action("Reload All from Disk", workspace::ReloadActiveItem),
-                MenuItem::separator(),
                 MenuItem::action("Repair IDE", workspace::ReloadActiveItem),
                 MenuItem::action("Invalidate Caches…", workspace::Reload),
-                MenuItem::submenu(Menu::new("Manage IDE Settings").items([
-                    MenuItem::action("Open Settings", zed_actions::OpenSettings),
-                    MenuItem::action("Export Settings…", zed_actions::OpenSettingsFile),
-                    MenuItem::action("Restore Default Settings…", super::OpenDefaultSettings),
-                ])),
-                MenuItem::submenu(Menu::new("File Properties").items([
-                    MenuItem::action("Make File Read-Only", workspace::ToggleReadOnlyFile),
-                ])),
                 MenuItem::separator(),
-                MenuItem::action(
-                    "Close Editor",
-                    workspace::CloseActiveItem {
-                        save_intent: None,
-                        close_pinned: true,
-                    },
-                ),
-                MenuItem::action("Close Project", workspace::CloseProject),
-                MenuItem::action("Close Window", workspace::CloseWindow),
+                MenuItem::submenu(Menu::new("Manage IDE Settings").items([
+                    MenuItem::action("Settings…", zed_actions::OpenSettings),
+                    MenuItem::action("Keymap…", zed_actions::OpenKeymap),
+                    MenuItem::action(
+                        "Theme…",
+                        zed_actions::theme_selector::Toggle::default(),
+                    ),
+                ])),
+                MenuItem::action("Export", zed_actions::OpenSettingsFile),
+                MenuItem::action("Print…", phpstorm_menu::Print),
+                MenuItem::separator(),
+                MenuItem::action("Power Save Mode", phpstorm_menu::PowerSaveMode),
             ],
         },
 
@@ -133,13 +166,21 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::os_action("Cut", editor_actions::Cut, OsAction::Cut),
                 MenuItem::os_action("Copy", editor_actions::Copy, OsAction::Copy),
-                MenuItem::action("Copy as Plain Text", editor_actions::CopyAndTrim),
+                MenuItem::action("Copy Path/Reference…", zed_actions::workspace::CopyPath),
                 MenuItem::os_action("Paste", editor_actions::Paste, OsAction::Paste),
-                MenuItem::action("Delete", editor_actions::Delete),
                 MenuItem::separator(),
-                MenuItem::action("Find", search::buffer_search::Deploy::find()),
-                MenuItem::action("Find in Files…", workspace::DeploySearch::default()),
-                MenuItem::action("Replace in Files…", workspace::DeploySearch::default()),
+                MenuItem::submenu(Menu::new("Find").items([
+                    MenuItem::action("Find in File", search::buffer_search::Deploy::find()),
+                    MenuItem::action("Replace in File", search::buffer_search::Deploy::replace()),
+                    MenuItem::action("Find in Files…", workspace::DeploySearch::default()),
+                    MenuItem::action(
+                        "Replace in Files…",
+                        workspace::DeploySearch {
+                            replace_enabled: true,
+                            ..Default::default()
+                        },
+                    ),
+                ])),
                 MenuItem::action("Find Usages", editor_actions::FindAllReferences::default()),
                 MenuItem::separator(),
                 MenuItem::os_action(
@@ -147,47 +188,38 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     editor_actions::SelectAll,
                     OsAction::SelectAll,
                 ),
-                MenuItem::action("Extend Selection", editor_actions::SelectLargerSyntaxNode),
-                MenuItem::action("Shrink Selection", editor_actions::SelectSmallerSyntaxNode),
                 MenuItem::action(
                     "Add Carets to Ends of Selected Lines",
                     editor_actions::SplitSelectionIntoLines::default(),
                 ),
-                MenuItem::action(
-                    "Add Cursor Above",
-                    editor_actions::AddSelectionAbove {
-                        skip_soft_wrap: true,
-                    },
-                ),
-                MenuItem::action(
-                    "Add Cursor Below",
-                    editor_actions::AddSelectionBelow {
-                        skip_soft_wrap: true,
-                    },
-                ),
-                MenuItem::action(
-                    "Select Next Occurrence",
-                    editor_actions::SelectNext {
-                        replace_newest: false,
-                    },
-                ),
-                MenuItem::action(
-                    "Select Previous Occurrence",
-                    editor_actions::SelectPrevious {
-                        replace_newest: false,
-                    },
-                ),
-                MenuItem::action("Select All Occurrences", editor_actions::SelectAllMatches),
+                MenuItem::action("Extend Selection", editor_actions::SelectLargerSyntaxNode),
+                MenuItem::action("Shrink Selection", editor_actions::SelectSmallerSyntaxNode),
                 MenuItem::separator(),
-                MenuItem::action("Move Line Up", editor_actions::MoveLineUp),
-                MenuItem::action("Move Line Down", editor_actions::MoveLineDown),
+                MenuItem::action("Toggle Case", editor_actions::ToggleCase),
+                MenuItem::action("Join Lines", editor_actions::JoinLines),
                 MenuItem::action("Duplicate Line or Selection", editor_actions::DuplicateLineDown),
+                MenuItem::action("Sort Lines", editor_actions::SortLinesCaseInsensitive),
+                MenuItem::action("Reverse Lines", editor_actions::ReverseLines),
+                MenuItem::separator(),
                 MenuItem::action("Indent Selection", editor_actions::Indent),
                 MenuItem::action("Unindent Line or Selection", editor_actions::Outdent),
                 MenuItem::submenu(Menu::new("Convert Indents").items([
                     MenuItem::action("To Spaces", editor_actions::ConvertIndentationToSpaces),
                     MenuItem::action("To Tabs", editor_actions::ConvertIndentationToTabs),
                 ])),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu::new("Bookmarks").items([
+                    MenuItem::action("Toggle Bookmark", editor_actions::ToggleBookmark),
+                    MenuItem::action(
+                        "Toggle Bookmark with Label",
+                        editor_actions::ToggleBookmarkWithLabel,
+                    ),
+                    MenuItem::action("Show Bookmarks", editor_actions::ViewBookmarks),
+                    MenuItem::action("Next Bookmark", editor_actions::GoToNextBookmark),
+                    MenuItem::action("Previous Bookmark", editor_actions::GoToPreviousBookmark),
+                ])),
+                MenuItem::separator(),
+                MenuItem::action("Emoji & Symbols", editor_actions::ShowCharacterPalette),
             ],
         },
 
@@ -200,58 +232,31 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             items: {
                 let mut items = vec![
                     MenuItem::submenu(Menu::new("Tool Windows").items([
-                        MenuItem::action("Project (⌘1)", project_panel::ToggleFocus),
+                        MenuItem::action("Project (⌘1)", zed_project_panel::ToggleFocus),
                         MenuItem::action("Commit (⌘0)", git_panel::ToggleFocus),
-                        MenuItem::action("Database", php_panel::ToggleFocus),
-                        MenuItem::action("Services (Remote Host)", php_panel::BrowseRemoteHost),
-                        MenuItem::action("HTTP Client", php_panel::OpenHttpClient),
                         MenuItem::action("Terminal (⌥F12)", terminal_panel::Toggle),
+                        MenuItem::action("Database", php_panel::ToggleFocus),
+                        MenuItem::action("Remote Host", php_panel::BrowseRemoteHost),
+                        MenuItem::action("HTTP Client", php_panel::OpenHttpClient),
                         MenuItem::action("Structure (⌘7)", outline_panel::ToggleFocus),
-                        MenuItem::action("Problems / Diagnostics (⌘6)", diagnostics::Deploy),
-                        MenuItem::action(
-                            "Run / Tasks (⌃⌥R)",
-                            zed_actions::Spawn::ViaModal {
-                                reveal_target: None,
-                            },
-                        ),
+                        MenuItem::action("Problems (⌘6)", diagnostics::Deploy),
                         MenuItem::action("Debug (⌘5)", debug_panel::ToggleFocus),
-                        MenuItem::action("Git", git_panel::ToggleFocus),
-                        MenuItem::action("Collab / Channels", collab_panel::ToggleFocus),
-                        MenuItem::action("Notifications", workspace::ToggleBottomDock),
-                        MenuItem::action("File Transfer", php_panel::BrowseRemoteHost),
                     ])),
-                    MenuItem::separator(),
                     MenuItem::submenu(Menu::new("Appearance").items([
-                        MenuItem::action("Toggle Left Dock", workspace::ToggleLeftDock),
-                        MenuItem::action("Toggle Right Dock", workspace::ToggleRightDock),
-                        MenuItem::action("Toggle Bottom Dock", workspace::ToggleBottomDock),
-                        MenuItem::action("Toggle All Docks", workspace::ToggleAllDocks),
-                        MenuItem::action("Toggle Centered Layout", workspace::ToggleCenteredLayout),
-                        MenuItem::action("Toggle Editor Zoom", workspace::ToggleEditorZoom),
+                        MenuItem::action(
+                            "Zoom In",
+                            zed_actions::IncreaseBufferFontSize { persist: false },
+                        ),
+                        MenuItem::action(
+                            "Zoom Out",
+                            zed_actions::DecreaseBufferFontSize { persist: false },
+                        ),
+                        MenuItem::action(
+                            "Reset Zoom",
+                            zed_actions::ResetBufferFontSize { persist: false },
+                        ),
+                        MenuItem::action("Toggle Full Screen", super::ToggleFullScreen),
                     ])),
-                    MenuItem::submenu(Menu::new("Editor Layout").items([
-                        MenuItem::action("Split Up", workspace::SplitUp::default()),
-                        MenuItem::action("Split Down", workspace::SplitDown::default()),
-                        MenuItem::action("Split Left", workspace::SplitLeft::default()),
-                        MenuItem::action("Split Right", workspace::SplitRight::default()),
-                    ])),
-                    MenuItem::separator(),
-                    MenuItem::action(
-                        "Zoom In",
-                        zed_actions::IncreaseBufferFontSize { persist: false },
-                    ),
-                    MenuItem::action(
-                        "Zoom Out",
-                        zed_actions::DecreaseBufferFontSize { persist: false },
-                    ),
-                    MenuItem::action(
-                        "Reset Zoom",
-                        zed_actions::ResetBufferFontSize { persist: false },
-                    ),
-                    MenuItem::action(
-                        "Reset Font Size in All Editors",
-                        zed_actions::ResetAllZoom { persist: false },
-                    ),
                     MenuItem::separator(),
                     MenuItem::action(
                         "Quick Definition",
@@ -261,8 +266,22 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                         "Quick Type Definition",
                         editor_actions::GoToTypeDefinition::default(),
                     ),
+                    MenuItem::action(
+                        "Jump to Source",
+                        editor_actions::GoToDeclaration::default(),
+                    ),
+                    MenuItem::action("Open in Right Split", workspace::SplitRight::default()),
+                    MenuItem::separator(),
                     MenuItem::action("Recent Files", workspace::ToggleFileFinder::default()),
-                    MenuItem::action("Recent Changes", git_panel::ToggleFocus),
+                    MenuItem::action("Recent Locations", phpstorm_menu::RecentLocations),
+                    MenuItem::action(
+                        "Compare With…",
+                        git_ui::project_diff::CompareWithBranch,
+                    ),
+                    MenuItem::action(
+                        "Compare with Clipboard",
+                        editor_actions::DiffClipboardWithSelection,
+                    ),
                 ];
                 items.extend(dev_items);
                 items
@@ -276,24 +295,24 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "Navigate".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("Search Everywhere", zed_actions::command_palette::Toggle),
-                MenuItem::action("Class…", zed_actions::outline::ToggleOutline),
-                MenuItem::action("File…", workspace::ToggleFileFinder::default()),
-                MenuItem::action("Symbol…", zed_actions::outline::ToggleOutline),
-                MenuItem::action("Line/Column…", editor_actions::ToggleGoToLine),
-                MenuItem::separator(),
                 MenuItem::action("Back", workspace::GoBack),
                 MenuItem::action("Forward", workspace::GoForward),
+                MenuItem::separator(),
+                MenuItem::action("Search Everywhere", zed_actions::command_palette::Toggle),
+                MenuItem::action("Class…", workspace::ToggleProjectSymbols),
+                MenuItem::action("File…", workspace::ToggleFileFinder::default()),
+                MenuItem::action("Symbol…", workspace::ToggleProjectSymbols),
                 MenuItem::separator(),
                 MenuItem::action("Next Highlighted Error", editor_actions::GoToDiagnostic::default()),
                 MenuItem::action(
                     "Previous Highlighted Error",
                     editor_actions::GoToPreviousDiagnostic::default(),
                 ),
+                MenuItem::action("Last Edit Location", phpstorm_menu::LastEditLocation),
                 MenuItem::separator(),
                 MenuItem::action(
                     "Declaration or Usages",
-                    editor_actions::GoToDeclaration::default(),
+                    editor_actions::GoToDefinition::default(),
                 ),
                 MenuItem::action(
                     "Implementation(s)",
@@ -303,11 +322,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     "Type Declaration",
                     editor_actions::GoToTypeDefinition::default(),
                 ),
-                MenuItem::action(
-                    "Find Usages",
-                    editor_actions::FindAllReferences::default(),
-                ),
-                MenuItem::action("Call Hierarchy", call_hierarchy::ShowIncomingCalls),
+                MenuItem::separator(),
                 MenuItem::action("File Structure", zed_actions::outline::ToggleOutline),
             ],
         },
@@ -319,20 +334,19 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "Code".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("Code Completion", editor_actions::ConfirmCompletion::default()),
-                MenuItem::action(
-                    "Intention Actions / Code Actions",
-                    editor_actions::ToggleCodeActions::default(),
-                ),
+                MenuItem::action("Override Methods…", phpstorm_menu::OverrideMethods),
+                MenuItem::action("Implement Methods…", phpstorm_menu::ImplementMethods),
+                MenuItem::action("Generate…", phpstorm_menu::GenerateCode),
                 MenuItem::separator(),
-                MenuItem::action("Reformat Code", editor_actions::Format),
-                MenuItem::action("Auto-Indent Lines", editor_actions::AutoIndent),
+                MenuItem::action("Code Completion", editor_actions::ShowCompletions),
+                MenuItem::action("Inspect Code…", diagnostics::Deploy),
+                MenuItem::separator(),
+                MenuItem::action("Surround With…", phpstorm_menu::SurroundWith),
                 MenuItem::submenu(Menu::new("Folding").items([
-                    MenuItem::action("Expand", editor_actions::UnfoldAll),
-                    MenuItem::action("Collapse", editor_actions::FoldAll),
-                    MenuItem::action("Toggle Fold", editor_actions::ToggleFold),
-                    MenuItem::action("Fold Recursive", editor_actions::FoldRecursive),
-                    MenuItem::action("Fold All", editor_actions::FoldAll),
+                    MenuItem::action("Expand", editor_actions::UnfoldLines),
+                    MenuItem::action("Collapse", editor_actions::Fold),
+                    MenuItem::action("Expand All", editor_actions::UnfoldAll),
+                    MenuItem::action("Collapse All", editor_actions::FoldAll),
                 ])),
                 MenuItem::separator(),
                 MenuItem::action(
@@ -343,11 +357,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     "Comment with Block Comment",
                     editor_actions::ToggleBlockComments,
                 ),
-                MenuItem::separator(),
-                MenuItem::action("Move Statement Down", editor_actions::MoveLineDown),
+                MenuItem::action("Reformat Code", editor_actions::Format),
+                MenuItem::action("Optimize Imports", editor_actions::OrganizeImports),
                 MenuItem::action("Move Statement Up", editor_actions::MoveLineUp),
-                MenuItem::action("Duplicate Line or Selection", editor_actions::DuplicateLineDown),
-                MenuItem::action("Inspect Code…", diagnostics::Deploy),
+                MenuItem::action("Move Statement Down", editor_actions::MoveLineDown),
             ],
         },
 
@@ -360,8 +373,11 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Refactor This…", editor_actions::ToggleCodeActions::default()),
                 MenuItem::action("Rename…", editor_actions::Rename),
-                MenuItem::action("Format Selection", editor_actions::FormatSelections),
-                MenuItem::action("Copy…", editor_actions::Copy),
+                MenuItem::action("Change Signature…", phpstorm_menu::ChangeSignature),
+                MenuItem::action("Extract Method…", phpstorm_menu::ExtractMethod),
+                MenuItem::action("Extract Variable…", phpstorm_menu::ExtractVariable),
+                MenuItem::action("Move…", phpstorm_menu::MoveRefactoring),
+                MenuItem::action("Copy File…", phpstorm_menu::CopyFile),
             ],
         },
 
@@ -378,19 +394,15 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                         reveal_target: None,
                     },
                 ),
-                MenuItem::action("Start Debugger", debugger_ui::Start),
+                MenuItem::action("Debug…", debugger_ui::Start),
                 MenuItem::action("Edit Configurations…", zed_actions::OpenProjectDebugTasks),
-                MenuItem::action("Edit Tasks…", zed_actions::OpenProjectTasks),
-                MenuItem::separator(),
-                MenuItem::action("Continue / Resume Program", debugger_ui::Continue),
-                MenuItem::action("Step Over", debugger_ui::StepOver),
-                MenuItem::action("Step Into", debugger_ui::StepInto),
-                MenuItem::action("Step Out", debugger_ui::StepOut),
-                MenuItem::action("Stop", workspace::ShutdownDebugAdapters),
-                MenuItem::separator(),
-                MenuItem::action("Toggle Line Breakpoint", editor_actions::ToggleBreakpoint),
-                MenuItem::action("Edit Breakpoint…", editor_actions::EditLogBreakpoint),
-                MenuItem::action("Clear All Breakpoints", debugger_ui::ClearAllBreakpoints),
+                MenuItem::action("Stop", debugger_ui::Stop),
+                MenuItem::action("Toggle Breakpoint", editor_actions::ToggleBreakpoint),
+                MenuItem::action("View Breakpoints…", editor_actions::EditLogBreakpoint),
+                MenuItem::action(
+                    "Start Listening for PHP Debug Connections",
+                    phpstorm_menu::StartListeningForPhpDebugConnections,
+                ),
             ],
         },
 
@@ -581,18 +593,20 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Commit…", git_panel::ToggleFocus),
                 MenuItem::action("Push…", push_dialog::OpenPushDialog),
                 MenuItem::action("Update Project…", git_ui_panel::OpenMenu),
-                MenuItem::action("Fetch", git_ui_panel::OpenMenu),
-                MenuItem::action("Branches…", git_picker::ActivateBranchesTab),
-                MenuItem::action("Stash Changes…", git_picker::ActivateStashTab),
-                MenuItem::action("File History", git::FileHistory),
-                MenuItem::action("Git Blame", git::Blame),
-                MenuItem::action("Show Git Log", git_panel::ToggleFocus),
+                MenuItem::action("Pull…", git::Pull),
+                MenuItem::action("Fetch", git::Fetch),
                 MenuItem::separator(),
-                MenuItem::submenu(Menu::new("Patch").items([
-                    MenuItem::action("Create Patch from Local Changes…", git_ui_panel::FocusChanges),
-                    MenuItem::action("Apply Patch…", git_ui_panel::FocusChanges),
-                    MenuItem::action("Apply Patch from Clipboard…", git_ui_panel::FocusChanges),
-                ])),
+                MenuItem::action("Merge…", phpstorm_menu::Merge),
+                MenuItem::action("Rebase…", git::PullRebase),
+                MenuItem::separator(),
+                MenuItem::action("Branches…", git_picker::ActivateBranchesTab),
+                MenuItem::action("New Branch…", zed_actions::git::Branch),
+                MenuItem::action("New Tag…", git::CreateTagAtHead),
+                MenuItem::action("Reset HEAD…", git::RestoreTrackedFiles),
+                MenuItem::separator(),
+                MenuItem::action("Stash Changes…", git::StashAll),
+                MenuItem::action("Unstash Changes…", git::StashPop),
+                MenuItem::action("Show Git Log", git_panel::ToggleFocus),
             ],
         },
 
@@ -606,6 +620,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Minimize", super::Minimize),
                 MenuItem::action("Zoom", super::Zoom),
                 MenuItem::separator(),
+                MenuItem::submenu(Menu::new("Layouts").items([
+                    MenuItem::action("Restore Default Layout", workspace::ToggleAllDocks),
+                    MenuItem::action("Save Current Layout as Default", workspace::ToggleAllDocks),
+                ])),
                 MenuItem::submenu(Menu::new("Active Tool Window").items([
                     MenuItem::action("Hide Active Window", workspace::CloseActiveDock),
                     MenuItem::action("Hide All Tool Windows", workspace::ToggleAllDocks),
@@ -642,14 +660,14 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("Find Action…", zed_actions::command_palette::Toggle),
-                MenuItem::action("About PhpWorkbench", zed_actions::About),
+                MenuItem::action("Help Topics", zed_actions::OpenOnboarding),
+                MenuItem::action("What's New", zed_actions::About),
                 MenuItem::action("Keyboard Shortcuts PDF", zed_actions::OpenDefaultKeymap),
-                MenuItem::action("What's New in PhpWorkbench", zed_actions::About),
-                MenuItem::action("Getting Started", zed_actions::OpenOnboarding),
-                MenuItem::separator(),
-                MenuItem::action("Submit Feedback…", zed_actions::feedback::RequestFeature),
-                MenuItem::action("Submit a Bug Report…", zed_actions::feedback::FileBugReport),
-                MenuItem::action("View Dependency Licenses", zed_actions::OpenLicenses),
+                MenuItem::submenu(Menu::new("Diagnostic Tools").items([
+                    MenuItem::action("Troubleshooting / Diagnostics", diagnostics::Deploy),
+                    MenuItem::action("Open Log File", workspace::OpenLog),
+                ])),
+                MenuItem::action("Show Log in Finder", workspace::RevealLogInFileManager),
             ],
         },
     ]
