@@ -604,6 +604,94 @@ impl Editor {
         self.inlay_hint_visibility_changed(cx);
     }
 
+    pub fn collapse_doc_comments(
+        &mut self,
+        _: &CollapseDocComments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let buffer = display_map.buffer_snapshot();
+        let mut doc_comment_ranges = Vec::new();
+
+        let mut in_block_comment = false;
+        let mut block_start_row = 0;
+
+        for row in 0..=buffer.max_point().row {
+            let line_len = buffer.line_len(MultiBufferRow(row));
+            let line_text: String = buffer
+                .text_for_range(Point::new(row, 0)..Point::new(row, line_len))
+                .collect();
+            let trimmed = line_text.trim_start();
+
+            if !in_block_comment {
+                if trimmed.starts_with("/**") || trimmed.starts_with("/*") {
+                    in_block_comment = true;
+                    block_start_row = row;
+                }
+            }
+
+            if in_block_comment {
+                if trimmed.ends_with("*/") || trimmed.contains("*/") {
+                    in_block_comment = false;
+                    if row > block_start_row {
+                        let start_point = Point::new(block_start_row, 0);
+                        let end_point = Point::new(row, line_len);
+                        doc_comment_ranges.push(start_point..end_point);
+                    }
+                }
+            }
+        }
+
+        if !doc_comment_ranges.is_empty() {
+            self.fold_ranges(doc_comment_ranges, false, window, cx);
+        }
+    }
+
+    pub fn expand_doc_comments(
+        &mut self,
+        _: &ExpandDocComments,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let buffer = display_map.buffer_snapshot();
+        let mut doc_comment_ranges = Vec::new();
+
+        let mut in_block_comment = false;
+        let mut block_start_row = 0;
+
+        for row in 0..=buffer.max_point().row {
+            let line_len = buffer.line_len(MultiBufferRow(row));
+            let line_text: String = buffer
+                .text_for_range(Point::new(row, 0)..Point::new(row, line_len))
+                .collect();
+            let trimmed = line_text.trim_start();
+
+            if !in_block_comment {
+                if trimmed.starts_with("/**") || trimmed.starts_with("/*") {
+                    in_block_comment = true;
+                    block_start_row = row;
+                }
+            }
+
+            if in_block_comment {
+                if trimmed.ends_with("*/") || trimmed.contains("*/") {
+                    in_block_comment = false;
+                    if row > block_start_row {
+                        let start_point = Point::new(block_start_row, 0);
+                        let end_point = Point::new(row, line_len);
+                        doc_comment_ranges.push(start_point..end_point);
+                    }
+                }
+            }
+        }
+
+        if !doc_comment_ranges.is_empty() {
+            self.unfold_ranges(&doc_comment_ranges, true, false, cx);
+        }
+    }
+
     /// Removes any folds whose ranges intersect any of the given ranges.
     pub fn unfold_ranges<T: ToOffset + Clone>(
         &mut self,

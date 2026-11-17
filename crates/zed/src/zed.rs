@@ -1,4 +1,5 @@
 mod app_menus;
+mod phpstorm_menu_handlers;
 pub mod edit_prediction_registry;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
@@ -762,6 +763,7 @@ fn register_actions(
     _: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    phpstorm_menu_handlers::register_actions(workspace, cx);
     if !cfg!(test) {
         workspace.register_action(agent_ui::InlineAssistant::inline_assist);
     }

@@ -64,7 +64,7 @@ actions!(
 /// branch (typically main or master).
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
 #[action(namespace = git, name = "DiffBranch", deprecated_aliases = ["git::BranchDiff"])]
-pub(crate) struct DeployBranchDiff;
+pub struct DeployBranchDiff;
 
 pub struct ProjectDiff {
     project: Entity<Project>,

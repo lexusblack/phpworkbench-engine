@@ -77,7 +77,7 @@ impl BranchDiff {
         workspace::register_serializable_item::<Self>(cx);
     }
 
-    pub(crate) fn deploy_branch_diff(
+    pub fn deploy_branch_diff(
         workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,

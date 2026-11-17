@@ -77,4 +77,8 @@ impl StatusItemView for LineEndingIndicator {
                 .line_endings_button = Some(false);
         }))
     }
+
+    fn widget_id(&self, _: &App) -> Option<&'static str> {
+        Some("line_separator")
+    }
 }

@@ -596,6 +596,18 @@ impl EditorElement {
         register_action(editor, window, Editor::swap_selection_ends);
         register_action(editor, window, Editor::show_completions);
         register_action(editor, window, Editor::show_word_completions);
+        register_action(editor, window, Editor::complete_current_statement);
+        register_action(editor, window, Editor::cyclic_expand_word);
+        register_action(editor, window, Editor::cyclic_expand_word_backward);
+        register_action(editor, window, Editor::surround_with);
+        register_action(editor, window, Editor::collapse_doc_comments);
+        register_action(editor, window, Editor::expand_doc_comments);
+        register_action(editor, window, Editor::next_emmet_edit_point);
+        register_action(editor, window, Editor::previous_emmet_edit_point);
+        register_action(editor, window, Editor::next_method);
+        register_action(editor, window, Editor::previous_method);
+        register_action(editor, window, Editor::change_signature);
+        register_action(editor, window, Editor::safe_delete);
         register_action(editor, window, Editor::toggle_code_actions);
         register_action(editor, window, Editor::open_excerpts);
         register_action(editor, window, Editor::open_excerpts_in_split);
@@ -701,11 +713,16 @@ impl EditorElement {
         register_action(editor, window, Editor::go_to_next_bookmark);
         register_action(editor, window, Editor::go_to_previous_bookmark);
         register_action(editor, window, Editor::toggle_breakpoint);
+        register_action(editor, window, Editor::toggle_breakpoint_enabled);
         register_action(editor, window, Editor::edit_log_breakpoint);
         register_action(editor, window, Editor::enable_breakpoint);
         register_action(editor, window, Editor::disable_breakpoint);
         register_action(editor, window, Editor::toggle_read_only);
         register_action(editor, window, Editor::reload_file);
+        register_action(editor, window, Editor::copy_as_plain_text);
+        register_action(editor, window, Editor::add_bom);
+        register_action(editor, window, Editor::remove_bom);
+        register_action(editor, window, Editor::encode_xml_html_special_characters);
 
         if !editor.read(cx).read_only(cx) {
             register_action(editor, window, Editor::newline);

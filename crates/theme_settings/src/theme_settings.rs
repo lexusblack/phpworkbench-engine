@@ -6,7 +6,7 @@
 //! bridging the theme system with the settings infrastructure.
 
 mod schema;
-mod settings;
+pub mod settings;
 
 use std::sync::Arc;
 
@@ -26,7 +26,7 @@ pub use crate::schema::{
     ThemeColorsContent, ThemeContent, ThemeFamilyContent, ThemeStyleContent,
     WindowBackgroundContent, status_colors_refinement, syntax_overrides, theme_colors_refinement,
 };
-use crate::settings::adjust_buffer_font_size;
+pub use crate::settings::adjust_buffer_font_size;
 pub use crate::settings::{
     AgentBufferFontSize, AgentUiFontSize, BufferLineHeight, FontFamilyName,
     GitCommitBufferFontSize, IconThemeName, IconThemeSelection, MarkdownPreviewFontSize,

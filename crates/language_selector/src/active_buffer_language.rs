@@ -97,4 +97,8 @@ impl StatusItemView for ActiveBufferLanguage {
                 .active_language_button = Some(false);
         }))
     }
+
+    fn widget_id(&self, _: &App) -> Option<&'static str> {
+        Some("php_language_level")
+    }
 }

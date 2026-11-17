@@ -22481,6 +22481,7 @@ dependencies = [
  "system_specs",
  "tab_switcher",
  "tabular_data_preview",
+ "task",
  "tasks_ui",
  "telemetry",
  "telemetry_events",

@@ -215,6 +215,19 @@ impl PaneGroup {
         self.mark_positions(cx);
     }
 
+    pub fn flip_orientation(&mut self, cx: &mut App) {
+        match &mut self.root {
+            Member::Pane(_) => {}
+            Member::Axis(axis) => {
+                axis.axis = match axis.axis {
+                    Axis::Horizontal => Axis::Vertical,
+                    Axis::Vertical => Axis::Horizontal,
+                };
+            }
+        };
+        self.mark_positions(cx);
+    }
+
     pub fn swap(&mut self, from: &Entity<Pane>, to: &Entity<Pane>, cx: &mut App) {
         match &mut self.root {
             Member::Pane(_) => {}

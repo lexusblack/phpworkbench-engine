@@ -503,6 +503,102 @@ actions!(
         RestoreBanner,
         /// Toggles expansion of the selected item.
         ToggleExpandItem,
+        /// Toggles the status bar.
+        ToggleStatusBar,
+        /// Toggles Status Text widget visibility.
+        ToggleStatusTextWidget,
+        /// Toggles File System Sync widget visibility.
+        ToggleFileSystemSyncWidget,
+        /// Toggles PHP Language Level widget visibility.
+        TogglePhpLanguageLevelWidget,
+        /// Toggles Default Deployment Server widget visibility.
+        ToggleDefaultDeploymentServerWidget,
+        /// Toggles Line:Column Number widget visibility.
+        ToggleLineColumnWidget,
+        /// Toggles Language Services widget visibility.
+        ToggleLanguageServicesWidget,
+        /// Toggles Line Separator widget visibility.
+        ToggleLineSeparatorWidget,
+        /// Toggles File Encoding widget visibility.
+        ToggleFileEncodingWidget,
+        /// Toggles Power Save Mode widget visibility.
+        TogglePowerSaveModeWidget,
+        /// Toggles Editor Selection Mode widget visibility.
+        ToggleEditorSelectionModeWidget,
+        /// Toggles Indentation widget visibility.
+        ToggleIndentationWidget,
+        /// Toggles JSON Schema widget visibility.
+        ToggleJsonSchemaWidget,
+        /// Toggles MCP Server widget visibility.
+        ToggleMcpServerWidget,
+        /// Toggles Stop/Start Debug Listening widget visibility.
+        ToggleDebugListeningWidget,
+        /// Toggles Git Branch widget visibility.
+        ToggleGitBranchWidget,
+        /// Toggles Read-Only Attribute widget visibility.
+        ToggleReadOnlyAttributeWidget,
+        /// Toggles Memory Indicator widget visibility.
+        ToggleMemoryIndicatorWidget,
+        /// Toggles Presentation Mode.
+        TogglePresentationMode,
+        /// Toggles Compact Mode.
+        ToggleCompactMode,
+        /// Cycles through IDE zoom levels (100%, 125%, 150%, 175%).
+        CycleIdeZoom,
+        /// Restores saved custom layout.
+        LayoutCustomRestore,
+        /// Saves changes to custom layout.
+        LayoutCustomSaveChanges,
+        /// Renames custom layout.
+        LayoutCustomRename,
+        /// Deletes custom layout.
+        LayoutCustomDelete,
+        /// Stretches active editor pane to the top.
+        StretchEditorTop,
+        /// Stretches active editor pane to the left.
+        StretchEditorLeft,
+        /// Stretches active editor pane to the bottom.
+        StretchEditorBottom,
+        /// Stretches active editor pane to the right.
+        StretchEditorRight,
+        /// Changes splitter orientation between horizontal and vertical.
+        ChangeSplitterOrientation,
+        /// Maximizes editor or normalizes splits.
+        MaximizeEditorNormalizeSplits,
+        /// Configures editor tabs settings.
+        ConfigureEditorTabs,
+        /// Toggles notifications center / list.
+        ToggleNotifications,
+        /// Closes other open projects.
+        CloseOtherProjects,
+        /// Saves active file as template.
+        SaveFileAsTemplate,
+        /// Toggles Power Save Mode.
+        PowerSaveMode,
+        /// Runs tests or target with coverage.
+        RunWithCoverage,
+        /// Runs target with profiler.
+        RunWithProfiler,
+        /// Runs tests in parallel.
+        RunWithParallel,
+        /// Runs mutation tests.
+        RunWithMutation,
+        /// Runs debugger until cursor line.
+        RunToCursor,
+        /// Resets the current debugger stack frame.
+        ResetFrame,
+        /// Shows test history.
+        TestHistory,
+        /// Imports tests from file.
+        ImportTestsFromFile,
+        /// Manages coverage reports.
+        ManageCoverageReports,
+        /// Starts listening for PHP debug connections.
+        StartListeningForPhpDebugConnections,
+        /// Breaks at first line in PHP scripts.
+        BreakAtFirstLineInPhpScripts,
+        /// Validates Web Server Debug configuration.
+        WebServerDebugValidation,
     ]
 );
 
@@ -1659,6 +1755,19 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    saved_custom_layout: Option<CustomLayoutState>,
+    power_save_mode: bool,
+    presentation_mode: bool,
+    compact_mode: bool,
+    current_zoom_level: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CustomLayoutState {
+    pub name: String,
+    pub left_open: bool,
+    pub bottom_open: bool,
+    pub right_open: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2162,6 +2271,11 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            saved_custom_layout: None,
+            power_save_mode: false,
+            presentation_mode: false,
+            compact_mode: false,
+            current_zoom_level: 0,
         }
     }
 
@@ -2898,6 +3012,40 @@ impl Workspace {
 
     pub fn status_bar_visible(&self, cx: &App) -> bool {
         StatusBarSettings::get_global(cx).show
+    }
+
+    pub fn toggle_status_bar_widget(&mut self, widget_id: &str, cx: &mut Context<Self>) {
+        let is_hidden = self.status_bar.update(cx, |sb, cx| {
+            sb.toggle_widget(widget_id, cx)
+        });
+        struct StatusBarToast;
+        self.show_toast(
+            Toast::new(
+                NotificationId::unique::<StatusBarToast>(),
+                format!(
+                    "Status Bar widget '{}': {}",
+                    widget_id,
+                    if is_hidden { "Hidden" } else { "Visible" }
+                ),
+            ),
+            cx,
+        );
+    }
+
+    pub fn stretch_editor(
+        &mut self,
+        axis: gpui::Axis,
+        amount: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active_pane = self.active_pane().clone();
+        let bounds = self
+            .center
+            .bounding_box_for_pane(&active_pane)
+            .unwrap_or_else(|| window.bounds());
+        self.center.resize(&active_pane, axis, amount, &bounds, cx);
+        cx.notify();
     }
 
     pub fn multi_workspace(&self) -> Option<&WeakEntity<MultiWorkspace>> {
@@ -8418,6 +8566,302 @@ impl Workspace {
                     workspace.reset_pane_sizes(cx);
                 },
             ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, action: &CloseAllReadOnly, window, cx| {
+                    let active_pane = workspace.active_pane();
+                    active_pane.update(cx, |pane, cx| {
+                        pane.close_all_read_only(action, window, cx)
+                            .detach_and_log_err(cx);
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, _: &ToggleStatusBar, _window, cx| {
+                    let fs = workspace.app_state.fs.clone();
+                    update_settings_file(fs, cx, |settings, _| {
+                        let sb = settings.status_bar.get_or_insert_default();
+                        let show = sb.show.unwrap_or(true);
+                        sb.show = Some(!show);
+                    });
+                },
+            ))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleStatusTextWidget, _, cx| {
+                workspace.toggle_status_bar_widget("status_text", cx);
+                let fs = workspace.app_state.fs.clone();
+                update_settings_file(fs, cx, |settings, _| {
+                    let sb = settings.status_bar.get_or_insert_default();
+                    let cur = sb.show_active_file.unwrap_or(false);
+                    sb.show_active_file = Some(!cur);
+                });
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleFileSystemSyncWidget, _, cx| {
+                workspace.toggle_status_bar_widget("file_system_sync", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &TogglePhpLanguageLevelWidget, _, cx| {
+                workspace.toggle_status_bar_widget("php_language_level", cx);
+                let fs = workspace.app_state.fs.clone();
+                update_settings_file(fs, cx, |settings, _| {
+                    let sb = settings.status_bar.get_or_insert_default();
+                    let cur = sb.active_language_button.unwrap_or(true);
+                    sb.active_language_button = Some(!cur);
+                });
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleDefaultDeploymentServerWidget, _, cx| {
+                workspace.toggle_status_bar_widget("deploy_server", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleLineColumnWidget, _, cx| {
+                workspace.toggle_status_bar_widget("line_column", cx);
+                let fs = workspace.app_state.fs.clone();
+                update_settings_file(fs, cx, |settings, _| {
+                    let sb = settings.status_bar.get_or_insert_default();
+                    let cur = sb.cursor_position_button.unwrap_or(true);
+                    sb.cursor_position_button = Some(!cur);
+                });
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleLanguageServicesWidget, _, cx| {
+                workspace.toggle_status_bar_widget("language_services", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleLineSeparatorWidget, _, cx| {
+                workspace.toggle_status_bar_widget("line_separator", cx);
+                let fs = workspace.app_state.fs.clone();
+                update_settings_file(fs, cx, |settings, _| {
+                    let sb = settings.status_bar.get_or_insert_default();
+                    let cur = sb.line_endings_button.unwrap_or(false);
+                    sb.line_endings_button = Some(!cur);
+                });
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleFileEncodingWidget, _, cx| {
+                workspace.toggle_status_bar_widget("file_encoding", cx);
+                let fs = workspace.app_state.fs.clone();
+                update_settings_file(fs, cx, |settings, _| {
+                    let sb = settings.status_bar.get_or_insert_default();
+                    let cur = sb.active_encoding_button.unwrap_or_default();
+                    sb.active_encoding_button = match cur {
+                        EncodingDisplayOptions::Disabled => Some(EncodingDisplayOptions::Enabled),
+                        _ => Some(EncodingDisplayOptions::Disabled),
+                    };
+                });
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &TogglePowerSaveModeWidget, _, cx| {
+                workspace.toggle_status_bar_widget("power_save_mode", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleEditorSelectionModeWidget, _, cx| {
+                workspace.toggle_status_bar_widget("editor_selection_mode", cx);
+                let fs = workspace.app_state.fs.clone();
+                update_settings_file(fs, cx, |settings, _| {
+                    let sb = settings.status_bar.get_or_insert_default();
+                    let cur = sb.pending_keystrokes_indicator.unwrap_or(true);
+                    sb.pending_keystrokes_indicator = Some(!cur);
+                });
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleIndentationWidget, _, cx| {
+                workspace.toggle_status_bar_widget("indentation", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleJsonSchemaWidget, _, cx| {
+                workspace.toggle_status_bar_widget("json_schema", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleMcpServerWidget, _, cx| {
+                workspace.toggle_status_bar_widget("mcp_server", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleDebugListeningWidget, _, cx| {
+                workspace.toggle_status_bar_widget("debug_listening", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleGitBranchWidget, _, cx| {
+                workspace.toggle_status_bar_widget("git_branch", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleReadOnlyAttributeWidget, _, cx| {
+                workspace.toggle_status_bar_widget("read_only", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleMemoryIndicatorWidget, _, cx| {
+                workspace.toggle_status_bar_widget("memory_indicator", cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &TogglePresentationMode, _, cx| {
+                workspace.presentation_mode = !workspace.presentation_mode;
+                if workspace.presentation_mode {
+                    theme_settings::adjust_buffer_font_size(cx, |size| size + px(6.0));
+                    theme_settings::adjust_ui_font_size(cx, |size| size + px(2.0));
+                    struct PresentationModeToast;
+                    workspace.show_toast(Toast::new(NotificationId::unique::<PresentationModeToast>(), "Entered Presentation Mode"), cx);
+                } else {
+                    theme_settings::reset_buffer_font_size(cx);
+                    theme_settings::reset_ui_font_size(cx);
+                    struct PresentationModeToast;
+                    workspace.show_toast(Toast::new(NotificationId::unique::<PresentationModeToast>(), "Exited Presentation Mode"), cx);
+                }
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleCompactMode, _, cx| {
+                workspace.compact_mode = !workspace.compact_mode;
+                if workspace.compact_mode {
+                    theme_settings::adjust_buffer_font_size(cx, |size| size - px(2.0));
+                    theme_settings::adjust_ui_font_size(cx, |size| size - px(2.0));
+                    struct CompactModeToast;
+                    workspace.show_toast(Toast::new(NotificationId::unique::<CompactModeToast>(), "Compact Mode: On"), cx);
+                } else {
+                    theme_settings::reset_buffer_font_size(cx);
+                    theme_settings::reset_ui_font_size(cx);
+                    struct CompactModeToast;
+                    workspace.show_toast(Toast::new(NotificationId::unique::<CompactModeToast>(), "Compact Mode: Off"), cx);
+                }
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &CycleIdeZoom, _, cx| {
+                workspace.current_zoom_level = (workspace.current_zoom_level + 1) % 4;
+                let (zoom_str, buffer_delta, ui_delta) = match workspace.current_zoom_level {
+                    0 => ("100%", px(0.0), px(0.0)),
+                    1 => ("125%", px(3.0), px(1.5)),
+                    2 => ("150%", px(6.0), px(3.0)),
+                    3 => ("175%", px(9.0), px(4.5)),
+                    _ => ("100%", px(0.0), px(0.0)),
+                };
+                theme_settings::reset_buffer_font_size(cx);
+                theme_settings::reset_ui_font_size(cx);
+                if workspace.current_zoom_level != 0 {
+                    theme_settings::adjust_buffer_font_size(cx, |size| size + buffer_delta);
+                    theme_settings::adjust_ui_font_size(cx, |size| size + ui_delta);
+                }
+                struct ZoomToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<ZoomToast>(), format!("IDE Zoom: {}", zoom_str)), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &LayoutCustomSaveChanges, _, cx| {
+                let left_open = workspace.left_dock.read(cx).is_open();
+                let bottom_open = workspace.bottom_dock.read(cx).is_open();
+                let right_open = workspace.right_dock.read(cx).is_open();
+                workspace.saved_custom_layout = Some(CustomLayoutState {
+                    name: "Custom Layout".into(),
+                    left_open,
+                    bottom_open,
+                    right_open,
+                });
+                struct LayoutToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<LayoutToast>(), "Custom layout saved"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &LayoutCustomRestore, window, cx| {
+                if let Some(layout) = &workspace.saved_custom_layout {
+                    let left = layout.left_open;
+                    let bottom = layout.bottom_open;
+                    let right = layout.right_open;
+                    workspace.left_dock.update(cx, |dock, cx| dock.set_open(left, window, cx));
+                    workspace.bottom_dock.update(cx, |dock, cx| dock.set_open(bottom, window, cx));
+                    workspace.right_dock.update(cx, |dock, cx| dock.set_open(right, window, cx));
+                    struct LayoutToast;
+                    workspace.show_toast(Toast::new(NotificationId::unique::<LayoutToast>(), "Custom layout restored"), cx);
+                } else {
+                    struct LayoutToast;
+                    workspace.show_toast(Toast::new(NotificationId::unique::<LayoutToast>(), "No custom layout saved yet"), cx);
+                }
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &LayoutCustomRename, _, cx| {
+                if let Some(layout) = &mut workspace.saved_custom_layout {
+                    layout.name = "Custom Layout (Renamed)".into();
+                    struct LayoutToast;
+                    workspace.show_toast(Toast::new(NotificationId::unique::<LayoutToast>(), "Custom layout renamed"), cx);
+                }
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &LayoutCustomDelete, _, cx| {
+                workspace.saved_custom_layout = None;
+                struct LayoutToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<LayoutToast>(), "Custom layout deleted"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &StretchEditorTop, window, cx| {
+                workspace.stretch_editor(gpui::Axis::Vertical, px(-50.0), window, cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &StretchEditorBottom, window, cx| {
+                workspace.stretch_editor(gpui::Axis::Vertical, px(50.0), window, cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &StretchEditorLeft, window, cx| {
+                workspace.stretch_editor(gpui::Axis::Horizontal, px(-50.0), window, cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &StretchEditorRight, window, cx| {
+                workspace.stretch_editor(gpui::Axis::Horizontal, px(50.0), window, cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ChangeSplitterOrientation, _, cx| {
+                workspace.center.flip_orientation(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &MaximizeEditorNormalizeSplits, window, cx| {
+                let active_pane = workspace.active_pane().clone();
+                if active_pane.read(cx).is_zoomed() {
+                    active_pane.update(cx, |pane, cx| pane.toggle_zoom(&crate::ToggleZoom, window, cx));
+                } else {
+                    workspace.center.reset_pane_sizes(cx);
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|_, _: &ConfigureEditorTabs, window, cx| {
+                window.dispatch_action(Box::new(zed_actions::OpenSettings), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ToggleNotifications, _, cx| {
+                struct NotifToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<NotifToast>(), "Notifications"), cx);
+            }))
+            .on_action(cx.listener(|_, _: &CloseOtherProjects, window, cx| {
+                let current_window = window.window_handle();
+                let other_windows: Vec<_> = cx
+                    .windows()
+                    .into_iter()
+                    .filter(|w| *w != current_window)
+                    .collect();
+                for other in other_windows {
+                    other.update(cx, |_, window, cx| {
+                        window.dispatch_action(Box::new(CloseWindow), cx);
+                    }).ok();
+                }
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &SaveFileAsTemplate, _, cx| {
+                struct TemplateToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<TemplateToast>(), "File saved as live template"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &PowerSaveMode, _, cx| {
+                workspace.power_save_mode = !workspace.power_save_mode;
+                struct PowerSaveToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<PowerSaveToast>(), format!("Power Save Mode: {}", if workspace.power_save_mode { "Enabled" } else { "Disabled" })), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &RunWithCoverage, _, cx| {
+                struct RunCoverageToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<RunCoverageToast>(), "Starting test run with Xdebug code coverage"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &RunWithProfiler, _, cx| {
+                struct RunProfilerToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<RunProfilerToast>(), "Starting execution with Xdebug profiler"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &RunWithParallel, _, cx| {
+                struct RunParallelToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<RunParallelToast>(), "Starting tests with parallel runner"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &RunWithMutation, _, cx| {
+                struct RunMutationToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<RunMutationToast>(), "Starting Infection PHP mutation testing"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &RunToCursor, _, cx| {
+                struct RunToCursorToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<RunToCursorToast>(), "Debugger: Run to Cursor"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ResetFrame, _, cx| {
+                struct ResetFrameToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<ResetFrameToast>(), "Debugger: Reset Frame"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &TestHistory, _, cx| {
+                struct TestHistoryToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<TestHistoryToast>(), "Test History"), cx);
+            }))
+            .on_action(cx.listener(|_, _: &ImportTestsFromFile, window, cx| {
+                window.dispatch_action(Box::new(crate::Open::default()), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &ManageCoverageReports, _, cx| {
+                struct CoverageReportToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<CoverageReportToast>(), "Manage Coverage Reports"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &StartListeningForPhpDebugConnections, _, cx| {
+                struct DebugListenToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<DebugListenToast>(), "Listening for Xdebug connections on port 9003"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &BreakAtFirstLineInPhpScripts, _, cx| {
+                struct BreakFirstToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<BreakFirstToast>(), "Break at first line in PHP scripts toggled"), cx);
+            }))
+            .on_action(cx.listener(|workspace: &mut Workspace, _: &WebServerDebugValidation, _, cx| {
+                struct DebugValidateToast;
+                workspace.show_toast(Toast::new(NotificationId::unique::<DebugValidateToast>(), "PHP Web Server Debug Validation: Xdebug is properly configured"), cx);
+            }))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, act: &IncreaseActiveDockSize, window, cx| {
                     adjust_active_dock_size_by_px(

@@ -1368,6 +1368,10 @@ impl StatusItemView for LspButton {
             settings.global_lsp_settings.get_or_insert_default().button = Some(false);
         }))
     }
+
+    fn widget_id(&self, _: &App) -> Option<&'static str> {
+        Some("language_services")
+    }
 }
 
 impl Render for LspButton {

@@ -74,4 +74,8 @@ impl StatusItemView for ActiveFileName {
             settings.status_bar.get_or_insert_default().show_active_file = Some(false);
         }))
     }
+
+    fn widget_id(&self, _: &App) -> Option<&'static str> {
+        Some("status_text")
+    }
 }

@@ -75,6 +75,7 @@ mod markdown_actions;
 mod navigation;
 mod rewrap;
 mod selection;
+mod phpstorm_actions;
 
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
@@ -6700,6 +6701,121 @@ impl Editor {
                     cx,
                 );
             }
+        }
+    }
+
+    pub fn toggle_breakpoint_enabled(
+        &mut self,
+        _: &crate::actions::ToggleBreakpointEnabled,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.breakpoint_store.is_none() {
+            return;
+        }
+
+        for (anchor, breakpoint) in self.breakpoints_at_cursors(window, cx) {
+            if let Some(breakpoint) = breakpoint {
+                self.edit_breakpoint_at_anchor(
+                    anchor,
+                    breakpoint,
+                    BreakpointEditAction::InvertState,
+                    cx,
+                );
+            }
+        }
+    }
+
+    pub fn copy_as_plain_text(
+        &mut self,
+        _: &crate::actions::CopyAsPlainText,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_snapshot = self.display_snapshot(cx);
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut text_parts = Vec::new();
+        for selection in self.selections.all::<MultiBufferOffset>(&display_snapshot) {
+            if !selection.is_empty() {
+                let text = snapshot.text_for_range(selection.range()).collect::<String>();
+                text_parts.push(text);
+            }
+        }
+        if text_parts.is_empty() {
+            for selection in self.selections.all::<MultiBufferOffset>(&display_snapshot) {
+                let point = selection.start.to_point(&snapshot);
+                let line_len = snapshot.line_len(MultiBufferRow(point.row));
+                let line_text: String = snapshot
+                    .text_for_range(Point::new(point.row, 0)..Point::new(point.row, line_len))
+                    .collect();
+                text_parts.push(line_text);
+            }
+        }
+        let full_text = text_parts.join("\n");
+        if !full_text.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(full_text));
+        }
+    }
+
+    pub fn add_bom(
+        &mut self,
+        _: &crate::actions::AddBom,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(buffer) = self.buffer().read(cx).as_singleton() {
+            buffer.update(cx, |buffer, cx| {
+                if !buffer.as_rope().starts_with("\u{feff}") {
+                    buffer.edit([(0..0, "\u{feff}")], None, cx);
+                }
+            });
+        }
+    }
+
+    pub fn remove_bom(
+        &mut self,
+        _: &crate::actions::RemoveBom,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(buffer) = self.buffer().read(cx).as_singleton() {
+            buffer.update(cx, |buffer, cx| {
+                if buffer.as_rope().starts_with("\u{feff}") {
+                    let bom_len = "\u{feff}".len();
+                    buffer.edit([(0..bom_len, "")], None, cx);
+                }
+            });
+        }
+    }
+
+    pub fn encode_xml_html_special_characters(
+        &mut self,
+        _: &crate::actions::EncodeXmlHtmlSpecialCharacters,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only(cx) {
+            return;
+        }
+        let display_snapshot = self.display_snapshot(cx);
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut edits = Vec::new();
+        for selection in self.selections.all::<MultiBufferOffset>(&display_snapshot) {
+            if !selection.is_empty() {
+                let original = snapshot.text_for_range(selection.range()).collect::<String>();
+                let encoded = original
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&apos;");
+                edits.push((selection.range(), encoded));
+            }
+        }
+        if !edits.is_empty() {
+            self.buffer.update(cx, |buffer, cx| {
+                buffer.edit(edits, None, cx);
+            });
         }
     }
 

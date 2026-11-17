@@ -141,4 +141,8 @@ impl StatusItemView for ActiveBufferEncoding {
                 .active_encoding_button = Some(EncodingDisplayOptions::Disabled);
         }))
     }
+
+    fn widget_id(&self, _: &App) -> Option<&'static str> {
+        Some("file_encoding")
+    }
 }

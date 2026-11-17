@@ -880,6 +880,16 @@ actions!(
         EditBookmark,
         /// Toggles a breakpoint at the current line.
         ToggleBreakpoint,
+        /// Toggles whether the breakpoint at the current line is enabled or disabled.
+        ToggleBreakpointEnabled,
+        /// Copies selection as plain unformatted text.
+        CopyAsPlainText,
+        /// Adds a UTF-8 BOM to the buffer.
+        AddBom,
+        /// Removes a UTF-8 BOM from the buffer.
+        RemoveBom,
+        /// Encodes XML/HTML special characters in selection.
+        EncodeXmlHtmlSpecialCharacters,
         /// Toggles the case of selected text.
         ToggleCase,
         /// Disables the breakpoint at the current line.
@@ -970,6 +980,30 @@ actions!(
         SaveLocation,
         /// Toggles breadcrumbs display.
         ToggleBreadcrumb,
+        /// Completes the current statement by closing parentheses/semicolon and inserting newline.
+        CompleteCurrentStatement,
+        /// Cyclically expands word before cursor from open buffers.
+        CyclicExpandWord,
+        /// Cyclically expands word before cursor backward from open buffers.
+        CyclicExpandWordBackward,
+        /// Surrounds current selection or statement with a block or try/catch.
+        SurroundWith,
+        /// Expands folded documentation comments.
+        ExpandDocComments,
+        /// Collapses documentation comments.
+        CollapseDocComments,
+        /// Navigates to next Emmet edit point or snippet tabstop.
+        NextEmmetEditPoint,
+        /// Navigates to previous Emmet edit point or snippet tabstop.
+        PreviousEmmetEditPoint,
+        /// Jumps to next method or symbol.
+        NextMethod,
+        /// Jumps to previous method or symbol.
+        PreviousMethod,
+        /// Refactors signature or displays signature help.
+        ChangeSignature,
+        /// Safely checks usages before deleting symbol.
+        SafeDelete,
     ]
 );
 

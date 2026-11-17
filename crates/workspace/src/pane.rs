@@ -161,6 +161,12 @@ pub struct CloseAllButPinned {
     pub save_intent: Option<SaveIntent>,
 }
 
+/// Closes all read-only items in the pane.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default, Action)]
+#[action(namespace = pane)]
+#[serde(deny_unknown_fields)]
+pub struct CloseAllReadOnly;
+
 /// Unsplits the current pane into the next pane.
 #[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default, Action)]
 #[action(namespace = pane)]
@@ -1783,6 +1789,37 @@ impl Pane {
         self.close_items(window, cx, SaveIntent::Close, &move |item_id| {
             clean_item_ids.contains(&item_id)
                 && (action.close_pinned || !pinned_item_ids.contains(&item_id))
+        })
+    }
+
+    pub fn close_all_read_only(
+        &mut self,
+        _action: &CloseAllReadOnly,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.items.is_empty() {
+            return Task::ready(Ok(()));
+        }
+
+        let read_only_item_ids: Vec<EntityId> = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let ro = matches!(
+                    item.capability(cx),
+                    Capability::ReadOnly | Capability::Read
+                );
+                if ro {
+                    Some(item.item_id())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        self.close_items(window, cx, SaveIntent::Close, &move |item_id| {
+            read_only_item_ids.contains(&item_id)
         })
     }
 
@@ -4606,6 +4643,12 @@ impl Render for Pane {
                         cx,
                     )
                     .detach_and_log_err(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|pane: &mut Self, action: &CloseAllReadOnly, window, cx| {
+                    pane.close_all_read_only(action, window, cx)
+                        .detach_and_log_err(cx);
                 }),
             )
             .on_action(cx.listener(

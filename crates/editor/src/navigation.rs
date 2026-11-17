@@ -2174,6 +2174,24 @@ impl Editor {
         self.go_to_symbol_by_offset(window, cx, -1).detach();
     }
 
+    pub fn next_method(
+        &mut self,
+        _: &NextMethod,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.go_to_symbol_by_offset(window, cx, 1).detach();
+    }
+
+    pub fn previous_method(
+        &mut self,
+        _: &PreviousMethod,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.go_to_symbol_by_offset(window, cx, -1).detach();
+    }
+
     /// Opens `location` and jumps to it through the same path as
     /// go-to-definition, so selection, autoscroll, and jumplist tagging all
     /// match. `split` opens it in the adjacent pane. Called on the editor the

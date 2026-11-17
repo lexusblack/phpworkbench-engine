@@ -304,6 +304,10 @@ impl StatusItemView for CursorPosition {
                 .cursor_position_button = Some(false);
         }))
     }
+
+    fn widget_id(&self, _: &App) -> Option<&'static str> {
+        Some("line_column")
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, RegisterSetting)]

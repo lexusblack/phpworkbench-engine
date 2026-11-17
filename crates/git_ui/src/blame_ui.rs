@@ -130,6 +130,10 @@ impl workspace::StatusItemView for GitBlameStatus {
     fn hide_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
         None
     }
+
+    fn widget_id(&self, _: &App) -> Option<&'static str> {
+        Some("git_branch")
+    }
 }
 
 impl BlameRenderer for GitBlameRenderer {

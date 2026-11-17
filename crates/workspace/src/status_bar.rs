@@ -56,6 +56,11 @@ pub trait StatusItemView: Render {
     /// that the status bar can show a "Hide Button" entry in its
     /// right-click menu.
     fn hide_setting(&self, cx: &App) -> Option<HideStatusItem>;
+
+    /// An optional identifier for the widget (used for individual widget visibility toggling).
+    fn widget_id(&self, _cx: &App) -> Option<&'static str> {
+        None
+    }
 }
 
 trait StatusItemViewHandle: Send {
@@ -68,6 +73,7 @@ trait StatusItemViewHandle: Send {
     );
     fn item_type(&self) -> TypeId;
     fn hide_setting(&self, cx: &App) -> Option<HideStatusItem>;
+    fn widget_id(&self, cx: &App) -> Option<&'static str>;
 }
 
 #[derive(Default)]
@@ -104,6 +110,7 @@ pub struct StatusBar {
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     focus_handle: FocusHandle,
     _observe_active_pane: Subscription,
+    pub hidden_widgets: std::collections::HashSet<String>,
 }
 
 impl Focusable for StatusBar {
@@ -200,8 +207,13 @@ impl StatusBar {
                 sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Left,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
             )
-            .children(self.left_items.iter().enumerate().map(|(index, item)| {
-                render_hideable_item("status-bar-left", index, item.as_ref(), cx)
+            .children(self.left_items.iter().enumerate().filter_map(|(index, item)| {
+                if let Some(id) = item.widget_id(cx) {
+                    if self.hidden_widgets.contains(id) {
+                        return None;
+                    }
+                }
+                Some(render_hideable_item("status-bar-left", index, item.as_ref(), cx))
             }))
     }
 
@@ -219,8 +231,13 @@ impl StatusBar {
                     .iter()
                     .enumerate()
                     .rev()
-                    .map(|(index, item)| {
-                        render_hideable_item("status-bar-right", index, item.as_ref(), cx)
+                    .filter_map(|(index, item)| {
+                        if let Some(id) = item.widget_id(cx) {
+                            if self.hidden_widgets.contains(id) {
+                                return None;
+                            }
+                        }
+                        Some(render_hideable_item("status-bar-right", index, item.as_ref(), cx))
                     }),
             )
             .when(
@@ -339,9 +356,26 @@ impl StatusBar {
             _observe_active_pane: cx.observe_in(active_pane, window, |this, _, window, cx| {
                 this.update_active_pane_item(window, cx)
             }),
+            hidden_widgets: std::collections::HashSet::new(),
         };
         this.update_active_pane_item(window, cx);
         this
+    }
+
+    pub fn toggle_widget(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let is_hidden = if self.hidden_widgets.contains(id) {
+            self.hidden_widgets.remove(id);
+            false
+        } else {
+            self.hidden_widgets.insert(id.to_string());
+            true
+        };
+        cx.notify();
+        is_hidden
+    }
+
+    pub fn is_widget_hidden(&self, id: &str) -> bool {
+        self.hidden_widgets.contains(id)
     }
 
     pub fn set_multi_workspace(
@@ -496,6 +530,10 @@ impl<T: StatusItemView> StatusItemViewHandle for Entity<T> {
 
     fn hide_setting(&self, cx: &App) -> Option<HideStatusItem> {
         self.read(cx).hide_setting(cx)
+    }
+
+    fn widget_id(&self, cx: &App) -> Option<&'static str> {
+        self.read(cx).widget_id(cx)
     }
 }
 
