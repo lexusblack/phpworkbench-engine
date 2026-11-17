@@ -508,6 +508,7 @@ impl EditorElement {
         register_action(editor, window, Editor::move_to_end_of_larger_syntax_node);
         register_action(editor, window, Editor::select_enclosing_symbol);
         register_action(editor, window, Editor::move_to_enclosing_bracket);
+        register_action(editor, window, Editor::move_caret_to_matching_brace);
         register_action(editor, window, Editor::select_inside_delimiters);
         register_action(editor, window, Editor::select_around_delimiters);
         register_action(editor, window, Editor::undo_selection);
@@ -585,6 +586,7 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_fold);
         register_action(editor, window, Editor::toggle_fold_recursive);
         register_action(editor, window, Editor::toggle_fold_all);
+        register_action(editor, window, Editor::unfold);
         register_action(editor, window, Editor::unfold_lines);
         register_action(editor, window, Editor::unfold_recursive);
         register_action(editor, window, Editor::unfold_all);

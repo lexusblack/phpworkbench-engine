@@ -153,9 +153,24 @@ pub fn init(cx: &mut App) {
         );
         workspace.register_action(
             |workspace, action: &zed_actions::SwitchWorktree, window, cx| {
-                git_ui_core::worktree_service::handle_switch_worktree(
-                    workspace, action, window, None, cx,
-                );
+                if action.path.as_os_str().is_empty() {
+                    let focused_dock = workspace.focused_dock_position(window, cx);
+                    let project = workspace.project().clone();
+                    let workspace_handle = workspace.weak_handle();
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        git_ui_core::worktree_picker::WorktreePicker::new_modal(
+                            project,
+                            workspace_handle,
+                            focused_dock,
+                            window,
+                            cx,
+                        )
+                    });
+                } else {
+                    git_ui_core::worktree_service::handle_switch_worktree(
+                        workspace, action, window, None, cx,
+                    );
+                }
             },
         );
 
@@ -333,6 +348,26 @@ pub fn init(cx: &mut App) {
                 panel.unstage_all(action, window, cx);
             });
         });
+        workspace.register_action(|workspace, action: &git::RestoreTrackedFiles, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.restore_tracked_files(action, window, cx);
+            });
+        });
+        workspace.register_action(|workspace, action: &git_panel::ActivateStashTab, window, cx| {
+            if let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.activate_stash_tab(action, window, cx);
+                });
+                workspace.focus_panel::<git_panel::GitPanel>(window, cx);
+            }
+        });
+        workspace.register_action(stash_picker::open_unstash);
+        workspace.register_action(|workspace, _: &git::Merge, window, cx| {
+            open_merge_branch_picker(workspace, window, cx);
+        });
         workspace.register_action(|workspace, _: &git::Uncommit, window, cx| {
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
@@ -438,6 +473,72 @@ fn file_diff_entry(
                 repository.clone(),
             ))
         })
+}
+
+pub fn open_merge_branch_picker(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let workspace_handle = workspace.weak_handle();
+    let repository = workspace.project().read(cx).active_repository(cx);
+    let Some(repo) = repository.clone() else {
+        return;
+    };
+    let current_branch_name = repo.read(cx).branch.as_ref().map(|b| b.ref_name.clone());
+    let workspace_for_toast = workspace_handle.clone();
+    let repo_for_merge = repo.clone();
+
+    workspace.toggle_modal(window, cx, |window, cx| {
+        branch_picker::select_modal(
+            workspace_handle,
+            Some(repo),
+            current_branch_name.clone(),
+            std::sync::Arc::new(move |branch, _window, cx| {
+                let merge_ref = branch.ref_name.to_string();
+                let curr_name = current_branch_name.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "HEAD".to_string());
+                let rx = repo_for_merge.update(cx, |r, _| r.merge_branch(merge_ref.clone()));
+                let workspace = workspace_for_toast.clone();
+                cx.spawn(async move |cx| {
+                    match rx.await {
+                        Ok(Ok(())) => {
+                            if let Some(workspace) = workspace.upgrade() {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    let toast = StatusToast::new(
+                                        format!("Merged '{merge_ref}' into '{curr_name}'"),
+                                        cx,
+                                        |this, _| {
+                                            this.icon(
+                                                Icon::new(IconName::Check)
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Success),
+                                            )
+                                        },
+                                    );
+                                    workspace.toggle_status_toast(toast, cx);
+                                });
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            if let Some(workspace) = workspace.upgrade() {
+                                cx.update(|cx| {
+                                    git_ui_core::notifications::show_error_toast(
+                                        workspace,
+                                        "git merge",
+                                        err,
+                                        cx,
+                                    );
+                                });
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }).detach();
+            }),
+            window,
+            cx,
+        )
+    });
 }
 
 fn open_modified_files(

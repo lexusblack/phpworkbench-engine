@@ -152,6 +152,27 @@ pub struct CloseAllItems {
     pub close_pinned: bool,
 }
 
+/// Closes all items except pinned items in the pane.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default, Action)]
+#[action(namespace = pane)]
+#[serde(deny_unknown_fields)]
+pub struct CloseAllButPinned {
+    #[serde(default)]
+    pub save_intent: Option<SaveIntent>,
+}
+
+/// Unsplits the current pane into the next pane.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default, Action)]
+#[action(namespace = pane)]
+#[serde(deny_unknown_fields)]
+pub struct Unsplit;
+
+/// Unsplits all panes into one.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default, Action)]
+#[action(namespace = pane)]
+#[serde(deny_unknown_fields)]
+pub struct UnsplitAll;
+
 /// Closes all items that have no unsaved changes.
 #[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Default, Action)]
 #[action(namespace = pane)]
@@ -2673,7 +2694,7 @@ impl Pane {
         }
     }
 
-    fn toggle_pin_tab(&mut self, _: &TogglePinTab, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn toggle_pin_tab(&mut self, _: &TogglePinTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.items.is_empty() {
             return;
         }
@@ -4493,6 +4514,12 @@ impl Render for Pane {
             .on_action(cx.listener(|_, _: &JoinAll, _, cx| {
                 cx.emit(Event::JoinAll);
             }))
+            .on_action(cx.listener(|_, _: &Unsplit, _, cx| {
+                cx.emit(Event::JoinIntoNext);
+            }))
+            .on_action(cx.listener(|_, _: &UnsplitAll, _, cx| {
+                cx.emit(Event::JoinAll);
+            }))
             .on_action(cx.listener(Pane::toggle_zoom))
             .on_action(cx.listener(Pane::zoom_in))
             .on_action(cx.listener(Pane::zoom_out))
@@ -4566,6 +4593,19 @@ impl Render for Pane {
                 cx.listener(|pane: &mut Self, action: &CloseAllItems, window, cx| {
                     pane.close_all_items(action, window, cx)
                         .detach_and_log_err(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|pane: &mut Self, action: &CloseAllButPinned, window, cx| {
+                    pane.close_all_items(
+                        &CloseAllItems {
+                            save_intent: action.save_intent,
+                            close_pinned: false,
+                        },
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
                 }),
             )
             .on_action(cx.listener(

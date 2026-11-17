@@ -8,18 +8,25 @@ use picker::{Picker, PickerDelegate};
 use project::Project;
 use std::sync::Arc;
 use ui::{ListItem, ListItemSpacing, prelude::*};
-use workspace::ModalView;
+use workspace::{ModalView, Workspace};
 
 actions!(
     line_ending_selector,
     [
         /// Toggles the line ending selector modal.
-        Toggle
+        Toggle,
+        /// Sets line ending to CRLF (Windows).
+        SetCrlf,
+        /// Sets line ending to LF (Unix and macOS).
+        SetLf,
+        /// Sets line ending to CR (Classic Mac OS).
+        SetCr,
     ]
 );
 
 pub fn init(cx: &mut App) {
     cx.observe_new(LineEndingSelector::register).detach();
+    cx.observe_new(LineEndingSelector::register_workspace).detach();
 }
 
 pub struct LineEndingSelector {
@@ -29,14 +36,109 @@ pub struct LineEndingSelector {
 impl LineEndingSelector {
     fn register(editor: &mut Editor, _window: Option<&mut Window>, cx: &mut Context<Editor>) {
         let editor_handle = cx.weak_entity();
+        let editor_crlf = editor_handle.clone();
+        let editor_lf = editor_handle.clone();
+        let editor_cr = editor_handle.clone();
         editor
             .register_action(move |_: &Toggle, window, cx| {
                 Self::toggle(&editor_handle, window, cx);
             })
             .detach();
+        editor
+            .register_action(move |_: &SetCrlf, _window, cx| {
+                Self::set_line_ending_for_editor(&editor_crlf, LineEnding::Windows, cx);
+            })
+            .detach();
+        editor
+            .register_action(move |_: &SetLf, _window, cx| {
+                Self::set_line_ending_for_editor(&editor_lf, LineEnding::Unix, cx);
+            })
+            .detach();
+        editor
+            .register_action(move |_: &SetCr, _window, cx| {
+                Self::set_line_ending_for_editor(&editor_cr, LineEnding::Unix, cx);
+            })
+            .detach();
     }
 
-    fn toggle(editor: &WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
+    fn register_workspace(
+        workspace: &mut Workspace,
+        _window: Option<&mut Window>,
+        _: &mut Context<Workspace>,
+    ) {
+        workspace.register_action(|workspace, _: &Toggle, window, cx| {
+            Self::toggle_for_workspace(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &SetCrlf, _window, cx| {
+            Self::set_line_ending_for_workspace(workspace, LineEnding::Windows, cx);
+        });
+        workspace.register_action(|workspace, _: &SetLf, _window, cx| {
+            Self::set_line_ending_for_workspace(workspace, LineEnding::Unix, cx);
+        });
+        workspace.register_action(|workspace, _: &SetCr, _window, cx| {
+            Self::set_line_ending_for_workspace(workspace, LineEnding::Unix, cx);
+        });
+    }
+
+    pub fn toggle_for_workspace(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(editor) = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx))
+        else {
+            return;
+        };
+        let editor_handle = editor.downgrade();
+        Self::toggle(&editor_handle, window, cx);
+    }
+
+    pub fn set_line_ending_for_workspace(
+        workspace: &mut Workspace,
+        line_ending: LineEnding,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(editor) = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx))
+        else {
+            return;
+        };
+        let editor_handle = editor.downgrade();
+        Self::set_line_ending_for_editor(&editor_handle, line_ending, cx);
+    }
+
+    pub fn set_line_ending_for_editor(
+        editor: &WeakEntity<Editor>,
+        line_ending: LineEnding,
+        cx: &mut App,
+    ) {
+        let Some((workspace, buffer)) = editor
+            .update(cx, |editor, cx| {
+                Some((editor.workspace()?, editor.active_buffer(cx)?))
+            })
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+
+        buffer.update(cx, |this, cx| {
+            this.set_line_ending(line_ending, cx);
+        });
+        let _ = workspace.update(cx, |workspace, cx| {
+            let project = workspace.project().clone();
+            cx.defer(move |cx| {
+                project.update(cx, |this, cx| {
+                    this.save_buffer(buffer, cx).detach();
+                });
+            });
+        });
+    }
+
+    pub fn toggle(editor: &WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
         let Some((workspace, buffer)) = editor
             .update(cx, |editor, cx| {
                 Some((editor.workspace()?, editor.active_buffer(cx)?))

@@ -8321,6 +8321,79 @@ impl Workspace {
                 },
             ))
             .on_action(cx.listener(
+                |workspace: &mut Workspace, _: &Unsplit, window, cx| {
+                    let active_pane = workspace.active_pane().clone();
+                    workspace.join_pane_into_next(active_pane, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, _: &JoinIntoNext, window, cx| {
+                    let active_pane = workspace.active_pane().clone();
+                    workspace.join_pane_into_next(active_pane, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, _: &UnsplitAll, window, cx| {
+                    workspace.join_all_panes(window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, _: &JoinAll, window, cx| {
+                    workspace.join_all_panes(window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, action: &CloseAllButPinned, window, cx| {
+                    let active_pane = workspace.active_pane();
+                    active_pane.update(cx, |pane, cx| {
+                        pane.close_all_items(
+                            &CloseAllItems {
+                                save_intent: action.save_intent,
+                                close_pinned: false,
+                            },
+                            window,
+                            cx,
+                        )
+                        .detach_and_log_err(cx);
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, action: &CloseCleanItems, window, cx| {
+                    let active_pane = workspace.active_pane();
+                    active_pane.update(cx, |pane, cx| {
+                        pane.close_clean_items(action, window, cx)
+                            .detach_and_log_err(cx);
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, action: &CloseItemsToTheLeft, window, cx| {
+                    let active_pane = workspace.active_pane();
+                    active_pane.update(cx, |pane, cx| {
+                        pane.close_items_to_the_left_by_id(None, action, window, cx)
+                            .detach_and_log_err(cx);
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, action: &CloseItemsToTheRight, window, cx| {
+                    let active_pane = workspace.active_pane();
+                    active_pane.update(cx, |pane, cx| {
+                        pane.close_items_to_the_right_by_id(None, action, window, cx)
+                            .detach_and_log_err(cx);
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace: &mut Workspace, action: &TogglePinTab, window, cx| {
+                    let active_pane = workspace.active_pane();
+                    active_pane.update(cx, |pane, cx| {
+                        pane.toggle_pin_tab(action, window, cx);
+                    });
+                },
+            ))
+            .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ResetActiveDockSize, window, cx| {
                     if let Some(dock) = workspace.active_dock(window, cx).cloned() {
                         dock.update(cx, |dock, cx| {

@@ -440,6 +440,10 @@ impl Editor {
         }
     }
 
+    pub fn unfold(&mut self, _: &Unfold, window: &mut Window, cx: &mut Context<Self>) {
+        self.unfold_lines(&UnfoldLines, window, cx);
+    }
+
     pub fn unfold_lines(&mut self, _: &UnfoldLines, _window: &mut Window, cx: &mut Context<Self>) {
         if self.buffer_kind(cx) == ItemBufferKind::Singleton {
             let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));

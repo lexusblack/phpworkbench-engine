@@ -3362,7 +3362,7 @@ impl GitPanel {
         .detach();
     }
 
-    fn restore_tracked_files(
+    pub fn restore_tracked_files(
         &mut self,
         _: &RestoreTrackedFiles,
         window: &mut Window,
@@ -8357,7 +8357,7 @@ impl GitPanel {
     ) {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
-    fn activate_stash_tab(
+    pub fn activate_stash_tab(
         &mut self,
         _: &ActivateStashTab,
         window: &mut Window,

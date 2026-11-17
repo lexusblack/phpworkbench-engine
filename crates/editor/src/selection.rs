@@ -1012,6 +1012,15 @@ impl Editor {
         });
     }
 
+    pub fn move_caret_to_matching_brace(
+        &mut self,
+        _: &MoveCaretToMatchingBrace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to_enclosing_bracket(&MoveToEnclosingBracket, window, cx);
+    }
+
     pub fn move_to_enclosing_bracket(
         &mut self,
         _: &MoveToEnclosingBracket,

@@ -26,12 +26,27 @@ actions!(
         DropStashItem,
         /// Show the diff view of the selected stash entry.
         ShowStashItem,
+        /// Opens the stash picker modal to view, apply, or pop stashes.
+        Unstash,
     ]
 );
 
 pub fn open(
     workspace: &mut Workspace,
     _: &zed_actions::git::ViewStash,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let repository = workspace.project().read(cx).active_repository(cx);
+    let weak_workspace = workspace.weak_handle();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        StashList::new(repository, weak_workspace, rems(34.), window, cx)
+    })
+}
+
+pub fn open_unstash(
+    workspace: &mut Workspace,
+    _: &Unstash,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {

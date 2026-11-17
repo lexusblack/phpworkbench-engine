@@ -666,6 +666,8 @@ actions!(
         MoveToBeginning,
         /// Moves cursor to the enclosing bracket.
         MoveToEnclosingBracket,
+        /// Moves caret to matching bracket or brace.
+        MoveCaretToMatchingBrace,
         /// Selects the content within the nearest enclosing delimiters
         /// (brackets, braces, parentheses, or quotes), excluding the
         /// delimiters.
@@ -945,6 +947,8 @@ actions!(
         UndoSelection,
         /// Unfolds all folded regions.
         UnfoldAll,
+        /// Unfolds the code block (alias for UnfoldLines).
+        Unfold,
         /// Unfolds lines at cursor.
         UnfoldLines,
         /// Unfolds recursively at cursor.
