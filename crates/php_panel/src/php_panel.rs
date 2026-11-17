@@ -16921,7 +16921,7 @@ impl Panel for PhpPanel {
     }
 
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
-        true
+        false
     }
 
     fn active_subview(&self, _cx: &App) -> Option<String> {
