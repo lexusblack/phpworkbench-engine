@@ -55,6 +55,7 @@ pub mod phpstorm;
 pub mod phpstorm_branch_popup;
 pub mod project_diff;
 pub mod push_dialog;
+pub mod manage_remotes_dialog;
 pub(crate) mod remote_output;
 pub mod repository_selector;
 pub mod solo_diff_view;
@@ -116,6 +117,28 @@ pub fn init(cx: &mut App) {
             |workspace, _: &push_dialog::OpenPushDialog, window, cx| {
                 let repository = workspace.project().read(cx).active_repository(cx);
                 push_dialog::PushDialog::open(workspace.weak_handle(), repository, window, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &manage_remotes_dialog::ManageRemotes, window, cx| {
+                let repository = workspace.project().read(cx).active_repository(cx)
+                    .or_else(|| {
+                        workspace.panel::<GitPanel>(cx).and_then(|p| p.read(cx).active_repository.clone())
+                    })
+                    .or_else(|| {
+                        workspace.project().read(cx).repositories(cx).values().next().cloned()
+                    });
+                let work_dir = repository.as_ref().map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
+                    .or_else(|| {
+                        workspace.project().read(cx).visible_worktrees(cx).next().map(|w| w.read(cx).abs_path().to_path_buf())
+                    });
+                manage_remotes_dialog::ManageRemotesDialog::open(
+                    workspace.weak_handle(),
+                    repository,
+                    work_dir,
+                    window,
+                    cx,
+                );
             },
         );
         repository_selector::register(workspace);

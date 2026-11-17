@@ -1,7 +1,7 @@
 use editor::actions as editor_actions;
 use encoding_selector;
 use git;
-use git_ui::{git_panel as git_ui_panel, git_picker, push_dialog};
+use git_ui::{git_panel as git_ui_panel, git_picker, manage_remotes_dialog, push_dialog};
 use gpui::{App, Menu, MenuItem, OsAction};
 use php_panel;
 use project_panel;
@@ -1220,7 +1220,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     MenuItem::separator(),
                     MenuItem::action("Manage Accounts…", phpstorm_menu::GitHubManageAccounts),
                 ])),
-                MenuItem::action("Manage Remotes…", phpstorm_menu::ManageRemotes),
+                MenuItem::action("Manage Remotes…", manage_remotes_dialog::ManageRemotes),
                 MenuItem::action("Clone…", git::Clone),
                 MenuItem::separator(),
                 MenuItem::action("VCS Operations Popup…", phpstorm_menu::VcsOperationsPopup),
