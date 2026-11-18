@@ -27,7 +27,7 @@ use std::{
     ops::Range,
     sync::Arc,
 };
-use ui::{DiffStat, Divider, Tooltip, prelude::*};
+use ui::{Checkbox, DiffStat, Divider, Tooltip, prelude::*};
 use util::paths::{PathExt as _, PathStyle};
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
@@ -682,6 +682,48 @@ impl SoloDiffGitToolbar {
             });
         }
     }
+
+    fn navigate_file(&mut self, next: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(solo_diff) = self.solo_diff() else {
+            return;
+        };
+        let (repo, current_path, workspace) = {
+            let s = solo_diff.read(cx);
+            (s.repository.clone(), s.repo_path.clone(), s.workspace.clone())
+        };
+        let statuses: Vec<GitStatusEntry> = repo
+            .read(cx)
+            .status()
+            .map(|e| GitStatusEntry {
+                repo_path: e.repo_path,
+                staging: e.status.staging(),
+                status: e.status,
+                diff_stat: e.diff_stat,
+            })
+            .collect();
+        if statuses.is_empty() {
+            return;
+        }
+        let current_idx = statuses
+            .iter()
+            .position(|e| e.repo_path == current_path)
+            .unwrap_or(0);
+        let target_idx = if next {
+            if current_idx + 1 < statuses.len() {
+                current_idx + 1
+            } else {
+                return;
+            }
+        } else {
+            if current_idx > 0 {
+                current_idx - 1
+            } else {
+                return;
+            }
+        };
+        let target_entry = statuses[target_idx].clone();
+        SoloDiffView::open_or_focus(target_entry, repo, workspace, window, cx).detach();
+    }
 }
 
 impl EventEmitter<ToolbarItemEvent> for SoloDiffGitToolbar {}
@@ -762,24 +804,62 @@ impl Render for SoloDiffGitToolbar {
         };
 
         let focus_handle = solo_diff.focus_handle(cx);
-        let solo_diff = solo_diff.read(cx);
-        let button_states = solo_diff.button_states(cx);
-        let status_entry = solo_diff
+        let solo_diff_ref = solo_diff.read(cx);
+        let button_states = solo_diff_ref.button_states(cx);
+        let status_entry = solo_diff_ref
             .repository
             .read(cx)
-            .status_for_path(&solo_diff.repo_path);
+            .status_for_path(&solo_diff_ref.repo_path);
         let diff_stat = status_entry.and_then(|entry| entry.diff_stat);
+
+        let (total_hunks, included_hunks) = {
+            let editor = solo_diff_ref.editor.read(cx).rhs_editor().read(cx);
+            let multibuffer = editor.buffer().read(cx);
+            let snapshot = multibuffer.snapshot(cx);
+            let mut total = 0;
+            let mut included = 0;
+            for hunk in snapshot.diff_hunks() {
+                total += 1;
+                if matches!(
+                    hunk.status.secondary,
+                    DiffHunkSecondaryStatus::NoSecondaryHunk
+                        | DiffHunkSecondaryStatus::SecondaryHunkRemovalPending
+                ) {
+                    included += 1;
+                }
+            }
+            (total, included)
+        };
+
+        let file_toggle_state = if total_hunks == 0 {
+            ToggleState::Unselected
+        } else if included_hunks == total_hunks {
+            ToggleState::Selected
+        } else if included_hunks > 0 {
+            ToggleState::Indeterminate
+        } else {
+            ToggleState::Unselected
+        };
+
+        let file_nav = {
+            let statuses: Vec<RepoPath> = solo_diff_ref
+                .repository
+                .read(cx)
+                .status()
+                .map(|e| e.repo_path)
+                .collect();
+            let total_files = statuses.len();
+            let current_idx = statuses.iter().position(|p| p == &solo_diff_ref.repo_path);
+            (total_files, current_idx)
+        };
 
         h_flex()
             .my_neg_1()
             .py_1()
             .gap_1p5()
             .flex_wrap()
+            .items_center()
             .justify_between()
-            .children(diff_stat.map(|stat| {
-                DiffStat::new("solo-diff-stat", stat.added as usize, stat.deleted as usize)
-            }))
-            .child(Divider::vertical().ml_1())
             .child(
                 h_group_sm()
                     .child(
@@ -809,7 +889,83 @@ impl Render for SoloDiffGitToolbar {
                             })),
                     ),
             )
-            .child(Divider::vertical())
+            .when(file_nav.0 > 1 && file_nav.1.is_some(), |el| {
+                let current_idx = file_nav.1.unwrap();
+                let total_files = file_nav.0;
+                el.child(Divider::vertical().ml_0p5())
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                IconButton::new("prev-file", IconName::ArrowLeft)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(current_idx == 0)
+                                    .tooltip(Tooltip::text("Previous modified file"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.navigate_file(false, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Label::new(format!("{}/{} files", current_idx + 1, total_files))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                IconButton::new("next-file", IconName::ArrowRight)
+                                    .icon_size(IconSize::Small)
+                                    .disabled(current_idx + 1 >= total_files)
+                                    .tooltip(Tooltip::text("Next modified file"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.navigate_file(true, window, cx);
+                                    })),
+                            ),
+                    )
+            })
+            .child(Divider::vertical().ml_0p5())
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        Checkbox::new("solo-diff-file-cb", file_toggle_state)
+                            .tooltip(Tooltip::text(match file_toggle_state {
+                                ToggleState::Selected => {
+                                    "All differences included. Click to exclude all."
+                                }
+                                ToggleState::Indeterminate => {
+                                    "Partially included. Click to include all."
+                                }
+                                ToggleState::Unselected => {
+                                    "No differences included. Click to include all."
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if file_toggle_state == ToggleState::Selected {
+                                    this.unstage_file(window, cx);
+                                } else {
+                                    this.stage_file(window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Label::new(if total_hunks == 1 {
+                            format!("1 difference, {included_hunks} included")
+                        } else {
+                            format!("{total_hunks} differences, {included_hunks} included")
+                        })
+                        .size(LabelSize::Small)
+                        .color(if included_hunks > 0 {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }),
+                    ),
+            )
+            .children(diff_stat.map(|stat| {
+                DiffStat::new("solo-diff-stat", stat.added as usize, stat.deleted as usize)
+            }))
+            .child(Divider::vertical().ml_1())
             .child(
                 h_group_sm()
                     .when(button_states.selection, |el| {

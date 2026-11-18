@@ -7,6 +7,7 @@ use ::git::{
 };
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 use project::git_store::Repository;
+use ui::{Checkbox, ToggleState};
 
 #[derive(Clone)]
 struct ResolvedDiffHunk {
@@ -3080,85 +3081,48 @@ pub fn render_diff_hunk_controls(
         .block_mouse_except_scroll()
         .shadow_md()
         .when(show_stage_or_unstage, |el| {
-            el.child(if status.has_secondary_hunk() {
-                Button::new(("stage", row as u64), "Stage")
-                    .alpha(if status.is_pending() { 0.66 } else { 1.0 })
-                    .tooltip({
-                        let focus_handle = editor.focus_handle(cx);
-                        move |_window, cx| {
-                            Tooltip::for_action_in(
-                                "Stage Hunk",
-                                &::git::ToggleStaged,
-                                &focus_handle,
-                                cx,
-                            )
-                        }
-                    })
-                    .on_click({
-                        let editor = editor.clone();
-                        move |_event, window, cx| {
-                            editor.update(cx, |editor, cx| {
-                                editor.stage_or_unstage_diff_hunks(
-                                    true,
-                                    vec![hunk_range.start..hunk_range.start],
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }
-                    })
+            let is_staged = !status.has_secondary_hunk();
+            let toggle_state = if is_staged {
+                ToggleState::Selected
             } else {
-                Button::new(("unstage", row as u64), "Unstage")
-                    .alpha(if status.is_pending() { 0.66 } else { 1.0 })
-                    .tooltip({
-                        let focus_handle = editor.focus_handle(cx);
-                        move |_window, cx| {
-                            Tooltip::for_action_in(
-                                "Unstage Hunk",
-                                &::git::ToggleStaged,
-                                &focus_handle,
+                ToggleState::Unselected
+            };
+            let editor = editor.clone();
+            let hunk_anchor = hunk_range.start;
+            el.child(
+                Checkbox::new(("diff-hunk-cb", row as u64), toggle_state)
+                    .label(format!("{}", row + 1))
+                    .disabled(status.is_pending())
+                    .tooltip(Tooltip::text(if is_staged {
+                        "Included in commit (Click to exclude)"
+                    } else {
+                        "Excluded from commit (Click to include)"
+                    }))
+                    .on_click(move |_, window, cx| {
+                        editor.update(cx, |editor, cx| {
+                            editor.stage_or_unstage_diff_hunks(
+                                !is_staged,
+                                vec![hunk_anchor..hunk_anchor],
+                                window,
                                 cx,
-                            )
-                        }
-                    })
-                    .on_click({
-                        let editor = editor.clone();
-                        move |_event, window, cx| {
-                            editor.update(cx, |editor, cx| {
-                                editor.stage_or_unstage_diff_hunks(
-                                    false,
-                                    vec![hunk_range.start..hunk_range.start],
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }
-                    })
-            })
+                            );
+                        });
+                    }),
+            )
         })
         .when(show_restore, |el| {
+            let editor = editor.clone();
+            let hunk_anchor = hunk_range.start;
             el.child(
-                Button::new(("restore", row as u64), "Restore")
-                    .tooltip({
-                        let focus_handle = editor.focus_handle(cx);
-                        move |_window, cx| {
-                            Tooltip::for_action_in(
-                                "Restore Hunk",
-                                &::git::Restore,
-                                &focus_handle,
-                                cx,
-                            )
-                        }
-                    })
-                    .on_click({
-                        let editor = editor.clone();
-                        move |_event, window, cx| {
-                            editor.update(cx, |editor, cx| {
-                                let snapshot = editor.snapshot(window, cx);
-                                let point = hunk_range.start.to_point(&snapshot.buffer_snapshot());
-                                editor.restore_hunks_in_ranges(vec![point..point], window, cx);
-                            });
-                        }
+                IconButton::new(("restore", row as u64), IconName::ChevronRight)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Revert changes in this block (PhpStorm >>)"))
+                    .on_click(move |_event, window, cx| {
+                        editor.update(cx, |editor, cx| {
+                            let snapshot = editor.snapshot(window, cx);
+                            let point = hunk_anchor.to_point(&snapshot.buffer_snapshot());
+                            editor.restore_hunks_in_ranges(vec![point..point], window, cx);
+                        });
                     })
                     .disabled(is_created_file),
             )
