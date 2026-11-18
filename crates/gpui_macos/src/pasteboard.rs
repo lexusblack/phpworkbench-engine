@@ -169,14 +169,17 @@ impl Pasteboard {
                 [ClipboardEntry::Image(image)] => {
                     self.write_image(image);
                 }
-                [ClipboardEntry::ExternalPaths(_)] => {}
-                _ => {
-                    // Agus NB: We're currently only writing string entries to the clipboard when we have more than one.
-                    //
-                    // This was the existing behavior before I refactored the outer clipboard code:
-                    // https://github.com/zed-industries/zed/blob/65f7412a0265552b06ce122655369d6cc7381dd6/crates/gpui/src/platform/mac/platform.rs#L1060-L1110
-                    //
-                    // Note how `any_images` is always `false`. We should fix that, but that's orthogonal to the refactor.
+                [ClipboardEntry::ExternalPaths(paths)] => {
+                    self.write_external_paths(paths);
+                }
+                entries => {
+                    if let Some(paths) = entries.iter().find_map(|e| match e {
+                        ClipboardEntry::ExternalPaths(paths) => Some(paths),
+                        _ => None,
+                    }) {
+                        self.write_external_paths(paths);
+                        return;
+                    }
 
                     let mut combined = ClipboardString {
                         text: String::new(),
@@ -230,6 +233,38 @@ impl Pasteboard {
                 self.inner
                     .setData_forType(metadata_bytes, *self.metadata_type);
             }
+        }
+    }
+
+    fn write_external_paths(&self, paths: &ExternalPaths) {
+        unsafe {
+            let ns_paths: Vec<id> = paths
+                .paths()
+                .iter()
+                .map(|p| ns_string(&p.to_string_lossy()))
+                .collect();
+            let ns_array = NSArray::arrayWithObjects(nil, &ns_paths);
+
+            let types = vec![NSFilenamesPboardType, NSPasteboardTypeString];
+            let types_array = NSArray::arrayWithObjects(nil, &types);
+            self.inner.declareTypes_owner(types_array, nil);
+
+            self.inner
+                .setPropertyList_forType(ns_array, NSFilenamesPboardType);
+
+            let joined = paths
+                .paths()
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let bytes = NSData::dataWithBytes_length_(
+                nil,
+                joined.as_ptr() as *const c_void,
+                joined.len() as u64,
+            );
+            self.inner
+                .setData_forType(bytes, NSPasteboardTypeString);
         }
     }
 

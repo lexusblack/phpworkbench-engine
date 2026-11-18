@@ -19,7 +19,7 @@ use git::status::GitSummary;
 use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{
     Action, Anchor, AnyElement, App, AsyncWindowContext, Bounds,
-    ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
+    ClipboardEntry as GpuiClipboardEntry, ClipboardItem, ClipboardString, Context, CursorStyle, DismissEvent, Div,
     DragMoveEvent, Entity, EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths,
     FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
     ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
@@ -3855,16 +3855,48 @@ impl ProjectPanel {
         Some((new_path.as_rel_path().into(), disambiguation_range))
     }
 
+    fn clipboard_matches_system_clipboard(&self, cx: &App) -> bool {
+        let Some(clipboard) = &self.clipboard else {
+            return false;
+        };
+        if clipboard.items().is_empty() {
+            return false;
+        }
+        let project = self.project.read(cx);
+        let mut local_paths: Vec<PathBuf> = clipboard
+            .items()
+            .iter()
+            .filter_map(|entry| {
+                let worktree = project.worktree_for_id(entry.worktree_id, cx)?;
+                let worktree = worktree.read(cx);
+                let worktree_entry = worktree.entry_for_id(entry.entry_id)?;
+                Some(worktree.abs_path().join(worktree_entry.path.as_std_path()))
+            })
+            .collect();
+        local_paths.sort();
+
+        let Some(external_paths) = self.external_paths_from_system_clipboard(cx) else {
+            return true;
+        };
+
+        let mut sys_paths: Vec<PathBuf> = external_paths.paths().iter().cloned().collect();
+        sys_paths.sort();
+
+        local_paths == sys_paths
+    }
+
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(external_paths) = self.external_paths_from_system_clipboard(cx) {
-            let target_entry_id = self
-                .selection
-                .map(|s| s.entry_id)
-                .or(self.state.last_worktree_root_id);
-            if let Some(entry_id) = target_entry_id {
-                self.drop_external_files(external_paths.paths(), entry_id, window, cx);
+        if !self.clipboard_matches_system_clipboard(cx) {
+            if let Some(external_paths) = self.external_paths_from_system_clipboard(cx) {
+                let target_entry_id = self
+                    .selection
+                    .map(|s| s.entry_id)
+                    .or(self.state.last_worktree_root_id);
+                if let Some(entry_id) = target_entry_id {
+                    self.drop_external_files(external_paths.paths(), entry_id, window, cx);
+                }
+                return;
             }
-            return;
         }
 
         maybe!({
@@ -4659,7 +4691,7 @@ impl ProjectPanel {
 
     fn write_entries_to_system_clipboard(&self, entries: &BTreeSet<SelectedEntry>, cx: &mut App) {
         let project = self.project.read(cx);
-        let paths: Vec<String> = entries
+        let paths: Vec<PathBuf> = entries
             .iter()
             .filter_map(|entry| {
                 let worktree = project.worktree_for_id(entry.worktree_id, cx)?;
@@ -4668,14 +4700,23 @@ impl ProjectPanel {
                 Some(
                     worktree
                         .abs_path()
-                        .join(worktree_entry.path.as_std_path())
-                        .to_string_lossy()
-                        .to_string(),
+                        .join(worktree_entry.path.as_std_path()),
                 )
             })
             .collect();
         if !paths.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+            let str_paths = paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let external_paths = ExternalPaths(paths.into());
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![
+                    GpuiClipboardEntry::ExternalPaths(external_paths),
+                    GpuiClipboardEntry::String(ClipboardString::new(str_paths)),
+                ],
+            });
         }
     }
 
@@ -4688,6 +4729,36 @@ impl ProjectPanel {
                 }
             }
         }
+
+        // Fallback: Check if the string clipboard entry contains valid paths on disk.
+        // This enables cross-window copy-paste, pasting from terminal, external editors, etc.
+        for entry in clipboard_item.entries() {
+            if let GpuiClipboardEntry::String(clipboard_string) = entry {
+                let lines: Vec<&str> = clipboard_string
+                    .text
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if !lines.is_empty() {
+                    let mut candidate_paths = smallvec::SmallVec::new();
+                    let mut all_exist = true;
+                    for line in lines {
+                        let path = PathBuf::from(line);
+                        if path.is_absolute() && (path.is_file() || path.is_dir()) {
+                            candidate_paths.push(path);
+                        } else {
+                            all_exist = false;
+                            break;
+                        }
+                    }
+                    if all_exist && !candidate_paths.is_empty() {
+                        return Some(ExternalPaths(candidate_paths));
+                    }
+                }
+            }
+        }
+
         None
     }
 
