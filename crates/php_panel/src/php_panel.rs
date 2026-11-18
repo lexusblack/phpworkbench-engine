@@ -1439,6 +1439,8 @@ impl DeploymentDialog {
         if let Some(server) = self.servers.get_mut(index) {
             server.password = None;
             server.password_session = false;
+            server.keychain = false;
+            server.keychain_service = None;
         }
         cx.notify();
     }
@@ -3246,41 +3248,82 @@ impl Render for DeploymentDialog {
                             })),
                         ),
                 ),
-                DeployField::Password => h_flex()
-                    .w_full()
-                    .flex_none()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(dialog_row(
-                        "Password:",
-                        dialog_editor(
-                            "deploy-password-editor",
-                            &self.password_editor,
-                            None,
-                            window,
-                            cx,
-                        ),
-                    ))
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .pl(DIALOG_CONTROL_INDENT)
-                            .child(dialog_static(self.save_password.hint(), Color::Muted))
-                            .child(
-                                dialog_button(
-                                    "deploy-reset-password",
-                                    "Reset",
-                                    DialogButtonVariant::Link,
-                                )
-                                .track_focus(&dialog_slot(&focus, DeployFocusSlot::PasswordReset))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.reset_password(window, cx);
-                                })),
+                DeployField::Password => {
+                    let has_saved = self
+                        .selected
+                        .and_then(|index| self.servers.get(index))
+                        .map(|server| {
+                            server.keychain
+                                || server
+                                    .password
+                                    .as_deref()
+                                    .map(|p| !p.trim().is_empty())
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    let typed_password = self.password_editor.read(cx).text(cx);
+                    let has_value = !typed_password.is_empty();
+
+                    if has_saved {
+                        dialog_row(
+                            "Password:",
+                            h_flex()
+                                .flex_1()
+                                .items_center()
+                                .gap_2()
+                                .child(dialog_static(self.save_password.hint(), Color::Muted))
+                                .child(
+                                    dialog_button(
+                                        "deploy-reset-password",
+                                        "Reset",
+                                        DialogButtonVariant::Link,
+                                    )
+                                    .track_focus(&dialog_slot(&focus, DeployFocusSlot::PasswordReset))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.reset_password(window, cx);
+                                    })),
+                                ),
+                        )
+                    } else if has_value {
+                        dialog_row(
+                            "Password:",
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .child(dialog_editor(
+                                    "deploy-password-editor",
+                                    &self.password_editor,
+                                    None,
+                                    window,
+                                    cx,
+                                ))
+                                .child(
+                                    dialog_button(
+                                        "deploy-reset-password",
+                                        "Reset",
+                                        DialogButtonVariant::Link,
+                                    )
+                                    .track_focus(&dialog_slot(&focus, DeployFocusSlot::PasswordReset))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.reset_password(window, cx);
+                                    })),
+                                ),
+                        )
+                    } else {
+                        dialog_row(
+                            "Password:",
+                            dialog_editor(
+                                "deploy-password-editor",
+                                &self.password_editor,
+                                None,
+                                window,
+                                cx,
                             ),
-                    )
-                    .into_any_element(),
+                        )
+                    }
+                }
                 DeployField::Folder => dialog_row(
                     "Folder:",
                     h_flex()
@@ -16894,7 +16937,16 @@ fn parse_deploy_server(server: &Value, root: &Path) -> Option<RemoteServer> {
         encoding: string_field(server, "encoding")
             .filter(|text| !text.trim().is_empty())
             .unwrap_or_else(|| ADVANCED_DEFAULT_ENCODING.to_string()),
-        protocol,
+        protocol: match (protocol.as_deref(), port_field(server).as_deref()) {
+            (Some("ftps"), Some("21"))
+                if string_field(server, "keychain_service")
+                    .map(|s| s.contains("IntelliJ Platform Deployment"))
+                    .unwrap_or(false) =>
+            {
+                Some("ftp".to_string())
+            }
+            _ => protocol,
+        },
         host: string_field(server, "host"),
         port: port_field(server),
         user: string_field(server, "user"),
@@ -27986,6 +28038,32 @@ Host web1
         assert!(!staged.password_session);
         let entry = deploy_server_entry(&staged);
         assert!(entry.get("password").is_none());
+    }
+
+    #[test]
+    fn parse_deploy_server_normalizes_intellij_ftps_on_port_21() {
+        let root = Path::new("/tmp");
+        let val = json!({
+            "name": "gpd",
+            "protocol": "ftps",
+            "host": "145.239.30.83",
+            "port": 21,
+            "user": "olek_all",
+            "keychain": true,
+            "keychain_service": "IntelliJ Platform Deployment — 38bc3a23-6506-4751-ac4a-58eb07678ff2"
+        });
+        let server = parse_deploy_server(&val, root).expect("parse server");
+        assert_eq!(server.protocol.as_deref(), Some("ftp"));
+        assert!(server.keychain);
+
+        let val990 = json!({
+            "name": "secure",
+            "protocol": "ftps",
+            "port": 990,
+            "keychain_service": "IntelliJ Platform Deployment — 123"
+        });
+        let server990 = parse_deploy_server(&val990, root).expect("parse server");
+        assert_eq!(server990.protocol.as_deref(), Some("ftps"));
     }
 
     #[test]

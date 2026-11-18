@@ -403,8 +403,12 @@ pub fn import_idea_servers(root: &Path) -> Option<Value> {
                 }
             }
 
-            // Check if FTPS (dataProtectionLevel or shareSSLContext)
-            if body.contains("dataProtectionLevel") || body.contains("shareSSLContext") {
+            // Check if FTPS (accessType="FTPS" or port 990)
+            if body.contains("accessType=\"FTPS\"")
+                || body.contains("accessType=\"ftps\"")
+                || body.contains("protocol=\"ftps\"")
+                || port == 990
+            {
                 if protocol == "ftp" {
                     protocol = "ftps".to_string();
                 }
@@ -635,7 +639,7 @@ mod tests {
             assert!(!servers.is_empty());
             let newdemo = servers.iter().find(|s| s["name"] == "newdemo").expect("newdemo server found");
             assert_eq!(newdemo["name"], json!("newdemo"));
-            assert_eq!(newdemo["protocol"], json!("ftps"));
+            assert_eq!(newdemo["protocol"], json!("ftp"));
             assert_eq!(newdemo["user"], json!("olek_all"));
             assert_eq!(newdemo["keychain"], json!(true));
             assert!(newdemo["keychain_service"].as_str().unwrap().starts_with("IntelliJ Platform Deployment"));
