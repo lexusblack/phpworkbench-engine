@@ -39,8 +39,11 @@ use util::ResultExt as _;
 
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::item::ItemEvent;
-use workspace::{ModalView, OpenOptions, Panel, StatusItemView, Workspace};
+use workspace::notifications::NotificationId;
+use workspace::{ModalView, OpenOptions, Panel, StatusItemView, Toast, Workspace};
 use gpui::FontWeight;
+
+struct DeployNotification;
 
 mod table_view;
 mod http_client_view;
@@ -4605,18 +4608,33 @@ fn resolve_deploy_target_paths(
 }
 
 pub fn execute_deploy_upload(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     root: PathBuf,
     server: String,
     abs_path: Option<String>,
     rel_path: String,
     cx: &mut Context<Workspace>,
 ) {
+    let file_desc = if !rel_path.is_empty() && rel_path != "." {
+        rel_path.clone()
+    } else {
+        "project".to_string()
+    };
+
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::unique::<DeployNotification>(),
+            format!("Uploading {} to {}…", file_desc, server),
+        )
+        .autohide(),
+        cx,
+    );
+
     let root_clone = root.clone();
     let server_clone = server.clone();
+    let server_name = server.clone();
     let rel_clone = rel_path.clone();
-    let root_for_panel = root.clone();
-    let server_for_panel = server.clone();
+    let file_desc_clone = file_desc.clone();
 
     let task: Task<Result<String, String>> = cx.background_spawn(async move {
         let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
@@ -4640,9 +4658,8 @@ pub fn execute_deploy_upload(
             let display = msg.trim();
             if display.is_empty() {
                 Ok(format!(
-                    "uploaded {} to {}",
-                    if rel_clone.is_empty() { "project" } else { &rel_clone },
-                    server_clone
+                    "Uploaded {} to {}",
+                    file_desc_clone, server_clone
                 ))
             } else {
                 Ok(display.to_string())
@@ -4656,7 +4673,29 @@ pub fn execute_deploy_upload(
     cx.spawn(async move |workspace, cx| {
         let result = task.await;
         workspace
-            .update(cx, |_workspace, cx| {
+            .update(cx, |workspace, cx| {
+                match &result {
+                    Ok(msg) => {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                msg.clone(),
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                format!("Upload to {} failed: {}", server_name, err),
+                            ),
+                            cx,
+                        );
+                    }
+                }
+
                 if cx.has_global::<DeployShared>() {
                     if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
                         panel
@@ -4665,7 +4704,6 @@ pub fn execute_deploy_upload(
                                     Ok(msg) => panel.saved_message = Some(msg),
                                     Err(err) => panel.saved_message = Some(format!("upload error: {err}")),
                                 }
-                                panel.refresh_remote(server_for_panel, root_for_panel, cx);
                                 cx.notify();
                             })
                             .log_err();
@@ -4678,16 +4716,33 @@ pub fn execute_deploy_upload(
 }
 
 pub fn execute_deploy_download(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     root: PathBuf,
     server: String,
     abs_path: Option<String>,
     rel_path: String,
     cx: &mut Context<Workspace>,
 ) {
+    let file_desc = if !rel_path.is_empty() && rel_path != "." {
+        rel_path.clone()
+    } else {
+        "project".to_string()
+    };
+
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::unique::<DeployNotification>(),
+            format!("Downloading {} from {}…", file_desc, server),
+        )
+        .autohide(),
+        cx,
+    );
+
     let root_clone = root.clone();
     let server_clone = server.clone();
+    let server_name = server.clone();
     let rel_clone = rel_path.clone();
+    let file_desc_clone = file_desc.clone();
 
     let task: Task<Result<String, String>> = cx.background_spawn(async move {
         let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
@@ -4705,9 +4760,8 @@ pub fn execute_deploy_download(
         let output = cmd.output().map_err(|e| e.to_string())?;
         if output.status.success() {
             Ok(format!(
-                "downloaded {} from {}",
-                if rel_clone.is_empty() { "project" } else { &rel_clone },
-                server_clone
+                "Downloaded {} from {}",
+                file_desc_clone, server_clone
             ))
         } else {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -4718,7 +4772,29 @@ pub fn execute_deploy_download(
     cx.spawn(async move |workspace, cx| {
         let result = task.await;
         workspace
-            .update(cx, |_workspace, cx| {
+            .update(cx, |workspace, cx| {
+                match &result {
+                    Ok(msg) => {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                msg.clone(),
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                format!("Download from {} failed: {}", server_name, err),
+                            ),
+                            cx,
+                        );
+                    }
+                }
+
                 if cx.has_global::<DeployShared>() {
                     if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
                         panel
@@ -4739,7 +4815,7 @@ pub fn execute_deploy_download(
 }
 
 pub fn execute_deploy_compare(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     window: &mut Window,
     root: PathBuf,
     server: String,
@@ -4747,16 +4823,30 @@ pub fn execute_deploy_compare(
     cx: &mut Context<Workspace>,
 ) {
     if rel_path.is_empty() {
-        if cx.has_global::<DeployShared>() {
-            if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
-                panel.update(cx, |panel, cx| {
-                    panel.saved_message = Some("No active file to compare with deployed version".to_string());
-                    cx.notify();
-                });
-            }
-        }
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::unique::<DeployNotification>(),
+                "No active file to compare with deployed version",
+            )
+            .autohide(),
+            cx,
+        );
         return;
     }
+
+    let file_name = Path::new(&rel_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| rel_path.clone());
+
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::unique::<DeployNotification>(),
+            format!("Fetching deployed version of {} from {}…", file_name, server),
+        )
+        .autohide(),
+        cx,
+    );
 
     let pristine_path = remote_file_banner::remote_pristine_root()
         .join(&server)
@@ -4795,7 +4885,14 @@ pub fn execute_deploy_compare(
         let res = task.await;
         if let Err(err) = res {
             workspace
-                .update_in(cx, |_workspace, _window, cx| {
+                .update_in(cx, |workspace, _window, cx| {
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<DeployNotification>(),
+                            format!("Compare download failed: {err}"),
+                        ),
+                        cx,
+                    );
                     if cx.has_global::<DeployShared>() {
                         if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
                             panel
@@ -4821,11 +4918,20 @@ pub fn execute_deploy_compare(
 }
 
 pub fn execute_deploy_sync(
-    _workspace: &mut Workspace,
+    workspace: &mut Workspace,
     root: PathBuf,
     server: String,
     cx: &mut Context<Workspace>,
 ) {
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::unique::<DeployNotification>(),
+            format!("Starting deployment sync with {}…", server),
+        )
+        .autohide(),
+        cx,
+    );
+
     if cx.has_global::<DeployShared>() {
         if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
             panel
@@ -12099,6 +12205,15 @@ impl PhpPanel {
                 let server_clone = server.clone();
                 let count = open_files.len();
 
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<DeployNotification>(),
+                        format!("Uploading {} open file(s) to {}…", count, server_clone),
+                    )
+                    .autohide(),
+                    cx,
+                );
+
                 let task: Task<Result<String, String>> = cx.background_spawn(async move {
                     let mut uploaded = 0;
                     let mut errors = Vec::new();
@@ -12130,7 +12245,29 @@ impl PhpPanel {
 
                 cx.spawn(async move |workspace, cx| {
                     let result = task.await;
-                    workspace.update(cx, |_workspace, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        match &result {
+                            Ok(msg) => {
+                                workspace.show_toast(
+                                    Toast::new(
+                                        NotificationId::unique::<DeployNotification>(),
+                                        msg.clone(),
+                                    )
+                                    .autohide(),
+                                    cx,
+                                );
+                            }
+                            Err(err) => {
+                                workspace.show_toast(
+                                    Toast::new(
+                                        NotificationId::unique::<DeployNotification>(),
+                                        format!("Upload open files failed: {err}"),
+                                    ),
+                                    cx,
+                                );
+                            }
+                        }
+
                         if cx.has_global::<DeployShared>() {
                             if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
                                 panel.update(cx, |panel, cx| {
