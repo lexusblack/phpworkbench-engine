@@ -990,7 +990,7 @@ impl From<WorkspaceId> for i64 {
 fn prompt_and_open_paths(
     app_state: Arc<AppState>,
     options: PathPromptOptions,
-    create_new_window: bool,
+    create_new_window: Option<bool>,
     cx: &mut App,
 ) {
     if let Some(workspace_window) =
@@ -1049,7 +1049,7 @@ pub fn prompt_for_open_path_and_open(
     workspace: &mut Workspace,
     app_state: Arc<AppState>,
     options: PathPromptOptions,
-    create_new_window: bool,
+    create_new_window: Option<bool>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -1064,7 +1064,66 @@ pub fn prompt_for_open_path_and_open(
         let Some(paths) = paths.await.log_err().flatten() else {
             return;
         };
-        if !create_new_window {
+
+        let open_in_new_window = match create_new_window {
+            Some(explicit) => explicit,
+            None => {
+                let has_existing_project = this
+                    .read_with(cx, |workspace, cx| {
+                        workspace.project().read(cx).visible_worktrees(cx).next().is_some()
+                    })
+                    .unwrap_or(false);
+                let is_directory = paths.iter().any(|p| p.is_dir());
+
+                if has_existing_project && is_directory {
+                    let behavior = this
+                        .read_with(cx, |_workspace, cx| {
+                            WorkspaceSettings::get_global(cx).default_open_behavior
+                        })
+                        .unwrap_or(DefaultOpenBehavior::Ask);
+
+                    match behavior {
+                        DefaultOpenBehavior::NewWindow => true,
+                        DefaultOpenBehavior::ExistingWindow => false,
+                        DefaultOpenBehavior::Ask => {
+                            let prompt = cx
+                                .update(|window, cx| {
+                                    window.prompt(
+                                        gpui::PromptLevel::Info,
+                                        "Open Project",
+                                        Some(
+                                            "You can open the project in the current window or in a new window.",
+                                        ),
+                                        &["This Window", "New Window", "Cancel"],
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+
+                            let Some(prompt) = prompt else {
+                                return;
+                            };
+
+                            match prompt.await.log_err() {
+                                Some(0) => false, // "This Window"
+                                Some(1) => true,  // "New Window"
+                                _ => return,      // "Cancel" or dismissed
+                            }
+                        }
+                    }
+                } else {
+                    this.read_with(cx, |_workspace, cx| {
+                        matches!(
+                            WorkspaceSettings::get_global(cx).default_open_behavior,
+                            DefaultOpenBehavior::NewWindow
+                        )
+                    })
+                    .unwrap_or(false)
+                }
+            }
+        };
+
+        if !open_in_new_window {
             if let Some(handle) = multi_workspace_handle {
                 if let Some(task) = handle
                     .update(cx, |multi_workspace, window, cx| {
@@ -1109,12 +1168,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     multiple: true,
                     prompt: None,
                 },
-                action.create_new_window.unwrap_or_else(|| {
-                    matches!(
-                        WorkspaceSettings::get_global(cx).default_open_behavior,
-                        DefaultOpenBehavior::NewWindow
-                    )
-                }),
+                action.create_new_window,
                 cx,
             );
         })
@@ -1129,7 +1183,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     multiple: true,
                     prompt: None,
                 },
-                true,
+                Some(false),
                 cx,
             );
         });

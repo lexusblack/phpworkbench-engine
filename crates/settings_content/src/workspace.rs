@@ -494,13 +494,16 @@ pub enum CliDefaultOpenBehavior {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultOpenBehavior {
-    /// Open projects in the current Zed window.
-    #[default]
+    /// Open projects in the current window.
     #[strum(serialize = "Add to Existing Window")]
     ExistingWindow,
     /// Open projects in a new window.
     #[strum(serialize = "Open a New Window")]
     NewWindow,
+    /// Prompt whether to open in current window or a new window (PhpStorm style).
+    #[default]
+    #[strum(serialize = "Ask Each Time (PhpStorm style)")]
+    Ask,
 }
 
 #[derive(

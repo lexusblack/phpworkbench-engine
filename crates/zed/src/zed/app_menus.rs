@@ -22,6 +22,7 @@ pub mod phpstorm_menu {
         [
             AnnotateWithGitBlame,
             // File
+            OpenInNewWindow,
             Print,
             NewProjectFromExistingFiles,
             PutLabel,
@@ -225,6 +226,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     },
                     workspace::Open::default(),
                 ),
+                MenuItem::action("Open in New Window…", phpstorm_menu::OpenInNewWindow),
                 MenuItem::action("Save As…", workspace::SaveAs),
                 MenuItem::action("New Project from Existing Files…", phpstorm_menu::NewProjectFromExistingFiles),
                 MenuItem::submenu(Menu::new("Recent Projects").items([

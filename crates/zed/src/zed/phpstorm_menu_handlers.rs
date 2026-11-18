@@ -1007,6 +1007,9 @@ pub fn register_actions(workspace: &mut Workspace, _cx: &mut Context<Workspace>)
     });
 
     // Remaining File items
+    workspace.register_action(|_workspace, _: &phpstorm_menu::OpenInNewWindow, window, cx| {
+        window.dispatch_action(Box::new(workspace::Open { create_new_window: Some(true) }), cx);
+    });
     workspace.register_action(|_workspace, _: &phpstorm_menu::NewProjectFromExistingFiles, window, cx| {
         window.dispatch_action(Box::new(workspace::Open { create_new_window: Some(true) }), cx);
     });

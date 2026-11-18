@@ -392,7 +392,7 @@ pub fn init(cx: &mut App) {
             add_wsl_distro(fs, &open_wsl.distro, cx);
             let requesting_window =
                 match workspace::WorkspaceSettings::get_global(cx).default_open_behavior {
-                    DefaultOpenBehavior::ExistingWindow => {
+                    DefaultOpenBehavior::ExistingWindow | DefaultOpenBehavior::Ask => {
                         window.window_handle().downcast::<MultiWorkspace>()
                     }
                     DefaultOpenBehavior::NewWindow => None,
@@ -2146,10 +2146,20 @@ impl RecentProjectsDelegate {
             return;
         };
 
-        let replace_current_window = self.create_new_window == secondary;
         let candidate_workspace_id = candidate_workspace.workspace_id;
         let candidate_workspace_location = candidate_workspace.location.clone();
         let candidate_workspace_paths = candidate_workspace.paths.clone();
+        let create_new_window = self.create_new_window;
+
+        let has_existing_project = workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .is_some();
+        let default_open_behavior =
+            workspace::WorkspaceSettings::get_global(cx).default_open_behavior;
 
         workspace.update(cx, |workspace, cx| {
             if workspace.database_id() == Some(candidate_workspace_id) {
@@ -2158,55 +2168,131 @@ impl RecentProjectsDelegate {
             match candidate_workspace_location {
                 SerializedWorkspaceLocation::Local => {
                     let paths = candidate_workspace_paths.paths().to_vec();
-                    if replace_current_window {
-                        if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
-                            cx.defer(move |cx| {
-                                if let Some(task) = handle
-                                    .update(cx, |multi_workspace, window, cx| {
-                                        multi_workspace.open_project(
-                                            paths,
-                                            OpenMode::Activate,
-                                            window,
-                                            cx,
-                                        )
-                                    })
-                                    .log_err()
-                                {
-                                    task.detach_and_log_err(cx);
-                                }
-                            });
+                    let multi_workspace_handle =
+                        window.window_handle().downcast::<MultiWorkspace>();
+                    let workspace_handle = cx.entity().clone();
+
+                    cx.spawn_in(window, async move |_this, cx| {
+                        let should_replace = if has_existing_project
+                            && !secondary
+                            && matches!(default_open_behavior, DefaultOpenBehavior::Ask)
+                        {
+                            let prompt = cx
+                                .update(|window, cx| {
+                                    window.prompt(
+                                        gpui::PromptLevel::Info,
+                                        "Open Project",
+                                        Some(
+                                            "You can open the project in the current window or in a new window.",
+                                        ),
+                                        &["This Window", "New Window", "Cancel"],
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+
+                            let Some(prompt) = prompt else {
+                                return anyhow::Ok(());
+                            };
+
+                            match prompt.await.log_err() {
+                                Some(0) => true,  // "This Window"
+                                Some(1) => false, // "New Window"
+                                _ => return anyhow::Ok(()),
+                            }
+                        } else {
+                            create_new_window == secondary
+                        };
+
+                        if should_replace {
+                            if let Some(handle) = multi_workspace_handle {
+                                let task = handle.update(cx, |multi_workspace, window, cx| {
+                                    multi_workspace.open_project(
+                                        paths,
+                                        OpenMode::Activate,
+                                        window,
+                                        cx,
+                                    )
+                                })?;
+                                task.await.log_err();
+                            }
+                        } else {
+                            let task = workspace_handle.update_in(cx, |workspace, window, cx| {
+                                workspace.open_workspace_for_paths(
+                                    OpenMode::NewWindow,
+                                    paths,
+                                    window,
+                                    cx,
+                                )
+                            })?;
+                            task.await.log_err();
                         }
-                        return;
-                    } else {
-                        workspace
-                            .open_workspace_for_paths(OpenMode::NewWindow, paths, window, cx)
-                            .detach_and_prompt_err(
-                                "Failed to open project",
-                                window,
-                                cx,
-                                |_, _, _| None,
-                            );
-                    }
+
+                        anyhow::Ok(())
+                    })
+                    .detach();
                 }
                 SerializedWorkspaceLocation::Remote(mut connection) => {
                     let app_state = workspace.app_state().clone();
-                    let replace_window = if replace_current_window {
-                        window.window_handle().downcast::<MultiWorkspace>()
-                    } else {
-                        None
-                    };
-                    let open_options = OpenOptions {
-                        requesting_window: replace_window,
-                        ..Default::default()
-                    };
+                    let paths = candidate_workspace_paths.paths().to_vec();
+                    let multi_workspace_handle =
+                        window.window_handle().downcast::<MultiWorkspace>();
+
                     if let RemoteConnectionOptions::Ssh(connection) = &mut connection {
                         RemoteSettings::get_global(cx)
                             .fill_connection_options_from_settings(connection);
                     };
-                    let paths = candidate_workspace_paths.paths().to_vec();
+
                     cx.spawn_in(window, async move |_, cx| {
-                        open_remote_project(connection.clone(), paths, app_state, open_options, cx)
-                            .await
+                        let should_replace = if has_existing_project
+                            && !secondary
+                            && matches!(default_open_behavior, DefaultOpenBehavior::Ask)
+                        {
+                            let prompt = cx
+                                .update(|window, cx| {
+                                    window.prompt(
+                                        gpui::PromptLevel::Info,
+                                        "Open Project",
+                                        Some(
+                                            "You can open the project in the current window or in a new window.",
+                                        ),
+                                        &["This Window", "New Window", "Cancel"],
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+
+                            let Some(prompt) = prompt else {
+                                return anyhow::Ok(());
+                            };
+
+                            match prompt.await.log_err() {
+                                Some(0) => true,
+                                Some(1) => false,
+                                _ => return anyhow::Ok(()),
+                            }
+                        } else {
+                            create_new_window == secondary
+                        };
+
+                        let open_options = OpenOptions {
+                            requesting_window: if should_replace {
+                                multi_workspace_handle
+                            } else {
+                                None
+                            },
+                            ..Default::default()
+                        };
+
+                        open_remote_project(
+                            connection.clone(),
+                            paths,
+                            app_state,
+                            open_options,
+                            cx,
+                        )
+                        .await?;
+                        anyhow::Ok(())
                     })
                     .detach_and_prompt_err(
                         "Failed to open project",

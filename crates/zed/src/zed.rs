@@ -938,12 +938,7 @@ fn register_actions(
                     multiple: true,
                     prompt: None,
                 },
-                action.create_new_window.unwrap_or_else(|| {
-                    matches!(
-                        WorkspaceSettings::get_global(cx).default_open_behavior,
-                        DefaultOpenBehavior::NewWindow
-                    )
-                }),
+                action.create_new_window,
                 window,
                 cx,
             );
@@ -959,7 +954,7 @@ fn register_actions(
                     multiple: true,
                     prompt: None,
                 },
-                true,
+                Some(false),
                 window,
                 cx,
             );

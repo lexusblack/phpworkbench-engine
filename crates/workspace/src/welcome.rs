@@ -308,7 +308,9 @@ impl WelcomePage {
                 if is_local {
                     let paths = workspace.paths.paths().to_vec();
                     let open_mode = match WorkspaceSettings::get_global(cx).default_open_behavior {
-                        DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
+                        DefaultOpenBehavior::ExistingWindow | DefaultOpenBehavior::Ask => {
+                            OpenMode::Activate
+                        }
                         DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
                     };
                     self.workspace
