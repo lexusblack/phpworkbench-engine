@@ -212,12 +212,19 @@ impl RemoteFileBanner {
             return;
         };
         active.status = RemoteSyncStatus::Uploading;
+        crate::set_deploy_transfer_started(
+            format!("Uploading {} to {}…", active.remote_path, active.server),
+            cx,
+        );
         cx.notify();
 
         let server = active.server.clone();
         let remote_path = active.remote_path.clone();
         let local_path = active.local_path.clone();
         let root = active.root.clone();
+
+        let s_name = server.clone();
+        let r_path = remote_path.clone();
 
         let task: Task<Result<(), String>> = cx.background_spawn(async move {
             let output = std::process::Command::new(crate::resolve_helper_tool("php-deploy"))
@@ -247,13 +254,23 @@ impl RemoteFileBanner {
             let result = task.await;
             this.update(cx, |this, cx| {
                 if let Some(active) = this.active_file.as_mut() {
-                    match result {
+                    match &result {
                         Ok(()) => {
                             active.status = RemoteSyncStatus::Uploaded;
                             active.last_uploaded = Some(Instant::now());
+                            crate::set_deploy_transfer_finished(
+                                true,
+                                format!("Uploaded {} to {}", r_path, s_name),
+                                cx,
+                            );
                         }
                         Err(err) => {
-                            active.status = RemoteSyncStatus::Failed(err);
+                            active.status = RemoteSyncStatus::Failed(err.clone());
+                            crate::set_deploy_transfer_finished(
+                                false,
+                                format!("Upload failed: {err}"),
+                                cx,
+                            );
                         }
                     }
                     cx.notify();

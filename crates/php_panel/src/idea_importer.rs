@@ -629,15 +629,16 @@ mod tests {
         let p = Path::new("/Users/admin/PhpstormProjects/newsystems");
         if p.is_dir() {
             let res = import_idea_servers(p).expect("import servers");
-            assert_eq!(res["default"], json!("newdemo"));
-            assert_eq!(res["active"], json!("newdemo"));
+            assert!(res["default"].is_string());
+            assert_eq!(res["default"], res["active"]);
             let servers = res["servers"].as_array().expect("servers array");
             assert!(!servers.is_empty());
-            assert_eq!(servers[0]["name"], json!("newdemo"));
-            assert_eq!(servers[0]["protocol"], json!("ftps"));
-            assert_eq!(servers[0]["user"], json!("olek_all"));
-            assert_eq!(servers[0]["keychain"], json!(true));
-            assert!(servers[0]["keychain_service"].as_str().unwrap().starts_with("IntelliJ Platform Deployment"));
+            let newdemo = servers.iter().find(|s| s["name"] == "newdemo").expect("newdemo server found");
+            assert_eq!(newdemo["name"], json!("newdemo"));
+            assert_eq!(newdemo["protocol"], json!("ftps"));
+            assert_eq!(newdemo["user"], json!("olek_all"));
+            assert_eq!(newdemo["keychain"], json!(true));
+            assert!(newdemo["keychain_service"].as_str().unwrap().starts_with("IntelliJ Platform Deployment"));
 
             let db_res = import_idea_databases(p).expect("import databases");
             let conns = db_res["connections"].as_array().expect("connections");

@@ -4296,6 +4296,132 @@ pub struct DeployShared {
 
 impl gpui::Global for DeployShared {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeployTransferState {
+    Idle,
+    Transferring {
+        message: String,
+        started_at: std::time::Instant,
+    },
+    Finished {
+        message: String,
+        success: bool,
+        at: std::time::Instant,
+    },
+}
+
+#[derive(Clone, Default)]
+pub struct DeployTransferGlobal {
+    pub state: DeployTransferState,
+    pub indicator: Option<WeakEntity<DeployServerIndicator>>,
+}
+
+impl Default for DeployTransferState {
+    fn default() -> Self {
+        DeployTransferState::Idle
+    }
+}
+
+impl gpui::Global for DeployTransferGlobal {}
+
+pub fn set_deploy_transfer_started(message: String, cx: &mut App) {
+    if cx.has_global::<DeployTransferGlobal>() {
+        let (indicator, panel) = {
+            let mut global = cx.global_mut::<DeployTransferGlobal>();
+            global.state = DeployTransferState::Transferring {
+                message: message.clone(),
+                started_at: std::time::Instant::now(),
+            };
+            let ind = global.indicator.clone();
+            let p = if cx.has_global::<DeployShared>() {
+                cx.global::<DeployShared>().panel.clone()
+            } else {
+                None
+            };
+            (ind, p)
+        };
+        if let Some(indicator) = indicator.and_then(|i| i.upgrade()) {
+            indicator.update(cx, |this, cx| {
+                this.transfer_state = DeployTransferState::Transferring {
+                    message: message.clone(),
+                    started_at: std::time::Instant::now(),
+                };
+                cx.notify();
+            });
+        }
+        if let Some(panel) = panel.and_then(|p| p.upgrade()) {
+            panel.update(cx, |panel, cx| {
+                panel.saved_message = Some(message);
+                cx.notify();
+            });
+        }
+    } else {
+        cx.set_global(DeployTransferGlobal {
+            state: DeployTransferState::Transferring {
+                message: message.clone(),
+                started_at: std::time::Instant::now(),
+            },
+            indicator: None,
+        });
+    }
+}
+
+pub fn set_deploy_transfer_finished(success: bool, message: String, cx: &mut App) {
+    if cx.has_global::<DeployTransferGlobal>() {
+        let (indicator, panel) = {
+            let mut global = cx.global_mut::<DeployTransferGlobal>();
+            global.state = DeployTransferState::Finished {
+                message: message.clone(),
+                success,
+                at: std::time::Instant::now(),
+            };
+            let ind = global.indicator.clone();
+            let p = if cx.has_global::<DeployShared>() {
+                cx.global::<DeployShared>().panel.clone()
+            } else {
+                None
+            };
+            (ind, p)
+        };
+        if let Some(indicator) = indicator.and_then(|i| i.upgrade()) {
+            indicator.update(cx, |this, cx| {
+                this.transfer_state = DeployTransferState::Finished {
+                    message: message.clone(),
+                    success,
+                    at: std::time::Instant::now(),
+                };
+                cx.notify();
+
+                if success {
+                    cx.spawn(async move |indicator, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(6))
+                            .await;
+                        indicator
+                            .update(cx, |this, cx| {
+                                if matches!(
+                                    this.transfer_state,
+                                    DeployTransferState::Finished { success: true, .. }
+                                ) {
+                                    this.transfer_state = DeployTransferState::Idle;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    })
+                    .detach();
+                }
+            });
+        }
+        if let Some(panel) = panel.and_then(|p| p.upgrade()) {
+            panel.update(cx, |panel, cx| {
+                panel.saved_message = Some(message);
+                cx.notify();
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeployOperation {
     Upload,
@@ -4621,6 +4747,8 @@ pub fn execute_deploy_upload(
         "project".to_string()
     };
 
+    set_deploy_transfer_started(format!("Uploading {} to {}…", file_desc, server), cx);
+
     workspace.show_toast(
         Toast::new(
             NotificationId::unique::<DeployNotification>(),
@@ -4676,6 +4804,7 @@ pub fn execute_deploy_upload(
             .update(cx, |workspace, cx| {
                 match &result {
                     Ok(msg) => {
+                        set_deploy_transfer_finished(true, msg.clone(), cx);
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<DeployNotification>(),
@@ -4686,6 +4815,7 @@ pub fn execute_deploy_upload(
                         );
                     }
                     Err(err) => {
+                        set_deploy_transfer_finished(false, format!("Upload failed: {err}"), cx);
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<DeployNotification>(),
@@ -4728,6 +4858,8 @@ pub fn execute_deploy_download(
     } else {
         "project".to_string()
     };
+
+    set_deploy_transfer_started(format!("Downloading {} from {}…", file_desc, server), cx);
 
     workspace.show_toast(
         Toast::new(
@@ -4775,6 +4907,7 @@ pub fn execute_deploy_download(
             .update(cx, |workspace, cx| {
                 match &result {
                     Ok(msg) => {
+                        set_deploy_transfer_finished(true, msg.clone(), cx);
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<DeployNotification>(),
@@ -4785,6 +4918,7 @@ pub fn execute_deploy_download(
                         );
                     }
                     Err(err) => {
+                        set_deploy_transfer_finished(false, format!("Download failed: {err}"), cx);
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<DeployNotification>(),
@@ -4923,6 +5057,8 @@ pub fn execute_deploy_sync(
     server: String,
     cx: &mut Context<Workspace>,
 ) {
+    set_deploy_transfer_started(format!("Syncing with {}…", server), cx);
+
     workspace.show_toast(
         Toast::new(
             NotificationId::unique::<DeployNotification>(),
@@ -12205,6 +12341,8 @@ impl PhpPanel {
                 let server_clone = server.clone();
                 let count = open_files.len();
 
+                set_deploy_transfer_started(format!("Uploading {} open file(s) to {}…", count, server_clone), cx);
+
                 workspace.show_toast(
                     Toast::new(
                         NotificationId::unique::<DeployNotification>(),
@@ -12248,6 +12386,7 @@ impl PhpPanel {
                     workspace.update(cx, |workspace, cx| {
                         match &result {
                             Ok(msg) => {
+                                set_deploy_transfer_finished(true, msg.clone(), cx);
                                 workspace.show_toast(
                                     Toast::new(
                                         NotificationId::unique::<DeployNotification>(),
@@ -12258,6 +12397,7 @@ impl PhpPanel {
                                 );
                             }
                             Err(err) => {
+                                set_deploy_transfer_finished(false, format!("Upload open files failed: {err}"), cx);
                                 workspace.show_toast(
                                     Toast::new(
                                         NotificationId::unique::<DeployNotification>(),
@@ -12674,6 +12814,7 @@ impl PhpPanel {
         if matches!(self.sync_status.get(&name), Some(SyncStatus::Syncing)) {
             return;
         }
+        set_deploy_transfer_started(format!("Syncing with {name}…"), cx);
         self.sync_status.insert(name.clone(), SyncStatus::Syncing);
         cx.notify();
 
@@ -12707,8 +12848,14 @@ impl PhpPanel {
             let result = task.await;
             this.update(cx, |this, cx| {
                 let status = match result {
-                    Ok(()) => SyncStatus::Ok,
-                    Err(message) => SyncStatus::Failed(message),
+                    Ok(()) => {
+                        set_deploy_transfer_finished(true, format!("Synced with {server_name}"), cx);
+                        SyncStatus::Ok
+                    }
+                    Err(message) => {
+                        set_deploy_transfer_finished(false, format!("Sync failed: {message}"), cx);
+                        SyncStatus::Failed(message)
+                    }
                 };
                 this.sync_status.insert(server_name, status);
                 cx.notify();
@@ -14519,7 +14666,9 @@ impl PhpPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(root) = root else { return; };
-        self.saved_message = Some(format!("uploading to {server}:{remote_path}…"));
+        let msg = format!("uploading to {server}:{remote_path}…");
+        set_deploy_transfer_started(msg.clone(), cx);
+        self.saved_message = Some(msg);
         cx.notify();
 
         let s_clone = server.clone();
@@ -14554,9 +14703,15 @@ impl PhpPanel {
         cx.spawn(async move |this, cx| {
             let res = task.await;
             this.update(cx, |this, cx| {
-                match res {
-                    Ok(msg) => this.saved_message = Some(msg),
-                    Err(err) => this.saved_message = Some(format!("upload failed: {err}")),
+                match &res {
+                    Ok(msg) => {
+                        this.saved_message = Some(msg.clone());
+                        set_deploy_transfer_finished(true, msg.clone(), cx);
+                    }
+                    Err(err) => {
+                        this.saved_message = Some(format!("upload failed: {err}"));
+                        set_deploy_transfer_finished(false, format!("Upload failed: {err}"), cx);
+                    }
                 }
                 if is_dir {
                     this.load_remote_dir(server.clone(), remote_path, root.clone(), cx);
@@ -14578,7 +14733,9 @@ impl PhpPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(root) = root else { return; };
-        self.saved_message = Some(format!("downloading {remote_path} from {server}…"));
+        let msg = format!("downloading {remote_path} from {server}…");
+        set_deploy_transfer_started(msg.clone(), cx);
+        self.saved_message = Some(msg);
         cx.notify();
 
         let s_clone = server.clone();
@@ -14612,9 +14769,15 @@ impl PhpPanel {
         cx.spawn(async move |this, cx| {
             let res = task.await;
             this.update(cx, |this, cx| {
-                match res {
-                    Ok(msg) => this.saved_message = Some(msg),
-                    Err(err) => this.saved_message = Some(format!("download failed: {err}")),
+                match &res {
+                    Ok(msg) => {
+                        this.saved_message = Some(msg.clone());
+                        set_deploy_transfer_finished(true, msg.clone(), cx);
+                    }
+                    Err(err) => {
+                        this.saved_message = Some(format!("download failed: {err}"));
+                        set_deploy_transfer_finished(false, format!("Download failed: {err}"), cx);
+                    }
                 }
                 cx.notify();
             }).log_err();
@@ -14690,7 +14853,9 @@ impl PhpPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(root) = root else { return; };
-        self.saved_message = Some(format!("deleting {remote_path} from {server}…"));
+        let msg = format!("deleting {remote_path} from {server}…");
+        set_deploy_transfer_started(msg.clone(), cx);
+        self.saved_message = Some(msg);
         cx.notify();
 
         let s_clone = server.clone();
@@ -14723,9 +14888,15 @@ impl PhpPanel {
         cx.spawn(async move |this, cx| {
             let res = task.await;
             this.update(cx, |this, cx| {
-                match res {
-                    Ok(msg) => this.saved_message = Some(msg),
-                    Err(err) => this.saved_message = Some(format!("delete failed: {err}")),
+                match &res {
+                    Ok(msg) => {
+                        this.saved_message = Some(msg.clone());
+                        set_deploy_transfer_finished(true, msg.clone(), cx);
+                    }
+                    Err(err) => {
+                        this.saved_message = Some(format!("delete failed: {err}"));
+                        set_deploy_transfer_finished(false, format!("Delete failed: {err}"), cx);
+                    }
                 }
                 let parent = remote_parent_path(&remote_path);
                 this.load_remote_dir(server.clone(), parent, root.clone(), cx);
@@ -15830,7 +16001,9 @@ impl PhpPanel {
         let server_root = server.root.clone();
         self.sync_status
             .insert(server_name.clone(), SyncStatus::Syncing);
-        self.saved_message = Some(format!("uploading {} to {}…", rel_path, server_name));
+        let start_msg = format!("uploading {} to {}…", rel_path, server_name);
+        set_deploy_transfer_started(start_msg.clone(), cx);
+        self.saved_message = Some(start_msg);
         cx.notify();
 
         let task_server = server_name.clone();
@@ -15868,16 +16041,18 @@ impl PhpPanel {
             let result = task.await;
             panel
                 .update(cx, |panel, cx| {
-                    match result {
+                    match &result {
                         Ok(msg) => {
                             panel.sync_status.insert(server_name.clone(), SyncStatus::Ok);
-                            panel.saved_message = Some(msg);
+                            panel.saved_message = Some(msg.clone());
+                            set_deploy_transfer_finished(true, msg.clone(), cx);
                         }
                         Err(err) => {
                             panel
                                 .sync_status
                                 .insert(server_name.clone(), SyncStatus::Failed(err.clone()));
                             panel.saved_message = Some(format!("auto-upload failed: {err}"));
+                            set_deploy_transfer_finished(false, format!("Auto-upload failed: {err}"), cx);
                         }
                     }
                     cx.notify();
@@ -25074,158 +25249,209 @@ fn empty_state(
 }
 
 pub struct DeployServerIndicator {
-    _marker: (),
+    pub transfer_state: DeployTransferState,
 }
 
 impl DeployServerIndicator {
-    fn new(_cx: &mut gpui::Context<Self>) -> Self {
-        Self { _marker: () }
+    fn new(cx: &mut gpui::Context<Self>) -> Self {
+        let weak = cx.weak_entity();
+        if cx.has_global::<DeployTransferGlobal>() {
+            cx.global_mut::<DeployTransferGlobal>().indicator = Some(weak);
+        } else {
+            cx.set_global(DeployTransferGlobal {
+                state: DeployTransferState::Idle,
+                indicator: Some(weak),
+            });
+        }
+        Self {
+            transfer_state: DeployTransferState::Idle,
+        }
     }
 }
 
 impl Render for DeployServerIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !cx.has_global::<DeployShared>() {
-            return div().into_any_element();
-        }
-        let shared = cx.global::<DeployShared>();
-        if shared.servers.is_empty() {
-            return div().into_any_element();
-        }
-        let active = shared
-            .active
-            .clone()
-            .or_else(|| shared.servers.first().cloned());
-
-        let trigger = Button::new(
-            "deploy-server-indicator",
-            active.unwrap_or_else(|| "no server".to_string()),
-        )
-        .size(ButtonSize::Compact)
-        .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
-        .tooltip(Tooltip::text("Deployment server"));
-
-        PopoverMenu::new("deploy-server-menu")
-            .menu(|window, cx| {
-                let shared = if cx.has_global::<DeployShared>() {
-                    cx.global::<DeployShared>()
+        match &self.transfer_state {
+            DeployTransferState::Transferring { message, .. } => {
+                let msg = message.clone();
+                Button::new("deploy-transfer-progress", msg.clone())
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .loading(true)
+                    .tooltip(Tooltip::text(format!("{msg} (Click to open Remote Host)")))
+                    .on_click(move |_, _, cx| {
+                        cx.dispatch_action(&BrowseRemoteHost);
+                    })
+                    .into_any_element()
+            }
+            DeployTransferState::Finished { message, success, .. } => {
+                let msg = message.clone();
+                let is_success = *success;
+                let (icon, color) = if is_success {
+                    (IconName::Check, Color::Success)
                 } else {
-                    return None;
+                    (IconName::Warning, Color::Error)
                 };
-                let servers = shared.servers.clone();
-                let active = shared.active.clone();
-                let panel = shared.panel.clone();
-                let root = shared.root.clone();
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    if let Some(active_server) = active.as_ref() {
-                        let s_deploy = active_server.clone();
-                        let r_root = root.clone();
-                        let menu_panel = panel.clone();
-                        menu = menu.item(
-                            ContextMenuEntry::new(format!("Upload to {s_deploy} (Deploy)"))
-                                .icon(IconName::ArrowUp)
-                                .handler(move |_window, cx| {
-                                    if let Some(panel) = menu_panel.clone().and_then(|panel| panel.upgrade()) {
-                                        panel.update(cx, |panel, cx| {
-                                            if let Some(root) = r_root.clone() {
-                                                panel.upload_project(s_deploy.clone(), root, cx);
+                Button::new("deploy-transfer-finished", msg.clone())
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                    .start_icon(Icon::new(icon).size(IconSize::Small).color(color))
+                    .tooltip(Tooltip::text(format!("{msg} (Click to open Remote Host)")))
+                    .on_click(move |_, _, cx| {
+                        cx.dispatch_action(&BrowseRemoteHost);
+                    })
+                    .into_any_element()
+            }
+            DeployTransferState::Idle => {
+                if !cx.has_global::<DeployShared>() {
+                    return div().into_any_element();
+                }
+                let shared = cx.global::<DeployShared>();
+                if shared.servers.is_empty() {
+                    return div().into_any_element();
+                }
+                let active = shared
+                    .active
+                    .clone()
+                    .or_else(|| shared.servers.first().cloned());
+                let active_name = active.unwrap_or_else(|| "no server".to_string());
+
+                let trigger = Button::new(
+                    "deploy-server-indicator",
+                    format!("ftp: {active_name}"),
+                )
+                .size(ButtonSize::Compact)
+                .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+                .start_icon(
+                    Icon::new(IconName::Server)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text(format!("Deployment server: {active_name} (Click for menu)")));
+
+                PopoverMenu::new("deploy-server-menu")
+                    .menu(|window, cx| {
+                        let shared = if cx.has_global::<DeployShared>() {
+                            cx.global::<DeployShared>()
+                        } else {
+                            return None;
+                        };
+                        let servers = shared.servers.clone();
+                        let active = shared.active.clone();
+                        let panel = shared.panel.clone();
+                        let root = shared.root.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            if let Some(active_server) = active.as_ref() {
+                                let s_deploy = active_server.clone();
+                                let r_root = root.clone();
+                                let menu_panel = panel.clone();
+                                menu = menu.item(
+                                    ContextMenuEntry::new(format!("Upload to {s_deploy} (Deploy)"))
+                                        .icon(IconName::ArrowUp)
+                                        .handler(move |_window, cx| {
+                                            if let Some(panel) = menu_panel.clone().and_then(|panel| panel.upgrade()) {
+                                                panel.update(cx, |panel, cx| {
+                                                    if let Some(root) = r_root.clone() {
+                                                        panel.upload_project(s_deploy.clone(), root, cx);
+                                                    }
+                                                });
                                             }
-                                        });
-                                    }
-                                }),
-                        );
+                                        }),
+                                );
 
-                        let s_dl = active_server.clone();
-                        let r_root_dl = root.clone();
-                        let menu_panel_dl = panel.clone();
-                        menu = menu.item(
-                            ContextMenuEntry::new(format!("Download from {s_dl}"))
-                                .icon(IconName::Download)
-                                .handler(move |_window, cx| {
-                                    if let Some(panel) = menu_panel_dl.clone().and_then(|panel| panel.upgrade()) {
-                                        panel.update(cx, |panel, cx| {
-                                            panel.download_from_remote_path(s_dl.clone(), ".".to_string(), true, r_root_dl.clone(), cx);
-                                        });
-                                    }
-                                }),
-                        );
-
-                        let s_sync = active_server.clone();
-                        let r_root_sync = root.clone();
-                        let menu_panel_sync = panel.clone();
-                        menu = menu.item(
-                            ContextMenuEntry::new(format!("Sync with {s_sync}…"))
-                                .icon(IconName::RotateCw)
-                                .handler(move |_window, cx| {
-                                    if let Some(panel) = menu_panel_sync.clone().and_then(|panel| panel.upgrade()) {
-                                        panel.update(cx, |panel, cx| {
-                                            if let Some(root) = r_root_sync.clone() {
-                                                panel.sync_server(s_sync.clone(), root, cx);
+                                let s_dl = active_server.clone();
+                                let r_root_dl = root.clone();
+                                let menu_panel_dl = panel.clone();
+                                menu = menu.item(
+                                    ContextMenuEntry::new(format!("Download from {s_dl}"))
+                                        .icon(IconName::Download)
+                                        .handler(move |_window, cx| {
+                                            if let Some(panel) = menu_panel_dl.clone().and_then(|panel| panel.upgrade()) {
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.download_from_remote_path(s_dl.clone(), ".".to_string(), true, r_root_dl.clone(), cx);
+                                                });
                                             }
-                                        });
-                                    }
-                                }),
-                        );
+                                        }),
+                                );
 
-                        menu = menu.separator();
-                    }
+                                let s_sync = active_server.clone();
+                                let r_root_sync = root.clone();
+                                let menu_panel_sync = panel.clone();
+                                menu = menu.item(
+                                    ContextMenuEntry::new(format!("Sync with {s_sync}…"))
+                                        .icon(IconName::RotateCw)
+                                        .handler(move |_window, cx| {
+                                            if let Some(panel) = menu_panel_sync.clone().and_then(|panel| panel.upgrade()) {
+                                                panel.update(cx, |panel, cx| {
+                                                    if let Some(root) = r_root_sync.clone() {
+                                                        panel.sync_server(s_sync.clone(), root, cx);
+                                                    }
+                                                });
+                                            }
+                                        }),
+                                );
 
-                    for server in servers.iter() {
-                        let is_active = active.as_deref() == Some(server.as_str());
-                        let server_name = server.clone();
-                        let menu_panel = panel.clone();
-                        let entry = ui::ContextMenuEntry::new(server.clone())
-                            .toggleable(ui::IconPosition::Start, is_active)
-                            .handler(move |_window: &mut Window, cx: &mut App| {
-                                if let Some(panel) =
-                                    menu_panel.clone().and_then(|panel| panel.upgrade())
-                                {
+                                menu = menu.separator();
+                            }
+
+                            for server in servers.iter() {
+                                let is_active = active.as_deref() == Some(server.as_str());
+                                let server_name = server.clone();
+                                let menu_panel = panel.clone();
+                                let entry = ui::ContextMenuEntry::new(server.clone())
+                                    .toggleable(ui::IconPosition::Start, is_active)
+                                    .handler(move |_window: &mut Window, cx: &mut App| {
+                                        if let Some(panel) =
+                                            menu_panel.clone().and_then(|panel| panel.upgrade())
+                                        {
+                                            panel.update(cx, |panel, cx| {
+                                                panel.set_active_server_from_status_bar(
+                                                    Some(server_name.clone()),
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    });
+                                menu = menu.item(entry);
+                            }
+                            menu = menu.separator();
+                            let clear_panel = panel.clone();
+                            menu = menu.entry("<no default server>", None, move |_window, cx| {
+                                if let Some(panel) = clear_panel.clone().and_then(|panel| panel.upgrade()) {
                                     panel.update(cx, |panel, cx| {
-                                        panel.set_active_server_from_status_bar(
-                                            Some(server_name.clone()),
-                                            cx,
-                                        );
+                                        let root = panel.worktree_root(cx);
+                                        let servers = panel
+                                            .remote_servers
+                                            .iter()
+                                            .filter(|server| server.visible)
+                                            .cloned()
+                                            .collect::<Vec<_>>();
+                                        if let Some(root) = root {
+                                            let _ = save_deploy_config(&root, &servers, None);
+                                        }
+                                        panel.set_active_server_from_status_bar(None, cx);
                                     });
                                 }
                             });
-                        menu = menu.item(entry);
-                    }
-                    menu = menu.separator();
-                    let clear_panel = panel.clone();
-                    menu = menu.entry("<no default server>", None, move |_window, cx| {
-                        if let Some(panel) = clear_panel.clone().and_then(|panel| panel.upgrade()) {
-                            panel.update(cx, |panel, cx| {
-                                let root = panel.worktree_root(cx);
-                                let servers = panel
-                                    .remote_servers
-                                    .iter()
-                                    .filter(|server| server.visible)
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                if let Some(root) = root {
-                                    let _ = save_deploy_config(&root, &servers, None);
-                                }
-                                panel.set_active_server_from_status_bar(None, cx);
-                            });
-                        }
-                    });
 
-                    if let Some(root) = root.clone() {
-                        menu = menu.separator();
-                        menu = menu.item(
-                            ContextMenuEntry::new("Deployment Configuration…")
-                                .icon(IconName::Settings)
-                                .handler(move |_window, cx| {
-                                    open_deployment_window(root.clone(), cx);
-                                }),
-                        );
-                    }
-                    menu
-                }))
-            })
-            .anchor(Anchor::BottomRight)
-            .trigger(trigger)
-            .into_any_element()
+                            if let Some(root) = root.clone() {
+                                menu = menu.separator();
+                                menu = menu.item(
+                                    ContextMenuEntry::new("Deployment Configuration…")
+                                        .icon(IconName::Settings)
+                                        .handler(move |_window, cx| {
+                                            open_deployment_window(root.clone(), cx);
+                                        }),
+                                );
+                            }
+                            menu
+                        }))
+                    })
+                    .anchor(Anchor::BottomRight)
+                    .trigger(trigger)
+                    .into_any_element()
+            }
+        }
     }
 }
 
