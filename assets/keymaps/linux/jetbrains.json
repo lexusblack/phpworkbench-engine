@@ -227,4 +227,10 @@
       "ctrl-k": null,
     },
   },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "alt-shift-ctrl-x": ["php_panel::UploadToDeployServer", {}],
+    },
+  },
 ]

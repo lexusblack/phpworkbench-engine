@@ -9444,16 +9444,10 @@ impl GitPanel {
             let active = shared.active.clone().or_else(|| shared.servers.first().cloned());
             (active, !shared.servers.is_empty())
         } else if let Some(work_dir) = work_dir.as_ref() {
-            let deploy_json = work_dir.join(".zed/deploy.json");
-            let alt_deploy_json = work_dir.join(".phpworkbench/deploy.json");
-            let read_json = |p: &Path| -> Option<(Option<String>, bool)> {
-                let contents = std::fs::read_to_string(p).ok()?;
-                let val = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
-                let active = val.get("active").and_then(|v| v.as_str()).map(str::to_string);
-                let count = val.get("servers").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                Some((active, count > 0))
-            };
-            read_json(&alt_deploy_json).or_else(|| read_json(&deploy_json)).unwrap_or((None, false))
+            let servers = php_panel::load_deploy_servers(work_dir);
+            let active = php_panel::load_active_deploy_server(work_dir)
+                .or_else(|| servers.first().map(|s| s.name.clone()));
+            (active, !servers.is_empty())
         } else {
             (None, false)
         };
@@ -9508,9 +9502,13 @@ impl GitPanel {
                         }),
                     )
                     .action_disabled_when(
-                        false,
-                        "Upload to…",
-                        Box::new(php_panel::OpenDeploymentDialog),
+                        !has_deploy_servers,
+                        "Upload To...",
+                        Box::new(php_panel::UploadToDeployServer {
+                            abs_path: abs.clone(),
+                            rel_path: rel.clone(),
+                            server: None,
+                        }),
                     )
                     .action_disabled_when(
                         !has_deploy_servers || abs.is_none(),
@@ -9522,29 +9520,59 @@ impl GitPanel {
                         }),
                     )
                     .action_disabled_when(
-                        false,
-                        "Download from…",
-                        Box::new(php_panel::OpenDeploymentDialog),
+                        !has_deploy_servers,
+                        "Download from...",
+                        Box::new(php_panel::DownloadFromDeployServer {
+                            abs_path: abs.clone(),
+                            rel_path: rel.clone(),
+                            server: None,
+                        }),
                     );
                 if !is_dir {
-                    sub = sub.action_disabled_when(
-                        !has_deploy_servers || abs.is_none(),
-                        format!("Compare with Deployed on {s_label}"),
-                        Box::new(php_panel::CompareWithDeployServer {
-                            abs_path: abs.clone(),
+                    sub = sub
+                        .action_disabled_when(
+                            !has_deploy_servers || abs.is_none(),
+                            format!("Compare with Deployed Version on {s_label}"),
+                            Box::new(php_panel::CompareWithDeployServer {
+                                abs_path: abs.clone(),
+                                rel_path: rel.clone(),
+                                server: srv.clone(),
+                            }),
+                        )
+                        .action_disabled_when(
+                            !has_deploy_servers || abs.is_none(),
+                            "Compare with Deployed To...",
+                            Box::new(php_panel::CompareWithDeployServer {
+                                abs_path: abs.clone(),
+                                rel_path: rel.clone(),
+                                server: None,
+                            }),
+                        );
+                }
+                sub = sub
+                    .action_disabled_when(
+                        !has_deploy_servers || rel.is_none(),
+                        format!("Sync with Deployed to {s_label}..."),
+                        Box::new(php_panel::SyncWithDeployServer {
                             rel_path: rel.clone(),
                             server: srv.clone(),
                         }),
+                    )
+                    .action_disabled_when(
+                        !has_deploy_servers || rel.is_none(),
+                        "Sync with Deployed To...",
+                        Box::new(php_panel::SyncWithDeployServer {
+                            rel_path: rel.clone(),
+                            server: None,
+                        }),
+                    );
+                if !has_deploy_servers {
+                    sub = sub.separator().action(
+                        "Configuration…",
+                        Box::new(php_panel::OpenDeploymentDialog),
                     );
                 }
-                sub.action_disabled_when(
-                    !has_deploy_servers || rel.is_none(),
-                    format!("Sync with {s_label}…"),
-                    Box::new(php_panel::SyncWithDeployServer {
-                        rel_path: rel.clone(),
-                        server: srv.clone(),
-                    }),
-                )
+                sub
             });
 
             menu

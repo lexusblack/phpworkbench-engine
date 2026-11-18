@@ -39,7 +39,7 @@ use util::ResultExt as _;
 
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::item::ItemEvent;
-use workspace::{OpenOptions, Panel, StatusItemView, Workspace};
+use workspace::{ModalView, OpenOptions, Panel, StatusItemView, Workspace};
 use gpui::FontWeight;
 
 mod table_view;
@@ -303,38 +303,38 @@ impl PanelTab {
     }
 }
 
-#[derive(Clone)]
-struct RemoteServer {
-    name: String,
-    protocol: Option<String>,
-    host: Option<String>,
-    port: Option<String>,
-    user: Option<String>,
-    password: Option<String>,
-    password_session: bool,
-    ssh_config: Option<String>,
-    remote_root: Option<String>,
-    local_root: Option<String>,
-    web_url: Option<String>,
-    excluded: Vec<String>,
-    upload_on_save: bool,
-    use_rsync: bool,
-    rsync_args: Option<String>,
-    rsync_path: Option<String>,
-    rsync_delete: bool,
-    use_sudo: bool,
-    visible: bool,
-    passive_mode: bool,
-    show_hidden: bool,
-    list_compat: bool,
-    use_mlsd: bool,
-    max_connections: u32,
-    keep_alive_enabled: bool,
-    keep_alive_seconds: u32,
-    encoding: String,
-    keychain: bool,
-    keychain_service: Option<String>,
-    root: PathBuf,
+#[derive(Clone, Debug)]
+pub struct RemoteServer {
+    pub name: String,
+    pub protocol: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<String>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub password_session: bool,
+    pub ssh_config: Option<String>,
+    pub remote_root: Option<String>,
+    pub local_root: Option<String>,
+    pub web_url: Option<String>,
+    pub excluded: Vec<String>,
+    pub upload_on_save: bool,
+    pub use_rsync: bool,
+    pub rsync_args: Option<String>,
+    pub rsync_path: Option<String>,
+    pub rsync_delete: bool,
+    pub use_sudo: bool,
+    pub visible: bool,
+    pub passive_mode: bool,
+    pub show_hidden: bool,
+    pub list_compat: bool,
+    pub use_mlsd: bool,
+    pub max_connections: u32,
+    pub keep_alive_enabled: bool,
+    pub keep_alive_seconds: u32,
+    pub encoding: String,
+    pub keychain: bool,
+    pub keychain_service: Option<String>,
+    pub root: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4126,9 +4126,10 @@ fn deploy_config_path(root: &Path) -> PathBuf {
     pw
 }
 
-fn load_deploy_config_for_root(root: &Path) -> Option<Value> {
+pub fn load_deploy_config_for_root(root: &Path) -> Option<Value> {
     read_json(&root.join(".phpworkbench/deploy.json"))
         .or_else(|| read_json(&root.join(".zed/deploy.json")))
+        .or_else(|| read_json(&root.join("deploy.json")))
         .or_else(|| {
             let imported = idea_importer::import_idea_servers(root)?;
             let pw = root.join(".phpworkbench/deploy.json");
@@ -4139,7 +4140,22 @@ fn load_deploy_config_for_root(root: &Path) -> Option<Value> {
         })
 }
 
-fn load_deploy_servers(root: &Path) -> Vec<RemoteServer> {
+pub fn load_active_deploy_server(root: &Path) -> Option<String> {
+    load_deploy_config_for_root(root).and_then(|config| {
+        config
+            .get("active")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                config
+                    .get("default")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+    })
+}
+
+pub fn load_deploy_servers(root: &Path) -> Vec<RemoteServer> {
     let Some(config) = load_deploy_config_for_root(root) else {
         return Vec::new();
     };
@@ -4276,6 +4292,550 @@ pub struct DeployShared {
 }
 
 impl gpui::Global for DeployShared {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeployOperation {
+    Upload,
+    Download,
+    Compare,
+    Sync,
+}
+
+impl DeployOperation {
+    pub fn title(&self) -> &'static str {
+        match self {
+            DeployOperation::Upload => "Choose Server to Upload To",
+            DeployOperation::Download => "Choose Server to Download From",
+            DeployOperation::Compare => "Choose Server to Compare With",
+            DeployOperation::Sync => "Choose Server to Sync With",
+        }
+    }
+}
+
+pub const DEPLOY_MNEMONICS: [char; 36] = [
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
+    'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
+    'U', 'V', 'W', 'X', 'Y', 'Z',
+];
+
+pub struct ChooseServerModal {
+    workspace: WeakEntity<Workspace>,
+    operation: DeployOperation,
+    root: PathBuf,
+    abs_path: Option<String>,
+    rel_path: String,
+    servers: Vec<RemoteServer>,
+    selected_index: usize,
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<DismissEvent> for ChooseServerModal {}
+impl ModalView for ChooseServerModal {}
+
+impl Focusable for ChooseServerModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl ChooseServerModal {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        operation: DeployOperation,
+        root: PathBuf,
+        abs_path: Option<String>,
+        rel_path: String,
+        servers: Vec<RemoteServer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+
+        let active = if cx.has_global::<DeployShared>() {
+            cx.global::<DeployShared>().active.clone()
+        } else {
+            load_active_deploy_server(&root)
+        };
+        let selected_index = servers
+            .iter()
+            .position(|s| Some(&s.name) == active.as_ref())
+            .unwrap_or(0);
+
+        Self {
+            workspace,
+            operation,
+            root,
+            abs_path,
+            rel_path,
+            servers,
+            selected_index,
+            focus_handle,
+        }
+    }
+
+    fn confirm_selection(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(server) = self.servers.get(index) {
+            let server_name = server.name.clone();
+            let root = self.root.clone();
+            let abs_path = self.abs_path.clone();
+            let rel_path = self.rel_path.clone();
+            let operation = self.operation;
+            let workspace = self.workspace.clone();
+
+            cx.emit(DismissEvent);
+
+            workspace
+                .update_in(cx, |workspace, window, cx| match operation {
+                    DeployOperation::Upload => {
+                        execute_deploy_upload(workspace, root, server_name, abs_path, rel_path, cx);
+                    }
+                    DeployOperation::Download => {
+                        execute_deploy_download(workspace, root, server_name, abs_path, rel_path, cx);
+                    }
+                    DeployOperation::Compare => {
+                        execute_deploy_compare(workspace, window, root, server_name, rel_path, cx);
+                    }
+                    DeployOperation::Sync => {
+                        execute_deploy_sync(workspace, root, server_name, cx);
+                    }
+                })
+                .ok();
+        }
+    }
+}
+
+impl Render for ChooseServerModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.operation.title();
+        let selected_idx = self.selected_index;
+
+        v_flex()
+            .id("choose-server-modal")
+            .key_context("ChooseServerModal")
+            .track_focus(&self.focus_handle)
+            .w(rems(22.))
+            .elevation_3(cx)
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .overflow_hidden()
+            .on_action(cx.listener(|_this, _: &editor_actions::Cancel, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                if key == "escape" {
+                    cx.emit(DismissEvent);
+                    cx.stop_propagation();
+                } else if key == "down" || key == "arrowdown" {
+                    if !this.servers.is_empty() {
+                        this.selected_index = (this.selected_index + 1) % this.servers.len();
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                } else if key == "up" || key == "arrowup" {
+                    if !this.servers.is_empty() {
+                        this.selected_index = (this.selected_index + this.servers.len() - 1) % this.servers.len();
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                } else if key == "enter" {
+                    this.confirm_selection(this.selected_index, window, cx);
+                    cx.stop_propagation();
+                } else if key.chars().count() == 1 {
+                    let ch = key.chars().next().unwrap().to_ascii_uppercase();
+                    if let Some(idx) = (0..this.servers.len()).find(|&i| i < DEPLOY_MNEMONICS.len() && DEPLOY_MNEMONICS[i] == ch) {
+                        this.confirm_selection(idx, window, cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
+            // Header
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().surface_background)
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::Default)
+                            .weight(FontWeight::SEMIBOLD)
+                            .color(Color::Default),
+                    ),
+            )
+            // Server list
+            .child(
+                v_flex()
+                    .id("choose-server-list")
+                    .w_full()
+                    .max_h(rems(26.))
+                    .overflow_y_scroll()
+                    .py_1()
+                    .children(self.servers.iter().enumerate().map(|(idx, server)| {
+                        let is_selected = idx == selected_idx;
+                        let mnemonic_str = if idx < DEPLOY_MNEMONICS.len() {
+                            format!("{}. ", DEPLOY_MNEMONICS[idx])
+                        } else {
+                            String::new()
+                        };
+                        let server_name = server.name.clone();
+                        let is_sftp = server.protocol.as_deref().map(|p| p.to_lowercase() == "sftp").unwrap_or(false);
+
+                        let badge = if is_sftp {
+                            div()
+                                .px_1()
+                                .py_0p5()
+                                .rounded_xs()
+                                .bg(gpui::rgb(0x38284f))
+                                .text_color(gpui::rgb(0xbe8af7))
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .child("SFTP")
+                        } else {
+                            div()
+                                .px_1()
+                                .py_0p5()
+                                .rounded_xs()
+                                .bg(gpui::rgb(0x1d3a2e))
+                                .text_color(gpui::rgb(0x4ec994))
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .child("FTP")
+                        };
+
+                        h_flex()
+                            .id(format!("deploy-server-item-{}", idx))
+                            .w_full()
+                            .items_center()
+                            .px_3()
+                            .py_1p5()
+                            .gap_2()
+                            .cursor_pointer()
+                            .when(is_selected, |this| {
+                                this.bg(cx.theme().colors().element_selected)
+                            })
+                            .when(!is_selected, |this| {
+                                this.hover(|s| s.bg(cx.theme().colors().element_hover))
+                            })
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _, _window, cx| {
+                                    this.selected_index = idx;
+                                    cx.notify();
+                                }),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.confirm_selection(idx, window, cx);
+                            }))
+                            .child(badge)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .child(
+                                        Label::new(mnemonic_str)
+                                            .size(LabelSize::Default)
+                                            .color(if is_selected { Color::Default } else { Color::Muted }),
+                                    )
+                                    .child(
+                                        Label::new(server_name)
+                                            .size(LabelSize::Default)
+                                            .weight(FontWeight::MEDIUM)
+                                            .color(Color::Default),
+                                    ),
+                            )
+                    }))
+            )
+    }
+}
+
+fn resolve_deploy_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    let root = if cx.has_global::<DeployShared>() {
+        cx.global::<DeployShared>().root.clone()
+    } else {
+        None
+    };
+    root.or_else(|| {
+        workspace
+            .project()
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    })
+}
+
+fn resolve_deploy_target_paths(
+    workspace: &Workspace,
+    root: &Path,
+    action_abs: Option<String>,
+    action_rel: Option<String>,
+    cx: &mut Context<Workspace>,
+) -> (Option<String>, String) {
+    if action_abs.is_some()
+        || (!action_rel.as_deref().unwrap_or("").is_empty()
+            && action_rel.as_deref() != Some("."))
+    {
+        (action_abs, action_rel.unwrap_or_default())
+    } else if let Some(active_item) = workspace.active_item(cx) {
+        if let Some(editor) = active_item.act_as::<Editor>(cx) {
+            if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
+                let rel = target_abs
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (Some(target_abs.to_string_lossy().to_string()), rel)
+            } else {
+                (None, String::new())
+            }
+        } else {
+            (None, String::new())
+        }
+    } else {
+        (None, String::new())
+    }
+}
+
+pub fn execute_deploy_upload(
+    _workspace: &mut Workspace,
+    root: PathBuf,
+    server: String,
+    abs_path: Option<String>,
+    rel_path: String,
+    cx: &mut Context<Workspace>,
+) {
+    let root_clone = root.clone();
+    let server_clone = server.clone();
+    let rel_clone = rel_path.clone();
+    let root_for_panel = root.clone();
+    let server_for_panel = server.clone();
+
+    let task: Task<Result<String, String>> = cx.background_spawn(async move {
+        let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+        cmd.current_dir(&root_clone)
+            .arg("upload")
+            .arg("--server")
+            .arg(&server_clone);
+
+        if !rel_clone.is_empty() && rel_clone != "." {
+            cmd.arg("--path").arg(&rel_clone);
+            if let Some(abs) = abs_path {
+                cmd.arg("--from").arg(&abs);
+            }
+        } else {
+            cmd.arg("--path").arg(".");
+        }
+
+        let output = cmd.output().map_err(|e| e.to_string())?;
+        if output.status.success() {
+            let msg = String::from_utf8_lossy(&output.stdout);
+            let display = msg.trim();
+            if display.is_empty() {
+                Ok(format!(
+                    "uploaded {} to {}",
+                    if rel_clone.is_empty() { "project" } else { &rel_clone },
+                    server_clone
+                ))
+            } else {
+                Ok(display.to_string())
+            }
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr);
+            Err(err.trim().to_string())
+        }
+    });
+
+    cx.spawn(async move |workspace, cx| {
+        let result = task.await;
+        workspace
+            .update(cx, |_workspace, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| {
+                                match result {
+                                    Ok(msg) => panel.saved_message = Some(msg),
+                                    Err(err) => panel.saved_message = Some(format!("upload error: {err}")),
+                                }
+                                panel.refresh_remote(server_for_panel, root_for_panel, cx);
+                                cx.notify();
+                            })
+                            .log_err();
+                    }
+                }
+            })
+            .log_err();
+    })
+    .detach();
+}
+
+pub fn execute_deploy_download(
+    _workspace: &mut Workspace,
+    root: PathBuf,
+    server: String,
+    abs_path: Option<String>,
+    rel_path: String,
+    cx: &mut Context<Workspace>,
+) {
+    let root_clone = root.clone();
+    let server_clone = server.clone();
+    let rel_clone = rel_path.clone();
+
+    let task: Task<Result<String, String>> = cx.background_spawn(async move {
+        let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+        cmd.current_dir(&root_clone)
+            .arg("download")
+            .arg("--server")
+            .arg(&server_clone)
+            .arg("--path")
+            .arg(if rel_clone.is_empty() { "." } else { &rel_clone });
+
+        if let Some(abs) = abs_path {
+            cmd.arg("--to").arg(&abs);
+        }
+
+        let output = cmd.output().map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok(format!(
+                "downloaded {} from {}",
+                if rel_clone.is_empty() { "project" } else { &rel_clone },
+                server_clone
+            ))
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr);
+            Err(err.trim().to_string())
+        }
+    });
+
+    cx.spawn(async move |workspace, cx| {
+        let result = task.await;
+        workspace
+            .update(cx, |_workspace, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| {
+                                match result {
+                                    Ok(msg) => panel.saved_message = Some(msg),
+                                    Err(err) => panel.saved_message = Some(format!("download error: {err}")),
+                                }
+                                cx.notify();
+                            })
+                            .log_err();
+                    }
+                }
+            })
+            .log_err();
+    })
+    .detach();
+}
+
+pub fn execute_deploy_compare(
+    _workspace: &mut Workspace,
+    window: &mut Window,
+    root: PathBuf,
+    server: String,
+    rel_path: String,
+    cx: &mut Context<Workspace>,
+) {
+    if rel_path.is_empty() {
+        if cx.has_global::<DeployShared>() {
+            if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
+                panel.update(cx, |panel, cx| {
+                    panel.saved_message = Some("No active file to compare with deployed version".to_string());
+                    cx.notify();
+                });
+            }
+        }
+        return;
+    }
+
+    let pristine_path = remote_file_banner::remote_pristine_root()
+        .join(&server)
+        .join(rel_path.trim_start_matches('/'));
+
+    let s_clone = server.clone();
+    let r_clone = rel_path.clone();
+    let pristine = pristine_path.clone();
+    let root_clone = root.clone();
+
+    let task: Task<Result<(), String>> = cx.background_spawn(async move {
+        if let Some(parent) = pristine.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
+            .arg("download")
+            .arg("--server")
+            .arg(&s_clone)
+            .arg("--path")
+            .arg(&r_clone)
+            .arg("--to")
+            .arg(&pristine)
+            .current_dir(&root_clone)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr);
+            Err(err.trim().to_string())
+        }
+    });
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        let res = task.await;
+        if let Err(err) = res {
+            workspace
+                .update_in(cx, |_workspace, _window, cx| {
+                    if cx.has_global::<DeployShared>() {
+                        if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.saved_message = Some(format!("compare download failed: {err}"));
+                                    cx.notify();
+                                })
+                                .log_err();
+                        }
+                    }
+                })
+                .log_err();
+            return;
+        }
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.split_abs_path(pristine_path, true, window, cx).detach_and_log_err(cx);
+            })
+            .log_err();
+    })
+    .detach();
+}
+
+pub fn execute_deploy_sync(
+    _workspace: &mut Workspace,
+    root: PathBuf,
+    server: String,
+    cx: &mut Context<Workspace>,
+) {
+    if cx.has_global::<DeployShared>() {
+        if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.sync_server(server, root, cx);
+                })
+                .log_err();
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataSourceTab {
@@ -11360,362 +11920,116 @@ impl PhpPanel {
                 workspace.reveal_panel::<PhpPanel>(window, cx);
                 open_sqlite_data_source(workspace, abs_path, window, cx);
             });
-            workspace.register_action(|workspace, action: &UploadToDeployServer, _window, cx| {
-                let root = if cx.has_global::<DeployShared>() {
-                    cx.global::<DeployShared>().root.clone()
+            workspace.register_action(|workspace, action: &UploadToDeployServer, window, cx| {
+                let root = resolve_deploy_root(workspace, cx);
+                let Some(root) = root else { return; };
+                let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
+
+                if let Some(server) = action.server.clone() {
+                    execute_deploy_upload(workspace, root, server, abs_path, rel_path, cx);
                 } else {
-                    None
-                };
-                let root = root.or_else(|| {
-                    workspace
-                        .project()
-                        .read(cx)
-                        .visible_worktrees(cx)
-                        .next()
-                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                });
-                let Some(root) = root else {
-                    return;
-                };
-
-                let server = action.server.clone().or_else(|| {
-                    if cx.has_global::<DeployShared>() {
-                        let shared = cx.global::<DeployShared>();
-                        shared.active.clone().or_else(|| shared.servers.first().cloned())
-                    } else {
-                        None
-                    }
-                });
-                let Some(server) = server else {
-                    return;
-                };
-
-                let (abs_path, rel_path) = if action.abs_path.is_some()
-                    || (!action.rel_path.as_deref().unwrap_or("").is_empty()
-                        && action.rel_path.as_deref() != Some("."))
-                {
-                    (action.abs_path.clone(), action.rel_path.clone().unwrap_or_default())
-                } else if let Some(active_item) = workspace.active_item(cx) {
-                    if let Some(editor) = active_item.act_as::<Editor>(cx) {
-                        if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
-                            let rel = target_abs
-                                .strip_prefix(&root)
-                                .ok()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            (Some(target_abs.to_string_lossy().to_string()), rel)
-                        } else {
-                            (None, String::new())
-                        }
-                    } else {
-                        (None, String::new())
-                    }
-                } else {
-                    (None, String::new())
-                };
-                let root_clone = root.clone();
-                let server_clone = server.clone();
-                let rel_clone = rel_path.clone();
-                let root_for_panel = root.clone();
-                let server_for_panel = server.clone();
-
-                let task: Task<Result<String, String>> = cx.background_spawn(async move {
-                    let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
-                    cmd.current_dir(&root_clone)
-                        .arg("upload")
-                        .arg("--server")
-                        .arg(&server_clone);
-
-                    if !rel_clone.is_empty() && rel_clone != "." {
-                        cmd.arg("--path").arg(&rel_clone);
-                        if let Some(abs) = abs_path {
-                            cmd.arg("--from").arg(&abs);
-                        }
-                    } else {
-                        cmd.arg("--path").arg(".");
-                    }
-
-                    let output = cmd.output().map_err(|e| e.to_string())?;
-                    if output.status.success() {
-                        let msg = String::from_utf8_lossy(&output.stdout);
-                        let display = msg.trim();
-                        if display.is_empty() {
-                            Ok(format!("uploaded {} to {}", if rel_clone.is_empty() { "project" } else { &rel_clone }, server_clone))
-                        } else {
-                            Ok(display.to_string())
-                        }
-                    } else {
-                        let err = String::from_utf8_lossy(&output.stderr);
-                        Err(err.trim().to_string())
-                    }
-                });
-
-                cx.spawn(async move |workspace, cx| {
-                    let result = task.await;
-                    workspace.update(cx, |_workspace, cx| {
-                        if cx.has_global::<DeployShared>() {
-                            if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
-                                panel.update(cx, |panel, cx| {
-                                    match result {
-                                        Ok(msg) => panel.saved_message = Some(msg),
-                                        Err(err) => panel.saved_message = Some(format!("upload error: {err}")),
-                                    }
-                                    panel.refresh_remote(server_for_panel, root_for_panel, cx);
-                                    cx.notify();
-                                }).log_err();
-                            }
-                        }
-                    }).log_err();
-                }).detach();
-            });
-            workspace.register_action(|workspace, action: &DownloadFromDeployServer, _window, cx| {
-                let root = if cx.has_global::<DeployShared>() {
-                    cx.global::<DeployShared>().root.clone()
-                } else {
-                    None
-                };
-                let root = root.or_else(|| {
-                    workspace
-                        .project()
-                        .read(cx)
-                        .visible_worktrees(cx)
-                        .next()
-                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                });
-                let Some(root) = root else {
-                    return;
-                };
-
-                let server = action.server.clone().or_else(|| {
-                    if cx.has_global::<DeployShared>() {
-                        let shared = cx.global::<DeployShared>();
-                        shared.active.clone().or_else(|| shared.servers.first().cloned())
-                    } else {
-                        None
-                    }
-                });
-                let Some(server) = server else {
-                    return;
-                };
-
-                let (abs_path, rel_path) = if action.abs_path.is_some()
-                    || (!action.rel_path.as_deref().unwrap_or("").is_empty()
-                        && action.rel_path.as_deref() != Some("."))
-                {
-                    (action.abs_path.clone(), action.rel_path.clone().unwrap_or_default())
-                } else if let Some(active_item) = workspace.active_item(cx) {
-                    if let Some(editor) = active_item.act_as::<Editor>(cx) {
-                        if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
-                            let rel = target_abs
-                                .strip_prefix(&root)
-                                .ok()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            (Some(target_abs.to_string_lossy().to_string()), rel)
-                        } else {
-                            (None, String::new())
-                        }
-                    } else {
-                        (None, String::new())
-                    }
-                } else {
-                    (None, String::new())
-                };
-                let root_clone = root.clone();
-                let server_clone = server.clone();
-                let rel_clone = rel_path.clone();
-
-                let task: Task<Result<String, String>> = cx.background_spawn(async move {
-                    let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
-                    cmd.current_dir(&root_clone)
-                        .arg("download")
-                        .arg("--server")
-                        .arg(&server_clone)
-                        .arg("--path")
-                        .arg(if rel_clone.is_empty() { "." } else { &rel_clone });
-
-                    if let Some(abs) = abs_path {
-                        cmd.arg("--to").arg(&abs);
-                    }
-
-                    let output = cmd.output().map_err(|e| e.to_string())?;
-                    if output.status.success() {
-                        Ok(format!("downloaded {} from {}", if rel_clone.is_empty() { "project" } else { &rel_clone }, server_clone))
-                    } else {
-                        let err = String::from_utf8_lossy(&output.stderr);
-                        Err(err.trim().to_string())
-                    }
-                });
-
-                cx.spawn(async move |workspace, cx| {
-                    let result = task.await;
-                    workspace.update(cx, |_workspace, cx| {
-                        if cx.has_global::<DeployShared>() {
-                            if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
-                                panel.update(cx, |panel, cx| {
-                                    match result {
-                                        Ok(msg) => panel.saved_message = Some(msg),
-                                        Err(err) => panel.saved_message = Some(format!("download error: {err}")),
-                                    }
-                                    cx.notify();
-                                }).log_err();
-                            }
-                        }
-                    }).log_err();
-                }).detach();
-            });
-            workspace.register_action(|workspace, action: &CompareWithDeployServer, window, cx| {
-                let root = if cx.has_global::<DeployShared>() {
-                    cx.global::<DeployShared>().root.clone()
-                } else {
-                    None
-                };
-                let root = root.or_else(|| {
-                    workspace
-                        .project()
-                        .read(cx)
-                        .visible_worktrees(cx)
-                        .next()
-                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                });
-                let Some(root) = root else {
-                    return;
-                };
-
-                let server = action.server.clone().or_else(|| {
-                    if cx.has_global::<DeployShared>() {
-                        let shared = cx.global::<DeployShared>();
-                        shared.active.clone().or_else(|| shared.servers.first().cloned())
-                    } else {
-                        None
-                    }
-                });
-                let Some(server) = server else {
-                    return;
-                };
-
-                let rel_path = if !action.rel_path.as_deref().unwrap_or("").is_empty() {
-                    action.rel_path.clone().unwrap_or_default()
-                } else if let Some(active_item) = workspace.active_item(cx) {
-                    if let Some(editor) = active_item.act_as::<Editor>(cx) {
-                        if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
-                            target_abs
-                                .strip_prefix(&root)
-                                .ok()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                };
-
-                if rel_path.is_empty() {
-                    if cx.has_global::<DeployShared>() {
-                        if let Some(panel) = cx.global::<DeployShared>().panel.clone().and_then(|p| p.upgrade()) {
-                            panel.update(cx, |panel, cx| {
-                                panel.saved_message = Some("No active file to compare with deployed version".to_string());
-                                cx.notify();
-                            });
-                        }
-                    }
-                    return;
-                }
-
-                let pristine_path = remote_file_banner::remote_pristine_root()
-                    .join(&server)
-                    .join(rel_path.trim_start_matches('/'));
-
-                let s_clone = server.clone();
-                let r_clone = rel_path.clone();
-                let pristine = pristine_path.clone();
-                let root_clone = root.clone();
-
-                let task: Task<Result<(), String>> = cx.background_spawn(async move {
-                    if let Some(parent) = pristine.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
-                        .arg("download")
-                        .arg("--server")
-                        .arg(&s_clone)
-                        .arg("--path")
-                        .arg(&r_clone)
-                        .arg("--to")
-                        .arg(&pristine)
-                        .current_dir(&root_clone)
-                        .output()
-                        .map_err(|e| e.to_string())?;
-
-                    if output.status.success() {
-                        Ok(())
-                    } else {
-                        let err = String::from_utf8_lossy(&output.stderr);
-                        Err(err.trim().to_string())
-                    }
-                });
-
-                cx.spawn_in(window, async move |workspace, cx| {
-                    let res = task.await;
-                    if let Err(err) = res {
-                        workspace.update_in(cx, |_workspace, _window, cx| {
-                            if cx.has_global::<DeployShared>() {
-                                if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
-                                    panel.update(cx, |panel, cx| {
-                                        panel.saved_message = Some(format!("compare download failed: {err}"));
-                                        cx.notify();
-                                    }).log_err();
-                                }
-                            }
-                        }).log_err();
+                    let servers = load_deploy_servers(&root);
+                    if servers.is_empty() {
+                        open_deployment_window(root, cx);
                         return;
                     }
-
-                    workspace.update_in(cx, |workspace, window, cx| {
-                        workspace.split_abs_path(pristine_path, true, window, cx).detach_and_log_err(cx);
-                    }).log_err();
-                }).detach();
+                    let workspace_handle = workspace.weak_handle();
+                    workspace.toggle_modal(window, cx, move |window, cx| {
+                        ChooseServerModal::new(
+                            workspace_handle,
+                            DeployOperation::Upload,
+                            root,
+                            abs_path,
+                            rel_path,
+                            servers,
+                            window,
+                            cx,
+                        )
+                    });
+                }
             });
-            workspace.register_action(|workspace, action: &SyncWithDeployServer, _window, cx| {
-                let root = if cx.has_global::<DeployShared>() {
-                    cx.global::<DeployShared>().root.clone()
+            workspace.register_action(|workspace, action: &DownloadFromDeployServer, window, cx| {
+                let root = resolve_deploy_root(workspace, cx);
+                let Some(root) = root else { return; };
+                let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
+
+                if let Some(server) = action.server.clone() {
+                    execute_deploy_download(workspace, root, server, abs_path, rel_path, cx);
                 } else {
-                    None
-                };
-                let root = root.or_else(|| {
-                    workspace
-                        .project()
-                        .read(cx)
-                        .visible_worktrees(cx)
-                        .next()
-                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                });
-                let Some(root) = root else {
-                    return;
-                };
-
-                let server = action.server.clone().or_else(|| {
-                    if cx.has_global::<DeployShared>() {
-                        let shared = cx.global::<DeployShared>();
-                        shared.active.clone().or_else(|| shared.servers.first().cloned())
-                    } else {
-                        None
+                    let servers = load_deploy_servers(&root);
+                    if servers.is_empty() {
+                        open_deployment_window(root, cx);
+                        return;
                     }
-                });
-                let Some(server) = server else {
-                    return;
-                };
+                    let workspace_handle = workspace.weak_handle();
+                    workspace.toggle_modal(window, cx, move |window, cx| {
+                        ChooseServerModal::new(
+                            workspace_handle,
+                            DeployOperation::Download,
+                            root,
+                            abs_path,
+                            rel_path,
+                            servers,
+                            window,
+                            cx,
+                        )
+                    });
+                }
+            });
+            workspace.register_action(|workspace, action: &CompareWithDeployServer, window, cx| {
+                let root = resolve_deploy_root(workspace, cx);
+                let Some(root) = root else { return; };
+                let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
 
-                if cx.has_global::<DeployShared>() {
-                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
-                        panel.update(cx, |panel, cx| {
-                            panel.sync_server(server, root, cx);
-                        }).log_err();
+                if let Some(server) = action.server.clone() {
+                    execute_deploy_compare(workspace, window, root, server, rel_path, cx);
+                } else {
+                    let servers = load_deploy_servers(&root);
+                    if servers.is_empty() {
+                        open_deployment_window(root, cx);
+                        return;
                     }
+                    let workspace_handle = workspace.weak_handle();
+                    workspace.toggle_modal(window, cx, move |window, cx| {
+                        ChooseServerModal::new(
+                            workspace_handle,
+                            DeployOperation::Compare,
+                            root,
+                            abs_path,
+                            rel_path,
+                            servers,
+                            window,
+                            cx,
+                        )
+                    });
+                }
+            });
+            workspace.register_action(|workspace, action: &SyncWithDeployServer, window, cx| {
+                let root = resolve_deploy_root(workspace, cx);
+                let Some(root) = root else { return; };
+                let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, None, action.rel_path.clone(), cx);
+
+                if let Some(server) = action.server.clone() {
+                    execute_deploy_sync(workspace, root, server, cx);
+                } else {
+                    let servers = load_deploy_servers(&root);
+                    if servers.is_empty() {
+                        open_deployment_window(root, cx);
+                        return;
+                    }
+                    let workspace_handle = workspace.weak_handle();
+                    workspace.toggle_modal(window, cx, move |window, cx| {
+                        ChooseServerModal::new(
+                            workspace_handle,
+                            DeployOperation::Sync,
+                            root,
+                            abs_path,
+                            rel_path,
+                            servers,
+                            window,
+                            cx,
+                        )
+                    });
                 }
             });
             workspace.register_action(|workspace, action: &UploadAllOpenFilesToDeployServer, _window, cx| {
@@ -27533,5 +27847,23 @@ Host web1
         assert!(config.contains(&SshFocusSlot::KeyPath));
         assert!(!config.contains(&SshFocusSlot::Password));
         assert_eq!(config.last(), Some(&SshFocusSlot::Ok));
+    }
+
+    #[test]
+    fn deploy_operation_titles_match_phpstorm() {
+        assert_eq!(DeployOperation::Upload.title(), "Choose Server to Upload To");
+        assert_eq!(DeployOperation::Download.title(), "Choose Server to Download From");
+        assert_eq!(DeployOperation::Compare.title(), "Choose Server to Compare With");
+        assert_eq!(DeployOperation::Sync.title(), "Choose Server to Sync With");
+    }
+
+    #[test]
+    fn deploy_mnemonics_match_phpstorm_sequence() {
+        assert_eq!(DEPLOY_MNEMONICS[0], '1');
+        assert_eq!(DEPLOY_MNEMONICS[8], '9');
+        assert_eq!(DEPLOY_MNEMONICS[9], '0');
+        assert_eq!(DEPLOY_MNEMONICS[10], 'A');
+        assert_eq!(DEPLOY_MNEMONICS[11], 'B');
+        assert_eq!(DEPLOY_MNEMONICS[35], 'Z');
     }
 }

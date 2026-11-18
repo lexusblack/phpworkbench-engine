@@ -1194,19 +1194,11 @@ impl ProjectPanel {
                 let active = shared.active.clone().or_else(|| shared.servers.first().cloned());
                 (active, !shared.servers.is_empty())
             } else {
-                let deploy_json = worktree.abs_path().join(".zed/deploy.json");
-                if let Ok(contents) = std::fs::read_to_string(&deploy_json) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
-                        let active = val.get("active").and_then(|v| v.as_str()).map(str::to_string)
-                            .or_else(|| val.get("servers").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|s| s.get("name")).and_then(|v| v.as_str()).map(str::to_string));
-                        let has_servers = val.get("servers").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
-                        (active, has_servers)
-                    } else {
-                        (None, false)
-                    }
-                } else {
-                    (None, false)
-                }
+                let servers = php_panel::load_deploy_servers(&worktree.abs_path());
+                let active = php_panel::load_active_deploy_server(&worktree.abs_path())
+                    .or_else(|| servers.first().map(|s| s.name.clone()));
+                let has = !servers.is_empty();
+                (active, has)
             };
             let deploy_file_abs = worktree.abs_path().join(entry.path.as_ref()).to_string_lossy().replace('\\', "/");
             let deploy_file_rel = entry.path.to_string().replace('\\', "/");
@@ -1363,7 +1355,7 @@ impl ProjectPanel {
                                         }),
                                     )
                                     .action(
-                                        "Upload to…",
+                                        "Upload To...",
                                         Box::new(php_panel::UploadToDeployServer {
                                             abs_path: Some(abs.clone()),
                                             rel_path: Some(rel.clone()),
@@ -1379,7 +1371,7 @@ impl ProjectPanel {
                                         }),
                                     )
                                     .action(
-                                        "Download from…",
+                                        "Download from...",
                                         Box::new(php_panel::DownloadFromDeployServer {
                                             abs_path: Some(abs.clone()),
                                             rel_path: Some(rel.clone()),
@@ -1387,22 +1379,39 @@ impl ProjectPanel {
                                         }),
                                     );
                                 if !is_dir {
-                                    sub = sub.action(
-                                        format!("Compare with Deployed on {s_label}"),
-                                        Box::new(php_panel::CompareWithDeployServer {
-                                            abs_path: Some(abs.clone()),
+                                    sub = sub
+                                        .action(
+                                            format!("Compare with Deployed Version on {s_label}"),
+                                            Box::new(php_panel::CompareWithDeployServer {
+                                                abs_path: Some(abs.clone()),
+                                                rel_path: Some(rel.clone()),
+                                                server: srv.clone(),
+                                            }),
+                                        )
+                                        .action(
+                                            "Compare with Deployed To...",
+                                            Box::new(php_panel::CompareWithDeployServer {
+                                                abs_path: Some(abs.clone()),
+                                                rel_path: Some(rel.clone()),
+                                                server: None,
+                                            }),
+                                        );
+                                }
+                                sub = sub
+                                    .action(
+                                        format!("Sync with Deployed to {s_label}..."),
+                                        Box::new(php_panel::SyncWithDeployServer {
                                             rel_path: Some(rel.clone()),
                                             server: srv.clone(),
                                         }),
+                                    )
+                                    .action(
+                                        "Sync with Deployed To...",
+                                        Box::new(php_panel::SyncWithDeployServer {
+                                            rel_path: Some(rel.clone()),
+                                            server: None,
+                                        }),
                                     );
-                                }
-                                sub = sub.action(
-                                    format!("Sync with {s_label}…"),
-                                    Box::new(php_panel::SyncWithDeployServer {
-                                        rel_path: Some(rel.clone()),
-                                        server: srv.clone(),
-                                    }),
-                                );
                                 if !has_deploy_servers {
                                     sub = sub.separator().action(
                                         "Configuration…",

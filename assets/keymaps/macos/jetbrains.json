@@ -232,4 +232,10 @@
       "cmd-k": null,
     },
   },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "alt-shift-cmd-x": ["php_panel::UploadToDeployServer", {}],
+    },
+  },
 ]
