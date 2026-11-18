@@ -25,7 +25,7 @@ use disconnected_overlay::DisconnectedOverlay;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    Subscription, Task, TaskExt, WeakEntity, Window, actions, px,
+    FontWeight, Subscription, Task, TaskExt, WeakEntity, Window, actions, px,
 };
 
 use picker::{
@@ -839,13 +839,98 @@ impl Focusable for RecentProjects {
     }
 }
 
+fn project_avatar(name: &str) -> impl IntoElement {
+    let mut initials = String::new();
+    for part in name.split(|c: char| !c.is_alphanumeric()) {
+        if let Some(ch) = part.chars().next() {
+            initials.push(ch.to_ascii_uppercase());
+            if initials.len() == 2 {
+                break;
+            }
+        }
+    }
+    let display_initials = if initials.is_empty() {
+        "P".to_string()
+    } else {
+        initials
+    };
+
+    let hash = name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+    let (bg_color, fg_color) = match hash % 5 {
+        0 => (gpui::rgb(0x234a2e), gpui::rgb(0x7ee787)), // green ('admin')
+        1 => (gpui::rgb(0x1a3d64), gpui::rgb(0x79b8ff)), // blue ('Stocks', 'newsystems')
+        2 => (gpui::rgb(0x5a2d18), gpui::rgb(0xffa657)), // orange ('cross-rental')
+        3 => (gpui::rgb(0x3e1f6e), gpui::rgb(0xd2a8ff)), // purple ('Blind-date26')
+        _ => (gpui::rgb(0x1b464a), gpui::rgb(0x56d4dd)), // teal
+    };
+
+    h_flex()
+        .w(px(22.))
+        .h(px(22.))
+        .rounded(px(4.))
+        .bg(bg_color)
+        .justify_center()
+        .items_center()
+        .flex_shrink_0()
+        .child(
+            Label::new(display_initials)
+                .size(LabelSize::XSmall)
+                .color(Color::Custom(fg_color.into()))
+                .weight(FontWeight::BOLD),
+        )
+}
+
 impl Render for RecentProjects {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
         v_flex()
             .key_context("RecentProjects")
             .on_action(cx.listener(Self::handle_toggle_open_menu))
             .on_action(cx.listener(Self::handle_remove_selected))
             .on_action(cx.listener(Self::handle_add_to_workspace))
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.title_bar_background)
+                    .child(
+                        Button::new("open_folder_btn", "Open...")
+                            .start_icon(Icon::new(IconName::FolderOpen).size(IconSize::Small).color(Color::Accent))
+                            .style(ButtonStyle::Filled)
+                            .size(ButtonSize::Compact)
+                            .tooltip(Tooltip::text("Open Project from Directory (⌘O)"))
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                cx.emit(DismissEvent);
+                                window.dispatch_action(Box::new(workspace::Open::DEFAULT), cx);
+                            }))
+                    )
+                    .child(
+                        Button::new("clone_repo_btn", "Clone...")
+                            .start_icon(Icon::new(IconName::CloudDownload).size(IconSize::Small))
+                            .style(ButtonStyle::Subtle)
+                            .size(ButtonSize::Compact)
+                            .tooltip(Tooltip::text("Clone Repository from Git"))
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                cx.emit(DismissEvent);
+                                window.dispatch_action(Box::new(git::Clone), cx);
+                            }))
+                    )
+                    .child(
+                        Button::new("connect_remote_btn", "Remote...")
+                            .start_icon(Icon::new(IconName::Server).size(IconSize::Small))
+                            .style(ButtonStyle::Subtle)
+                            .size(ButtonSize::Compact)
+                            .tooltip(Tooltip::text("Connect to Remote Host / SSH"))
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                cx.emit(DismissEvent);
+                                window.dispatch_action(Box::new(OpenRemote::default()), cx);
+                            }))
+                    )
+            )
             .child(self.picker.clone())
     }
 }
@@ -1297,6 +1382,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 .when(show_icon, |this| {
                                     this.child(Icon::new(icon).color(Color::Muted))
                                 })
+                                .child(project_avatar(&name))
                                 .child(
                                     v_flex()
                                         .min_w_0()
@@ -1354,6 +1440,12 @@ impl PickerDelegate for RecentProjectsDelegate {
                 let key = self.window_project_groups.get(hit.candidate_id)?;
                 let is_active = self.is_active_project_group(key, cx);
                 let paths = key.path_list();
+                let group_name = paths
+                    .ordered_paths()
+                    .next()
+                    .and_then(|p| p.file_name())
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Project".to_string());
                 let ordered_paths: Vec<_> = paths
                     .ordered_paths()
                     .map(|p| p.compact().to_string_lossy().to_string())
@@ -1460,6 +1552,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 .when(show_icon, |this| {
                                     this.child(Icon::new(icon).color(Color::Muted))
                                 })
+                                .child(project_avatar(&group_name))
                                 .child({
                                     let mut highlighted = highlighted_match;
                                     if !self.render_paths {
@@ -1479,6 +1572,12 @@ impl PickerDelegate for RecentProjectsDelegate {
                 let location = &workspace.location;
                 let raw_paths = &workspace.paths;
                 let identity_paths = &workspace.identity_paths;
+                let folder_name = identity_paths
+                    .ordered_paths()
+                    .next()
+                    .and_then(|p| p.file_name())
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Project".to_string());
                 let is_local = matches!(location, SerializedWorkspaceLocation::Local);
                 let paths_to_add = raw_paths.paths().to_vec();
                 let ordered_paths: Vec<_> = identity_paths
@@ -1641,6 +1740,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 .when(show_icon, |this| {
                                     this.child(Icon::new(icon).color(Color::Muted))
                                 })
+                                .child(project_avatar(&folder_name))
                                 .child({
                                     let mut highlighted = highlighted_match;
                                     if !self.render_paths {

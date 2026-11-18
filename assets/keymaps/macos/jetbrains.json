@@ -133,7 +133,7 @@
       "cmd-shift-a": "command_palette::Toggle",
       "shift shift": "command_palette::Toggle",
       "cmd-alt-o": "project_symbols::Toggle", // JetBrains: Go to Symbol
-      "cmd-o": "project_symbols::Toggle", // JetBrains: Go to Class
+      "cmd-o": "workspace::Open", // Open from directory / file dialog
       "cmd-1": "project_panel::ToggleFocus",
       "cmd-0": "git_panel::ToggleFocus",
       "f12": "workspace::JumpToLastToolWindow",

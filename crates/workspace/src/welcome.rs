@@ -7,8 +7,8 @@ use crate::{
 use agent_settings::AgentSettings;
 use git::Clone as GitClone;
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    ParentElement, Render, Styled, Task, TaskExt, Window, actions,
+    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
+    ParentElement, Render, Styled, Task, TaskExt, Window, actions, px,
 };
 use gpui::{WeakEntity, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
@@ -16,10 +16,10 @@ use menu::{SelectNext, SelectPrevious};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
-use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
-use util::ResultExt;
+use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Tooltip, Vector, VectorName, prelude::*};
+use util::{ResultExt, paths::PathExt};
 use zed_actions::{
-    Extensions, OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
+    Extensions, OpenKeymap, OpenOnboarding, OpenRemote, OpenSettings, assistant::ToggleFocus, command_palette,
 };
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
@@ -411,10 +411,331 @@ impl WelcomePage {
             self.focus_handle.clone(),
         )
     }
+
+    fn render_home_project_item(
+        &self,
+        index: usize,
+        workspace: &RecentWorkspace,
+    ) -> impl IntoElement {
+        let name = project_name(&workspace.identity_paths);
+        let path_str = workspace
+            .identity_paths
+            .ordered_paths()
+            .map(|p| p.compact().to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut initials = String::new();
+        for part in name.split(|c: char| !c.is_alphanumeric()) {
+            if let Some(ch) = part.chars().next() {
+                initials.push(ch.to_ascii_uppercase());
+                if initials.len() == 2 {
+                    break;
+                }
+            }
+        }
+        let display_initials = if initials.is_empty() {
+            "P".to_string()
+        } else {
+            initials
+        };
+
+        let hash = name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+        let (bg_color, fg_color) = match hash % 5 {
+            0 => (gpui::rgb(0x234a2e), gpui::rgb(0x7ee787)),
+            1 => (gpui::rgb(0x1a3d64), gpui::rgb(0x79b8ff)),
+            2 => (gpui::rgb(0x5a2d18), gpui::rgb(0xffa657)),
+            3 => (gpui::rgb(0x3e1f6e), gpui::rgb(0xd2a8ff)),
+            _ => (gpui::rgb(0x1b464a), gpui::rgb(0x56d4dd)),
+        };
+
+        let focus = self.focus_handle.clone();
+        ButtonLike::new(format!("home-proj-{}", index))
+            .full_width()
+            .style(ButtonStyle::Subtle)
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2p5()
+                    .items_center()
+                    .py_1()
+                    .child(
+                        h_flex()
+                            .w(px(26.))
+                            .h(px(26.))
+                            .rounded(px(4.))
+                            .bg(bg_color)
+                            .justify_center()
+                            .items_center()
+                            .flex_shrink_0()
+                            .child(
+                                Label::new(display_initials)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Custom(fg_color.into()))
+                                    .weight(FontWeight::BOLD),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_grow_1()
+                            .child(
+                                Label::new(name)
+                                    .size(LabelSize::Small)
+                                    .weight(FontWeight::BOLD)
+                                    .truncate(),
+                            )
+                            .child(
+                                Label::new(path_str)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    ),
+            )
+            .on_click(move |_, window, cx| {
+                focus.dispatch_action(&OpenRecentProject { index }, window, cx);
+            })
+    }
 }
 
 impl Render for WelcomePage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.fallback_to_recent_projects {
+            let colors = cx.theme().colors();
+            let recent_items = self
+                .recent_workspaces
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, workspace)| self.render_home_project_item(index, workspace))
+                .collect::<Vec<_>>();
+
+            return h_flex()
+                .key_context("Welcome")
+                .track_focus(&self.focus_handle(cx))
+                .on_action(cx.listener(Self::select_previous))
+                .on_action(cx.listener(Self::select_next))
+                .on_action(cx.listener(Self::open_recent_project))
+                .size_full()
+                .bg(colors.editor_background)
+                .child(
+                    // Left sidebar: Projects and Files (PhpStorm Home layout)
+                    v_flex()
+                        .w(px(340.))
+                        .h_full()
+                        .bg(colors.panel_background)
+                        .border_r_1()
+                        .border_color(colors.border)
+                        .child(
+                            h_flex()
+                                .px_4()
+                                .pt_4()
+                                .pb_2()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            Icon::new(IconName::FolderOpen)
+                                                .size(IconSize::Small)
+                                                .color(Color::Accent),
+                                        )
+                                        .child(
+                                            Label::new("Projects and Files")
+                                                .weight(FontWeight::BOLD)
+                                                .size(LabelSize::Default),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .px_3()
+                                .gap_1p5()
+                                .child(
+                                    Button::new("home-open-project", "Open")
+                                        .start_icon(
+                                            Icon::new(IconName::FolderOpen)
+                                                .size(IconSize::Small)
+                                                .color(Color::Accent),
+                                        )
+                                        .full_width()
+                                        .style(ButtonStyle::Filled)
+                                        .tooltip(Tooltip::text("Open Project from Directory (⌘O)"))
+                                        .on_click(cx.listener(|_, _, window, cx| {
+                                            window.dispatch_action(Box::new(Open::DEFAULT), cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("home-new-file", "New...")
+                                        .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                                        .full_width()
+                                        .style(ButtonStyle::Subtle)
+                                        .tooltip(Tooltip::text("New File / Project"))
+                                        .on_click(cx.listener(|_, _, window, cx| {
+                                            window.dispatch_action(Box::new(NewFile), cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("home-clone-repo", "Clone Repository")
+                                        .start_icon(
+                                            Icon::new(IconName::CloudDownload).size(IconSize::Small),
+                                        )
+                                        .full_width()
+                                        .style(ButtonStyle::Subtle)
+                                        .tooltip(Tooltip::text("Clone from Git Repository"))
+                                        .on_click(cx.listener(|_, _, window, cx| {
+                                            window.dispatch_action(Box::new(GitClone), cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("home-connect-remote", "Connect to Remote")
+                                        .start_icon(Icon::new(IconName::Server).size(IconSize::Small))
+                                        .full_width()
+                                        .style(ButtonStyle::Subtle)
+                                        .tooltip(Tooltip::text("Connect to Remote Host / SSH"))
+                                        .on_click(cx.listener(|_, _, window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(OpenRemote::default()),
+                                                cx,
+                                            );
+                                        })),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .px_3()
+                                .pt_3()
+                                .gap_1()
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .px_1()
+                                        .pb_1()
+                                        .child(
+                                            Icon::new(IconName::FolderSearch)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new("Recent Projects")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .weight(FontWeight::BOLD),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .id("home-recent-projects-list")
+                                .flex_grow_1()
+                                .px_2()
+                                .overflow_y_scroll()
+                                .children(recent_items),
+                        ),
+                )
+                .child(
+                    // Right Canvas: PhpStorm Home Center
+                    v_flex()
+                        .size_full()
+                        .justify_between()
+                        .bg(colors.editor_background)
+                        .child(
+                            v_flex()
+                                .size_full()
+                                .justify_center()
+                                .items_center()
+                                .gap_4()
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .child(
+                                            Button::new("home-new-php-file", "New PHP File")
+                                                .start_icon(
+                                                    Icon::new(IconName::FileCode)
+                                                        .size(IconSize::Small)
+                                                        .color(Color::Accent),
+                                                )
+                                                .style(ButtonStyle::Subtle)
+                                                .on_click(cx.listener(|_, _, window, cx| {
+                                                    window.dispatch_action(Box::new(NewFile), cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("home-new-http-req", "New HTTP Request")
+                                                .start_icon(
+                                                    Icon::new(IconName::FolderOpen)
+                                                        .size(IconSize::Small)
+                                                        .color(Color::Accent),
+                                                )
+                                                .style(ButtonStyle::Subtle)
+                                                .on_click(cx.listener(|_, _, window, cx| {
+                                                    window.dispatch_action(Box::new(NewFile), cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("home-new-laravel", "New Laravel Project")
+                                                .start_icon(
+                                                    Icon::new(IconName::FileCode)
+                                                        .size(IconSize::Small)
+                                                        .color(Color::Warning),
+                                                )
+                                                .style(ButtonStyle::Subtle)
+                                                .on_click(cx.listener(|_, _, window, cx| {
+                                                    window.dispatch_action(Box::new(Open::DEFAULT), cx);
+                                                })),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            // Bottom Status Bar
+                            h_flex()
+                                .w_full()
+                                .justify_end()
+                                .items_center()
+                                .gap_4()
+                                .px_4()
+                                .py_1p5()
+                                .border_t_1()
+                                .border_color(colors.border_variant)
+                                .child(
+                                    Button::new("home-plugins-btn", "Plugins")
+                                        .style(ButtonStyle::Subtle)
+                                        .label_size(LabelSize::XSmall)
+                                        .on_click(cx.listener(|_, _, window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(Extensions {
+                                                    category_filter: None,
+                                                    id: None,
+                                                }),
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    Label::new("Theme: Islands Dark")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new("Keymap: IntelliJ (macOS)")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new("PHP: 8.2 <no default server>")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
+
         let (first_section, second_section) = CONTENT;
         let first_section_entries = first_section.entries.len();
         let mut next_tab_index = first_section_entries + second_section.entries.len();
@@ -510,6 +831,7 @@ impl Render for WelcomePage {
                         )
                     }),
             )
+            .into_any_element()
     }
 }
 
@@ -525,7 +847,11 @@ impl Item for WelcomePage {
     type Event = ItemEvent;
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Welcome".into()
+        if self.fallback_to_recent_projects {
+            "PhpStorm Home".into()
+        } else {
+            "Welcome".into()
+        }
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
