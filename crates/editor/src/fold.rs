@@ -59,11 +59,20 @@ impl EditorSnapshot {
             Some(
                 Disclosure::new(("gutter_crease", buffer_row.0), !folded)
                     .toggle_state(folded)
-                    .on_click(window.listener_for(&editor, move |this, _e, window, cx| {
+                    .on_click(window.listener_for(&editor, move |this, e: &gpui::ClickEvent, window, cx| {
+                        let is_alt = e.modifiers().alt;
                         if folded {
-                            this.unfold_at(buffer_row, window, cx);
+                            if is_alt {
+                                this.unfold_at_recursive(buffer_row, window, cx);
+                            } else {
+                                this.unfold_at(buffer_row, window, cx);
+                            }
                         } else {
-                            this.fold_at(buffer_row, window, cx);
+                            if is_alt {
+                                this.toggle_fold_at_recursive(buffer_row, window, cx);
+                            } else {
+                                this.fold_at(buffer_row, window, cx);
+                            }
                         }
                     }))
                     .into_any_element(),
@@ -146,21 +155,34 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let selection = self.selections.newest::<Point>(&self.display_snapshot(cx));
-
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
-        let range = if selection.is_empty() {
-            let point = selection.head().to_display_point(&display_map);
-            let start = DisplayPoint::new(point.row(), 0).to_point(&display_map);
-            let end = DisplayPoint::new(point.row(), display_map.line_len(point.row()))
-                .to_point(&display_map);
-            start..end
+        let buffer_row = MultiBufferRow(selection.head().row);
+
+        if display_map.is_line_folded(buffer_row) {
+            self.unfold_recursive(&Default::default(), window, cx);
+        } else if let Some(crease) = display_map.crease_for_buffer_row(buffer_row) {
+            let parent_range = crease.range().clone();
+            let inner_range = Point::new(parent_range.start.row + 1, 0)..parent_range.end;
+            if display_map.folds_in_range(inner_range).next().is_some() {
+                self.unfold_ranges(&[parent_range], true, true, cx);
+            } else {
+                self.fold_recursive(&Default::default(), window, cx);
+            }
         } else {
-            selection.range()
-        };
-        if display_map.folds_in_range(range).next().is_some() {
-            self.unfold_recursive(&Default::default(), window, cx)
-        } else {
-            self.fold_recursive(&Default::default(), window, cx)
+            let range = if selection.is_empty() {
+                let point = selection.head().to_display_point(&display_map);
+                let start = DisplayPoint::new(point.row(), 0).to_point(&display_map);
+                let end = DisplayPoint::new(point.row(), display_map.line_len(point.row()))
+                    .to_point(&display_map);
+                start..end
+            } else {
+                selection.range()
+            };
+            if display_map.folds_in_range(range).next().is_some() {
+                self.unfold_recursive(&Default::default(), window, cx)
+            } else {
+                self.fold_recursive(&Default::default(), window, cx)
+            }
         }
     }
 
@@ -399,6 +421,14 @@ impl Editor {
                 for row in range.start.row..=range.end.row {
                     if let Some(crease) = display_map.crease_for_buffer_row(MultiBufferRow(row)) {
                         found = true;
+                        let parent_range = crease.range();
+                        for child_row in (parent_range.start.row + 1)..=parent_range.end.row {
+                            if let Some(inner) = display_map.crease_for_buffer_row(MultiBufferRow(child_row)) {
+                                if inner.range().end.row <= parent_range.end.row {
+                                    to_fold.push(inner);
+                                }
+                            }
+                        }
                         to_fold.push(crease);
                     }
                 }
@@ -410,8 +440,15 @@ impl Editor {
             for row in (0..=range.start.row).rev() {
                 if let Some(crease) = display_map.crease_for_buffer_row(MultiBufferRow(row)) {
                     if crease.range().end.row >= buffer_start_row {
+                        let parent_range = crease.range();
+                        for child_row in (parent_range.start.row + 1)..=parent_range.end.row {
+                            if let Some(inner) = display_map.crease_for_buffer_row(MultiBufferRow(child_row)) {
+                                if inner.range().end.row <= parent_range.end.row {
+                                    to_fold.push(inner);
+                                }
+                            }
+                        }
                         to_fold.push(crease);
-                    } else {
                         break;
                     }
                 }
@@ -419,6 +456,37 @@ impl Editor {
         }
 
         self.fold_creases(to_fold, true, window, cx);
+    }
+
+    pub fn fold_at_recursive(
+        &mut self,
+        buffer_row: MultiBufferRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+
+        if let Some(crease) = display_map.crease_for_buffer_row(buffer_row) {
+            let parent_range = crease.range();
+            let mut to_fold = Vec::new();
+
+            for row in (parent_range.start.row + 1)..=parent_range.end.row {
+                if let Some(inner) = display_map.crease_for_buffer_row(MultiBufferRow(row)) {
+                    if inner.range().end.row <= parent_range.end.row {
+                        to_fold.push(inner);
+                    }
+                }
+            }
+            to_fold.push(crease.clone());
+
+            let autoscroll = self
+                .selections
+                .all::<Point>(&display_map)
+                .iter()
+                .any(|selection| RangeExt::overlaps(&selection.range(), &parent_range));
+
+            self.fold_creases(to_fold, autoscroll, window, cx);
+        }
     }
 
     pub fn fold_at(
@@ -482,18 +550,35 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let buffer = display_map.buffer_snapshot();
         let selections = self.selections.all::<Point>(&display_map);
-        let ranges = selections
-            .iter()
-            .map(|s| {
-                let mut range = s.display_range(&display_map).sorted();
-                *range.start.column_mut() = 0;
-                *range.end.column_mut() = display_map.line_len(range.end.row());
-                let start = range.start.to_point(&display_map);
-                let end = range.end.to_point(&display_map);
-                start..end
-            })
-            .collect::<Vec<_>>();
+        let mut ranges = Vec::new();
+
+        for s in &selections {
+            let point = s.head();
+            let buffer_row = MultiBufferRow(point.row);
+            if let Some(crease) = display_map.crease_for_buffer_row(buffer_row) {
+                ranges.push(crease.range().clone());
+            } else {
+                let next_row = (point.row + 1).min(buffer.max_point().row);
+                let next_col = if next_row > point.row { 0 } else { buffer.line_len(buffer_row) };
+                let line_range = Point::new(point.row, 0)..Point::new(next_row, next_col);
+                let widest_fold = display_map.folds_in_range(line_range).max_by_key(|fold| {
+                    let p = fold.range.to_point(buffer);
+                    p.end.row.saturating_sub(p.start.row)
+                });
+                if let Some(fold) = widest_fold {
+                    ranges.push(fold.range.to_point(buffer));
+                } else {
+                    let mut range = s.display_range(&display_map).sorted();
+                    *range.start.column_mut() = 0;
+                    *range.end.column_mut() = display_map.line_len(range.end.row());
+                    let start = range.start.to_point(&display_map);
+                    let end = range.end.to_point(&display_map);
+                    ranges.push(start..end);
+                }
+            }
+        }
 
         self.unfold_ranges(&ranges, true, true, cx);
     }
@@ -519,6 +604,68 @@ impl Editor {
             .any(|selection| RangeExt::overlaps(&selection.range(), &intersection_range));
 
         self.unfold_ranges(&[intersection_range], true, autoscroll, cx);
+    }
+
+    pub fn unfold_at_recursive(
+        &mut self,
+        buffer_row: MultiBufferRow,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let buffer = display_map.buffer_snapshot();
+
+        let range = if let Some(crease) = display_map.crease_for_buffer_row(buffer_row) {
+            crease.range().clone()
+        } else {
+            let next_row = (buffer_row.0 + 1).min(buffer.max_point().row);
+            let next_col = if next_row > buffer_row.0 { 0 } else { buffer.line_len(buffer_row) };
+            let line_range = Point::new(buffer_row.0, 0)..Point::new(next_row, next_col);
+            let widest_fold = display_map.folds_in_range(line_range).max_by_key(|fold| {
+                let p = fold.range.to_point(buffer);
+                p.end.row.saturating_sub(p.start.row)
+            });
+            if let Some(fold) = widest_fold {
+                fold.range.to_point(buffer)
+            } else {
+                Point::new(buffer_row.0, 0)..Point::new(buffer_row.0, buffer.line_len(buffer_row))
+            }
+        };
+
+        let autoscroll = self
+            .selections
+            .all::<Point>(&display_map)
+            .iter()
+            .any(|selection| RangeExt::overlaps(&selection.range(), &range));
+
+        self.unfold_ranges(&[range], true, autoscroll, cx);
+    }
+
+    pub fn toggle_fold_at_recursive(
+        &mut self,
+        buffer_row: MultiBufferRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        if display_map.is_line_folded(buffer_row) {
+            self.unfold_at_recursive(buffer_row, window, cx);
+        } else if let Some(crease) = display_map.crease_for_buffer_row(buffer_row) {
+            let parent_range = crease.range().clone();
+            let inner_range = Point::new(parent_range.start.row + 1, 0)..parent_range.end;
+            let count = display_map.folds_in_range(inner_range.clone()).count();
+            let has_inner_folds = count > 0;
+            if has_inner_folds {
+                let autoscroll = self
+                    .selections
+                    .all::<Point>(&display_map)
+                    .iter()
+                    .any(|selection| RangeExt::overlaps(&selection.range(), &parent_range));
+                self.unfold_ranges(&[parent_range], true, autoscroll, cx);
+            } else {
+                self.fold_at_recursive(buffer_row, window, cx);
+            }
+        }
     }
 
     pub fn unfold_all(

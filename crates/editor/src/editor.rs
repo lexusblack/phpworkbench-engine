@@ -2038,11 +2038,16 @@ impl Editor {
                     .cursor_pointer()
                     .child("⋯")
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(move |_, _window, cx| {
+                    .on_click(move |e: &ClickEvent, _window, cx| {
                         editor
                             .update(cx, |editor, cx| {
+                                let range = if e.modifiers().alt {
+                                    fold_range.start..fold_range.end
+                                } else {
+                                    fold_range.start..fold_range.start
+                                };
                                 editor.unfold_ranges(
-                                    &[fold_range.start..fold_range.end],
+                                    &[range],
                                     true,
                                     false,
                                     cx,

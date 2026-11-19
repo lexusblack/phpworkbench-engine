@@ -1497,6 +1497,90 @@ async fn test_fold_action(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_recursive_folding_and_unfolding(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(rust_lang()), cx));
+    cx.set_state(indoc! {"
+        impl Foo {
+            fn a() {
+                1
+            }
+
+            fn b() {
+                2
+            }
+        }ˇ
+    "});
+
+    cx.update_editor(|editor, window, cx| {
+        // 1. Fold recursively at row 0 (impl Foo)
+        editor.fold_at_recursive(MultiBufferRow(0), window, cx);
+        assert_eq!(
+            editor.display_text(cx),
+            "impl Foo {⋯}\n"
+        );
+
+        // 2. Unfold at row 0 without Alt - outer class is unfolded, inner methods remain folded!
+        editor.unfold_at(MultiBufferRow(0), window, cx);
+        assert_eq!(
+            editor.display_text(cx),
+            "
+                impl Foo {
+                    fn a() {⋯}
+
+                    fn b() {⋯}
+                }
+            "
+            .unindent(),
+        );
+
+        // 3. Repeat operation with Alt on row 0 - unfolds all inner methods!
+        editor.toggle_fold_at_recursive(MultiBufferRow(0), window, cx);
+        assert_eq!(
+            editor.display_text(cx),
+            "
+                impl Foo {
+                    fn a() {
+                        1
+                    }
+
+                    fn b() {
+                        2
+                    }
+                }
+            "
+            .unindent(),
+        );
+
+        // 4. Fold recursively again, then unfold_at_recursive directly
+        editor.fold_at_recursive(MultiBufferRow(0), window, cx);
+        assert_eq!(
+            editor.display_text(cx),
+            "impl Foo {⋯}\n"
+        );
+        editor.unfold_at_recursive(MultiBufferRow(0), window, cx);
+        assert_eq!(
+            editor.display_text(cx),
+            "
+                impl Foo {
+                    fn a() {
+                        1
+                    }
+
+                    fn b() {
+                        2
+                    }
+                }
+            "
+            .unindent(),
+        );
+    });
+}
+
+#[gpui::test]
 fn test_fold_action_without_language(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
