@@ -5308,32 +5308,31 @@ fn data_source_entry(source: &DataSource) -> Value {
         let url = source.url.trim().to_string();
         if !url.is_empty() {
             entry.insert("url".to_string(), Value::String(url));
-        } else {
-            if !source.host.trim().is_empty() {
-                entry.insert(
-                    "host".to_string(),
-                    Value::String(source.host.trim().to_string()),
-                );
-            }
-            let port = source.port.trim().to_string();
-            if !port.is_empty() {
-                match port.parse::<u16>() {
-                    Ok(number) => entry.insert("port".to_string(), Value::from(number)),
-                    Err(_) => entry.insert("port".to_string(), Value::String(port)),
-                };
-            }
-            if !source.user.trim().is_empty() {
-                entry.insert(
-                    "user".to_string(),
-                    Value::String(source.user.trim().to_string()),
-                );
-            }
-            if !source.database.trim().is_empty() {
-                entry.insert(
-                    "database".to_string(),
-                    Value::String(source.database.trim().to_string()),
-                );
-            }
+        }
+        if !source.host.trim().is_empty() {
+            entry.insert(
+                "host".to_string(),
+                Value::String(source.host.trim().to_string()),
+            );
+        }
+        let port = source.port.trim().to_string();
+        if !port.is_empty() {
+            match port.parse::<u16>() {
+                Ok(number) => entry.insert("port".to_string(), Value::from(number)),
+                Err(_) => entry.insert("port".to_string(), Value::String(port)),
+            };
+        }
+        if !source.user.trim().is_empty() {
+            entry.insert(
+                "user".to_string(),
+                Value::String(source.user.trim().to_string()),
+            );
+        }
+        if !source.database.trim().is_empty() {
+            entry.insert(
+                "database".to_string(),
+                Value::String(source.database.trim().to_string()),
+            );
         }
     }
     if !source.password.is_empty() {
@@ -6835,6 +6834,70 @@ pub struct DataSourcesDialog {
     _bounds_subscription: Option<Subscription>,
 }
 
+fn compute_default_jdbc_url(driver: &str, host: &str, port: &str, database: &str) -> String {
+    let driver_scheme = match driver {
+        "postgres" | "postgresql" => "postgresql",
+        "mysql" => "mysql",
+        "mariadb" => "mariadb",
+        "sqlserver" | "mssql" => "sqlserver",
+        "oracle" => "oracle",
+        "mongodb" => "mongodb",
+        "redis" => "redis",
+        _ => "mysql",
+    };
+    let h = if host.trim().is_empty() { "localhost" } else { host.trim() };
+    let p = if port.trim().is_empty() {
+        match driver {
+            "postgres" | "postgresql" => "5432",
+            "sqlserver" | "mssql" => "1433",
+            "oracle" => "1521",
+            "mongodb" => "27017",
+            "redis" => "6379",
+            _ => "3306",
+        }
+    } else {
+        port.trim()
+    };
+    let db = database.trim();
+    if !db.is_empty() {
+        format!("jdbc:{driver_scheme}://{h}:{p}/{db}")
+    } else {
+        format!("jdbc:{driver_scheme}://{h}:{p}")
+    }
+}
+
+fn is_auto_jdbc_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let clean = trimmed.strip_prefix("jdbc:").unwrap_or(trimmed);
+    if clean.contains('?') || clean.contains('&') || clean.contains('@') {
+        return false;
+    }
+    if let Some((scheme, _)) = clean.split_once("://") {
+        matches!(
+            scheme,
+            "mysql" | "mariadb" | "postgres" | "postgresql" | "sqlserver" | "mssql" | "oracle" | "mongodb" | "redis"
+        )
+    } else {
+        false
+    }
+}
+
+fn set_editor_text_nowindow(editor: &Entity<Editor>, text: String, cx: &mut App) {
+    editor.update(cx, |editor, cx| {
+        editor.buffer().update(cx, |multi_buffer, cx| {
+            if let Some(buffer) = multi_buffer.as_singleton() {
+                buffer.update(cx, |buffer, cx| {
+                    let len = buffer.len();
+                    buffer.edit([(0..len, text)], None, cx);
+                });
+            }
+        });
+    });
+}
+
 impl Focusable for DataSourcesDialog {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.name_editor.focus_handle(cx)
@@ -7028,30 +7091,10 @@ impl DataSourcesDialog {
         set(&self.user_editor, source.user.clone());
         set(&self.password_editor, String::new());
         set(&self.database_editor, source.database.clone());
-        let initial_url = if source.url.is_empty() && source.driver != "sqlite" {
-            let driver_scheme = match source.driver.as_str() {
-                "postgres" | "postgresql" => "postgresql",
-                "mysql" => "mysql",
-                "mariadb" => "mariadb",
-                "sqlserver" | "mssql" => "sqlserver",
-                _ => "mysql",
-            };
-            let h = if source.host.is_empty() { "localhost" } else { &source.host };
-            let p = if source.port.is_empty() {
-                match source.driver.as_str() {
-                    "postgres" | "postgresql" => "5432",
-                    "sqlserver" | "mssql" => "1433",
-                    _ => "3306",
-                }
-            } else {
-                &source.port
-            };
-            let db = &source.database;
-            if !db.is_empty() {
-                format!("jdbc:{driver_scheme}://{h}:{p}/{db}")
-            } else {
-                format!("jdbc:{driver_scheme}://{h}:{p}")
-            }
+        let initial_url = if source.driver == "sqlite" {
+            source.url.clone()
+        } else if source.url.is_empty() || is_auto_jdbc_url(&source.url) {
+            compute_default_jdbc_url(&source.driver, &source.host, &source.port, &source.database)
         } else {
             source.url.clone()
         };
@@ -7089,53 +7132,47 @@ impl DataSourcesDialog {
         let Some(index) = self.selected else {
             return;
         };
-        let text = |editor: &Entity<Editor>| editor.read(cx).text(cx);
         let mut advanced = Vec::new();
         for (key_editor, value_editor) in &self.advanced_rows {
-            advanced.push((text(key_editor), text(value_editor)));
+            advanced.push((key_editor.read(cx).text(cx), value_editor.read(cx).text(cx)));
         }
+        let name_text = self.name_editor.read(cx).text(cx);
+        let host = self.host_editor.read(cx).text(cx);
+        let port = self.port_editor.read(cx).text(cx);
+        let user = self.user_editor.read(cx).text(cx);
+        let typed_password = self.password_editor.read(cx).text(cx);
+        let database = self.database_editor.read(cx).text(cx);
+        let typed_url = self.url_editor.read(cx).text(cx).trim().to_string();
+        let ssh_local_port = self.ssh_local_port_editor.read(cx).text(cx);
+
+        let mut need_url_sync = None;
         if let Some(source) = self.sources.get_mut(index) {
-            let mut name = text(&self.name_editor).trim().to_string();
-            let host = text(&self.host_editor);
-            let database = text(&self.database_editor);
+            let mut name = name_text.trim().to_string();
             if (name.is_empty() || name == "datasource") && !database.is_empty() {
                 let h = if host.is_empty() { "localhost" } else { &host };
                 name = format!("{database}@{h}");
             }
             source.name = name;
             source.host = host.clone();
-            source.port = text(&self.port_editor);
-            source.user = text(&self.user_editor);
-            let typed_password = text(&self.password_editor);
+            source.port = port;
+            source.user = user;
             if !typed_password.is_empty() {
                 source.password = typed_password;
             }
             source.database = database.clone();
-            let mut url = text(&self.url_editor).trim().to_string();
-            if url.is_empty() && source.driver != "sqlite" {
-                let driver_scheme = match source.driver.as_str() {
-                    "postgres" | "postgresql" => "postgresql",
-                    "mysql" => "mysql",
-                    "mariadb" => "mariadb",
-                    "sqlserver" | "mssql" => "sqlserver",
-                    _ => "mysql",
-                };
-                let h = if host.is_empty() { "localhost" } else { host.as_str() };
-                let p = if source.port.is_empty() {
-                    match source.driver.as_str() {
-                        "postgres" | "postgresql" => "5432",
-                        "sqlserver" | "mssql" => "1433",
-                        _ => "3306",
-                    }
-                } else {
-                    source.port.as_str()
-                };
-                if !database.is_empty() {
-                    url = format!("jdbc:{driver_scheme}://{h}:{p}/{database}");
+            let default_url =
+                compute_default_jdbc_url(&source.driver, &host, &source.port, &database);
+            if source.driver == "sqlite" {
+                source.url = typed_url;
+            } else if typed_url.is_empty() || is_auto_jdbc_url(&typed_url) {
+                source.url = default_url.clone();
+                if typed_url != default_url {
+                    need_url_sync = Some(default_url);
                 }
+            } else {
+                source.url = typed_url;
             }
-            source.url = url;
-            source.ssh_local_port = text(&self.ssh_local_port_editor);
+            source.ssh_local_port = ssh_local_port;
             source.options = rows_to_options(&advanced)
                 .into_iter()
                 .map(|(key, value)| {
@@ -7146,6 +7183,9 @@ impl DataSourcesDialog {
                     (key, value)
                 })
                 .collect();
+        }
+        if let Some(url_sync) = need_url_sync {
+            set_editor_text_nowindow(&self.url_editor, url_sync, cx);
         }
     }
 
@@ -7179,6 +7219,14 @@ impl DataSourcesDialog {
                     if let Some(default_port) = driver_default_port(&source.driver) {
                         source.port = default_port.to_string();
                     }
+                }
+                if is_auto_jdbc_url(&source.url) {
+                    source.url = compute_default_jdbc_url(
+                        &source.driver,
+                        &source.host,
+                        &source.port,
+                        &source.database,
+                    );
                 }
             }
         }
@@ -27311,6 +27359,40 @@ Host web1
         }
         source.ssh_enabled = true;
         assert!(data_source_problems(&source).contains(&"ssh host is required".to_string()));
+    }
+
+    #[test]
+    fn data_source_jdbc_url_and_entry_preserves_database_and_fields() {
+        assert_eq!(
+            compute_default_jdbc_url("mariadb", "127.0.0.1", "3306", "myinterview"),
+            "jdbc:mariadb://127.0.0.1:3306/myinterview"
+        );
+        assert_eq!(
+            compute_default_jdbc_url("mysql", "", "", ""),
+            "jdbc:mysql://localhost:3306"
+        );
+        assert!(is_auto_jdbc_url("jdbc:mysql://localhost:3306"));
+        assert!(is_auto_jdbc_url("jdbc:mariadb://127.0.0.1:306/myinterview"));
+        assert!(!is_auto_jdbc_url("jdbc:mysql://localhost:3306/app?useSSL=false"));
+        assert!(!is_auto_jdbc_url("mysql://root:secret@127.0.0.1:3306/app"));
+
+        let mut source = DataSource::blank(PathBuf::from("/tmp"));
+        source.name = "myinterview@127.0.0.1".to_string();
+        source.driver = "mariadb".to_string();
+        source.host = "127.0.0.1".to_string();
+        source.port = "306".to_string();
+        source.user = "root".to_string();
+        source.database = "myinterview".to_string();
+        source.url = "jdbc:mariadb://127.0.0.1:306/myinterview".to_string();
+
+        let entry = data_source_entry(&source);
+        assert_eq!(entry["name"], json!("myinterview@127.0.0.1"));
+        assert_eq!(entry["driver"], json!("mariadb"));
+        assert_eq!(entry["host"], json!("127.0.0.1"));
+        assert_eq!(entry["port"], json!(306));
+        assert_eq!(entry["user"], json!("root"));
+        assert_eq!(entry["database"], json!("myinterview"));
+        assert_eq!(entry["url"], json!("jdbc:mariadb://127.0.0.1:306/myinterview"));
     }
 
     #[test]
