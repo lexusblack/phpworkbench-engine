@@ -1049,6 +1049,43 @@ impl Editor {
             if definition.await? == Navigated::Yes {
                 return Ok(Navigated::Yes);
             }
+
+            let head_info = editor.update(cx, |editor, cx| {
+                let newest_anchor = editor.selections.newest_anchor().head();
+                let (buffer, head) = editor.buffer.read(cx).text_anchor_for_position(newest_anchor, cx)?;
+                let project = editor.project.clone();
+                let nav_entry = editor.navigation_entry(newest_anchor, cx);
+                Some((buffer, project, head, nav_entry))
+            })?;
+
+            if let Some((buffer, project, head, nav_entry)) = head_info {
+                if let Some((_, file_target)) =
+                    crate::php_controller_nav::find_php_controller_method(
+                        &buffer,
+                        project,
+                        head,
+                        cx,
+                    )
+                    .await
+                {
+                    let navigated = editor
+                        .update_in(cx, |editor, window, cx| {
+                            editor.navigate_to_hover_links(
+                                Some(GotoDefinitionKind::Symbol),
+                                vec![HoverLink::File(file_target)],
+                                nav_entry,
+                                false,
+                                window,
+                                cx,
+                            )
+                        })?
+                        .await?;
+                    if navigated == Navigated::Yes {
+                        return Ok(Navigated::Yes);
+                    }
+                }
+            }
+
             match fallback_strategy {
                 GoToDefinitionFallback::None => Ok(Navigated::No),
                 GoToDefinitionFallback::FindAllReferences => {

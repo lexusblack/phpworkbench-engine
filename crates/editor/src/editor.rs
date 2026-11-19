@@ -76,6 +76,7 @@ mod navigation;
 mod rewrap;
 mod selection;
 mod phpstorm_actions;
+pub mod php_controller_nav;
 
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;

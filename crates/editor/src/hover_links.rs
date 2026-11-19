@@ -183,7 +183,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hovered_link_modifier = Editor::is_cmd_or_ctrl_pressed(&modifiers, cx);
+        let hovered_link_modifier =
+            Editor::is_cmd_or_ctrl_pressed(&modifiers, cx) || modifiers.alt;
         if !hovered_link_modifier || self.has_pending_selection() {
             self.hide_hovered_link(cx);
             return;
@@ -235,7 +236,7 @@ impl Editor {
         } else {
             GotoDefinitionKind::Symbol
         };
-        let split = Self::is_alt_pressed(&modifiers, cx);
+        let split = modifiers.secondary() && modifiers.alt;
         let snapshot = self.snapshot(window, cx);
         let position = snapshot
             .buffer_snapshot()
@@ -632,6 +633,27 @@ pub fn show_link_definition(
                                 });
                             }
                             links.extend(definition_result.into_iter().map(HoverLink::Text));
+                        }
+                    }
+
+                    if links.is_empty() {
+                        if let Some((method_range, file_target)) =
+                            crate::php_controller_nav::find_php_controller_method(
+                                &buffer,
+                                project.clone(),
+                                anchor,
+                                cx,
+                            )
+                            .await
+                        {
+                            let snapshot =
+                                this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                            if let Some(range) =
+                                snapshot.buffer_anchor_range_to_anchor_range(method_range)
+                            {
+                                symbol_range = Some(RangeInEditor::Text(range));
+                            }
+                            links.push(HoverLink::File(file_target));
                         }
                     }
 

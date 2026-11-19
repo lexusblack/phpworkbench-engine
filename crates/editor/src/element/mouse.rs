@@ -1008,9 +1008,11 @@ impl EditorElement {
         let text_hitbox = &position_map.text_hitbox;
         let pending_nonempty_selections = editor.has_pending_nonempty_selection();
 
-        let hovered_link_modifier = Editor::is_cmd_or_ctrl_pressed(&event.modifiers(), cx);
+        let hovered_link_modifier =
+            Editor::is_cmd_or_ctrl_pressed(&event.modifiers(), cx) || event.modifiers().alt;
         let mouse_down_hovered_link_modifier = if let ClickEvent::Mouse(mouse_event) = event {
             Editor::is_cmd_or_ctrl_pressed(&mouse_event.down.modifiers, cx)
+                || mouse_event.down.modifiers.alt
         } else {
             true
         };
@@ -1040,6 +1042,13 @@ impl EditorElement {
                 return;
             }
 
+            if hovered_link_modifier && mouse_down_hovered_link_modifier {
+                editor.handle_click_hovered_link(point, event.modifiers(), window, cx);
+                editor.selection_drag_state = SelectionDragState::None;
+                cx.stop_propagation();
+                return;
+            }
+
             let is_alt_only = event.modifiers().alt
                 && !event.modifiers().secondary()
                 && !event.modifiers().control;
@@ -1052,12 +1061,6 @@ impl EditorElement {
                 editor.selection_drag_state = SelectionDragState::None;
                 cx.stop_propagation();
                 return;
-            }
-
-            if hovered_link_modifier && mouse_down_hovered_link_modifier {
-                editor.handle_click_hovered_link(point, event.modifiers(), window, cx);
-                editor.selection_drag_state = SelectionDragState::None;
-                cx.stop_propagation();
             }
         }
     }
