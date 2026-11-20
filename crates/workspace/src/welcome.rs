@@ -420,6 +420,7 @@ impl WelcomePage {
         &self,
         index: usize,
         workspace: &RecentWorkspace,
+        colors: &theme::ThemeColors,
     ) -> impl IntoElement {
         let name = project_name(&workspace.identity_paths);
         let path_str = workspace
@@ -445,56 +446,62 @@ impl WelcomePage {
         };
 
         let hash = name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
-        let (bg_color, fg_color) = match hash % 5 {
+        let (bg_color, fg_color) = match hash % 6 {
             0 => (gpui::rgb(0x234a2e), gpui::rgb(0x7ee787)),
             1 => (gpui::rgb(0x1a3d64), gpui::rgb(0x79b8ff)),
             2 => (gpui::rgb(0x5a2d18), gpui::rgb(0xffa657)),
             3 => (gpui::rgb(0x3e1f6e), gpui::rgb(0xd2a8ff)),
+            4 => (gpui::rgb(0x601d3b), gpui::rgb(0xff7b72)),
             _ => (gpui::rgb(0x1b464a), gpui::rgb(0x56d4dd)),
         };
 
         let focus = self.focus_handle.clone();
-        ButtonLike::new(format!("home-proj-{}", index))
-            .full_width()
-            .style(ButtonStyle::Subtle)
+        let hover_bg = colors.element_hover;
+        let active_bg = colors.element_active;
+
+        h_flex()
+            .id(format!("home-proj-{}", index))
+            .w_full()
+            .px_3()
+            .py_1p5()
+            .gap_3()
+            .items_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .active(move |s| s.bg(active_bg))
             .child(
                 h_flex()
-                    .w_full()
-                    .gap_2p5()
+                    .w(px(28.))
+                    .h(px(28.))
+                    .rounded(px(4.))
+                    .bg(bg_color)
+                    .justify_center()
                     .items_center()
-                    .py_1()
+                    .flex_shrink_0()
                     .child(
-                        h_flex()
-                            .w(px(26.))
-                            .h(px(26.))
-                            .rounded(px(4.))
-                            .bg(bg_color)
-                            .justify_center()
-                            .items_center()
-                            .flex_shrink_0()
-                            .child(
-                                Label::new(display_initials)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Custom(fg_color.into()))
-                                    .weight(FontWeight::BOLD),
-                            ),
+                        Label::new(display_initials)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Custom(fg_color.into()))
+                            .weight(FontWeight::BOLD),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(name)
+                            .size(LabelSize::Small)
+                            .weight(FontWeight::BOLD)
+                            .truncate(),
                     )
                     .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_grow_1()
-                            .child(
-                                Label::new(name)
-                                    .size(LabelSize::Small)
-                                    .weight(FontWeight::BOLD)
-                                    .truncate(),
-                            )
-                            .child(
-                                Label::new(path_str)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            ),
+                        Label::new(path_str)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
                     ),
             )
             .on_click(move |_, window, cx| {
@@ -513,7 +520,7 @@ impl Render for WelcomePage {
                 .into_iter()
                 .flatten()
                 .enumerate()
-                .map(|(index, workspace)| self.render_home_project_item(index, workspace))
+                .map(|(index, workspace)| self.render_home_project_item(index, workspace, colors))
                 .collect::<Vec<_>>();
 
             return h_flex()
@@ -610,26 +617,31 @@ impl Render for WelcomePage {
                                 ),
                         )
                         .child(
-                            v_flex()
+                            // Search projects bar matching PhpStorm
+                            h_flex()
                                 .px_3()
                                 .pt_3()
-                                .gap_1()
+                                .pb_1()
                                 .child(
                                     h_flex()
-                                        .gap_1p5()
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1()
+                                        .gap_2()
                                         .items_center()
-                                        .px_1()
-                                        .pb_1()
+                                        .rounded_md()
+                                        .bg(colors.editor_background)
+                                        .border_1()
+                                        .border_color(colors.border)
                                         .child(
-                                            Icon::new(IconName::FolderSearch)
+                                            Icon::new(IconName::MagnifyingGlass)
                                                 .size(IconSize::XSmall)
                                                 .color(Color::Muted),
                                         )
                                         .child(
-                                            Label::new("Recent Projects")
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted)
-                                                .weight(FontWeight::BOLD),
+                                            Label::new("Search projects")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
                                         ),
                                 ),
                         )
@@ -638,6 +650,8 @@ impl Render for WelcomePage {
                                 .id("home-recent-projects-list")
                                 .flex_grow_1()
                                 .px_2()
+                                .py_1()
+                                .gap_0p5()
                                 .overflow_y_scroll()
                                 .children(recent_items),
                         ),
@@ -699,41 +713,50 @@ impl Render for WelcomePage {
                             // Bottom Status Bar
                             h_flex()
                                 .w_full()
-                                .justify_end()
+                                .justify_between()
                                 .items_center()
-                                .gap_4()
                                 .px_4()
                                 .py_1p5()
                                 .border_t_1()
                                 .border_color(colors.border_variant)
                                 .child(
-                                    Button::new("home-plugins-btn", "Plugins")
-                                        .style(ButtonStyle::Subtle)
-                                        .label_size(LabelSize::XSmall)
-                                        .on_click(cx.listener(|_, _, window, cx| {
-                                            window.dispatch_action(
-                                                Box::new(Extensions {
-                                                    category_filter: None,
-                                                    id: None,
-                                                }),
-                                                cx,
-                                            );
-                                        })),
-                                )
-                                .child(
-                                    Label::new("Theme: Islands Dark")
+                                    Label::new("PhpStorm Home")
                                         .size(LabelSize::XSmall)
                                         .color(Color::Muted),
                                 )
                                 .child(
-                                    Label::new("Keymap: IntelliJ (macOS)")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .child(
-                                    Label::new("PHP: 8.2 <no default server>")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
+                                    h_flex()
+                                        .gap_4()
+                                        .items_center()
+                                        .child(
+                                            Button::new("home-plugins-btn", "Plugins")
+                                                .style(ButtonStyle::Subtle)
+                                                .label_size(LabelSize::XSmall)
+                                                .on_click(cx.listener(|_, _, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(Extensions {
+                                                            category_filter: None,
+                                                            id: None,
+                                                        }),
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            Label::new("Theme: Islands Dark")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new("Keymap: IntelliJ (macOS)")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new("PHP: 8.2 <no default server>")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
                                 ),
                         ),
                 )
