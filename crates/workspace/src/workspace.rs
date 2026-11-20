@@ -2555,33 +2555,9 @@ impl Workspace {
                 .await
                 .unwrap_or_default();
 
-            // Restore default dock state for empty workspaces
-            // Only restore if:
-            // 1. This is an empty workspace (no paths), AND
-            // 2. The serialized workspace either doesn't exist or has no paths
+            // For empty workspaces (no paths), keep docks closed so PhpStorm Home welcome view takes full window
             if is_empty_workspace && !serialized_workspace_has_paths {
-                if let Some(default_docks) = persistence::read_default_dock_state(&kvp) {
-                    window
-                        .update(cx, |_, window, cx| {
-                            workspace.update(cx, |workspace, cx| {
-                                for (dock, serialized_dock) in [
-                                    (&workspace.right_dock, &default_docks.right),
-                                    (&workspace.left_dock, &default_docks.left),
-                                    (&workspace.bottom_dock, &default_docks.bottom),
-                                ] {
-                                    dock.update(cx, |dock, cx| {
-                                        dock.restore_serialized_state(
-                                            serialized_dock.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-                                cx.notify();
-                            });
-                        })
-                        .log_err();
-                }
+                // Do not open docks over the Welcome view
             }
 
             window
@@ -6969,6 +6945,10 @@ impl Workspace {
             title = render_window_title_format(default_template, separator, &context);
         }
 
+        if !project.visible_worktrees(cx).next().is_some() && active_project_path.is_none() {
+            title = "PhpStorm Home".to_string();
+        }
+
         if project.is_via_collab() {
             title.push_str(" ↙");
         } else if project.is_shared() {
@@ -10247,6 +10227,9 @@ impl Render for Workspace {
             workspace: &self.weak_self,
         };
 
+        let is_home_screen = !self.project.read(cx).visible_worktrees(cx).next().is_some()
+            && self.active_item(cx).is_none();
+
         div()
             .relative()
             .size_full()
@@ -10400,6 +10383,17 @@ impl Render for Workspace {
                                 ))
                             })
                             .child({
+                                if is_home_screen {
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .size_full()
+                                        .child(self.render_center(
+                                            &pane_render_context,
+                                            window,
+                                            cx,
+                                        ))
+                                } else {
                                 match bottom_dock_layout {
                                     BottomDockLayout::Full => div()
                                         .flex()
@@ -10640,6 +10634,7 @@ impl Render for Workspace {
                                             cx,
                                         )),
                                 }
+                                }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
                                 let zoomed_view = view.upgrade()?;
@@ -10692,7 +10687,7 @@ impl Render for Workspace {
                             }))
                             .children(self.render_notifications(window, cx)),
                     )
-                    .when(self.status_bar_visible(cx), |parent| {
+                    .when(!is_home_screen && self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())
                     })
                     .child(self.toast_layer.clone()),

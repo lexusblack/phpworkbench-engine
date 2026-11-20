@@ -4736,7 +4736,7 @@ impl Render for Pane {
                                         }
                                     },
                                 ));
-                            if has_worktrees || !self.should_display_welcome_page {
+                            if has_worktrees {
                                 placeholder
                             } else {
                                 if self.welcome_page.is_none() {

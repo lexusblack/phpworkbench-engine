@@ -1552,11 +1552,8 @@ pub(crate) async fn restore_or_create_workspace(
                     |workspace, window, cx| {
                         let restore_on_startup =
                             WorkspaceSettings::get_global(cx).restore_on_startup;
-                        match restore_on_startup {
-                            workspace::RestoreOnStartupBehavior::Launchpad => {}
-                            _ => {
-                                Editor::new_file(workspace, &Default::default(), window, cx);
-                            }
+                        if matches!(restore_on_startup, workspace::RestoreOnStartupBehavior::EmptyTab) {
+                            Editor::new_file(workspace, &Default::default(), window, cx);
                         }
                     },
                 )
@@ -1578,11 +1575,8 @@ pub(crate) async fn restore_or_create_workspace(
                 cx,
                 |workspace, window, cx| {
                     let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-                        }
+                    if matches!(restore_on_startup, workspace::RestoreOnStartupBehavior::EmptyTab) {
+                        Editor::new_file(workspace, &Default::default(), window, cx);
                     }
                 },
             )
@@ -1596,11 +1590,8 @@ pub(crate) async fn restore_or_create_workspace(
                 cx,
                 |workspace, window, cx| {
                     let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-                        }
+                    if matches!(restore_on_startup, workspace::RestoreOnStartupBehavior::EmptyTab) {
+                        Editor::new_file(workspace, &Default::default(), window, cx);
                     }
                 },
             )
