@@ -882,6 +882,8 @@ fn main() {
 
         initialize_workspace(app_state.clone(), cx);
 
+        zed::update_checker::init(app_state.client.http_client(), cx);
+
         cx.activate(true);
 
         cx.spawn({

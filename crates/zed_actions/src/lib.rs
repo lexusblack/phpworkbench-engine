@@ -67,6 +67,8 @@ actions!(
         Quit,
         /// Shows information about Zed.
         About,
+        /// Checks for application updates.
+        CheckForUpdates,
         /// Opens the documentation website.
         OpenDocs,
         /// Views open source licenses.

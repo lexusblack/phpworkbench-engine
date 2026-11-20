@@ -166,7 +166,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("About PhpWorkbench", zed_actions::About),
-                MenuItem::action("Check for Updates…", zed_actions::About),
+                MenuItem::action("Check for Updates…", zed_actions::CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings…").items([
                     MenuItem::action("Open Settings", zed_actions::OpenSettings),
@@ -1159,6 +1159,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Help", zed_actions::OpenOnboarding),
                 MenuItem::separator(),
                 MenuItem::action("What's New in PhpWorkbench", zed_actions::About),
+                MenuItem::action("Check for Updates…", zed_actions::CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Getting Started", phpstorm_menu::GettingStarted),
                 MenuItem::action("PhpWorkbench on YouTube", phpstorm_menu::PhpWorkbenchOnYouTube),
