@@ -567,47 +567,119 @@ impl Render for WelcomePage {
                                 .px_3()
                                 .gap_1p5()
                                 .child(
-                                    Button::new("home-open-project", "Open")
-                                        .start_icon(
-                                            Icon::new(IconName::FolderOpen)
-                                                .size(IconSize::Small)
-                                                .color(Color::Accent),
-                                        )
+                                    ButtonLike::new("home-open-project")
                                         .full_width()
+                                        .size(ButtonSize::Medium)
                                         .style(ButtonStyle::Filled)
                                         .tooltip(Tooltip::text("Open Project from Directory (⌘O)"))
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .justify_between()
+                                                .items_center()
+                                                .child(
+                                                    h_flex()
+                                                        .gap_2p5()
+                                                        .items_center()
+                                                        .child(
+                                                            Icon::new(IconName::FolderOpen)
+                                                                .size(IconSize::Small)
+                                                                .color(Color::Accent),
+                                                        )
+                                                        .child(
+                                                            Label::new("Open")
+                                                                .size(LabelSize::Default)
+                                                                .weight(FontWeight::MEDIUM),
+                                                        ),
+                                                )
+                                                .child(
+                                                    Label::new("⌘O")
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                ),
+                                        )
                                         .on_click(cx.listener(|_, _, window, cx| {
                                             window.dispatch_action(Box::new(Open::DEFAULT), cx);
                                         })),
                                 )
                                 .child(
-                                    Button::new("home-new-file", "New...")
-                                        .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                                    ButtonLike::new("home-new-file")
                                         .full_width()
+                                        .size(ButtonSize::Medium)
                                         .style(ButtonStyle::Subtle)
                                         .tooltip(Tooltip::text("New File / Project"))
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .justify_between()
+                                                .items_center()
+                                                .child(
+                                                    h_flex()
+                                                        .gap_2p5()
+                                                        .items_center()
+                                                        .child(
+                                                            Icon::new(IconName::Plus)
+                                                                .size(IconSize::Small),
+                                                        )
+                                                        .child(
+                                                            Label::new("New...")
+                                                                .size(LabelSize::Default),
+                                                        ),
+                                                )
+                                                .child(
+                                                    Icon::new(IconName::ChevronDown)
+                                                        .size(IconSize::XSmall)
+                                                        .color(Color::Muted),
+                                                ),
+                                        )
                                         .on_click(cx.listener(|_, _, window, cx| {
                                             window.dispatch_action(Box::new(NewFile), cx);
                                         })),
                                 )
                                 .child(
-                                    Button::new("home-clone-repo", "Clone Repository")
-                                        .start_icon(
-                                            Icon::new(IconName::CloudDownload).size(IconSize::Small),
-                                        )
+                                    ButtonLike::new("home-clone-repo")
                                         .full_width()
+                                        .size(ButtonSize::Medium)
                                         .style(ButtonStyle::Subtle)
                                         .tooltip(Tooltip::text("Clone from Git Repository"))
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .items_center()
+                                                .gap_2p5()
+                                                .child(
+                                                    Icon::new(IconName::CloudDownload)
+                                                        .size(IconSize::Small),
+                                                )
+                                                .child(
+                                                    Label::new("Clone Repository")
+                                                        .size(LabelSize::Default),
+                                                ),
+                                        )
                                         .on_click(cx.listener(|_, _, window, cx| {
                                             window.dispatch_action(Box::new(GitClone), cx);
                                         })),
                                 )
                                 .child(
-                                    Button::new("home-connect-remote", "Connect to Remote")
-                                        .start_icon(Icon::new(IconName::Server).size(IconSize::Small))
+                                    ButtonLike::new("home-connect-remote")
                                         .full_width()
+                                        .size(ButtonSize::Medium)
                                         .style(ButtonStyle::Subtle)
                                         .tooltip(Tooltip::text("Connect to Remote Host / SSH"))
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .items_center()
+                                                .gap_2p5()
+                                                .child(
+                                                    Icon::new(IconName::Server)
+                                                        .size(IconSize::Small),
+                                                )
+                                                .child(
+                                                    Label::new("Connect to Remote")
+                                                        .size(LabelSize::Default),
+                                                ),
+                                        )
                                         .on_click(cx.listener(|_, _, window, cx| {
                                             window.dispatch_action(
                                                 Box::new(OpenRemote::default()),
