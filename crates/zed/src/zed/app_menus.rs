@@ -914,7 +914,12 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     dep_items.push(MenuItem::separator());
                     dep_items.push(MenuItem::action("Configuration…", php_panel::OpenDeploymentDialog));
                     dep_items.push(MenuItem::action("Options…", php_panel::OpenDeploymentDialog));
-                    dep_items.push(MenuItem::action("Automatic Upload", php_panel::ToggleAutomaticUpload).checked(is_auto_upload));
+                    let auto_upload_title = if is_auto_upload {
+                        "✓ Automatic Upload (always)"
+                    } else {
+                        "   Automatic Upload (always)"
+                    };
+                    dep_items.push(MenuItem::action(auto_upload_title, php_panel::ToggleAutomaticUpload).checked(is_auto_upload));
                     dep_items.push(MenuItem::separator());
                     dep_items.push(MenuItem::action("Browse Remote Host", php_panel::BrowseRemoteHost));
 

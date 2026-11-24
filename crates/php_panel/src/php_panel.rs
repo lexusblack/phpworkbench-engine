@@ -4465,6 +4465,206 @@ pub fn set_deploy_transfer_finished(success: bool, message: String, cx: &mut App
     }
 }
 
+pub fn set_active_deployment_server(name: Option<String>, cx: &mut App) {
+    if !cx.has_global::<DeployShared>() {
+        return;
+    }
+    let shared = cx.global::<DeployShared>();
+    let servers = shared.servers.clone();
+    let panel = shared.panel.clone();
+    let root = shared.root.clone();
+
+    let mut auto_upload = false;
+
+    if let Some(root) = root.as_ref() {
+        let config_path = deploy_config_path(root);
+        let mut config = load_config_object(&config_path).unwrap_or_default();
+        if !config.contains_key("servers") {
+            if let Some(imported) = load_deploy_config_for_root(root) {
+                if let Some(obj) = imported.as_object() {
+                    config = obj.clone();
+                }
+            }
+        }
+        if let Some(active_name) = name.as_ref() {
+            config.insert("active".to_string(), Value::String(active_name.clone()));
+            config.insert("default".to_string(), Value::String(active_name.clone()));
+            if let Some(servers_arr) = config.get("servers").and_then(Value::as_array) {
+                if let Some(s) = servers_arr.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(active_name)) {
+                    auto_upload = s.get("upload_on_save").and_then(Value::as_bool).unwrap_or(false);
+                }
+            }
+        } else {
+            config.remove("active");
+            config.remove("default");
+        }
+        let _ = write_config_object(&config_path, &config);
+    }
+
+    cx.set_global(DeployShared {
+        servers,
+        active: name.clone(),
+        auto_upload,
+        panel: panel.clone(),
+        root,
+    });
+
+    if let Some(panel) = panel.and_then(|p| p.upgrade()) {
+        panel.update(cx, |panel, cx| {
+            panel.set_active_server_from_status_bar(name.clone(), cx);
+        });
+    }
+
+    let msg = match &name {
+        Some(s) => format!("Default deployment server set to '{s}'"),
+        None => "Default deployment server cleared".to_string(),
+    };
+    set_deploy_transfer_finished(true, msg, cx);
+    request_reload_menus(cx);
+}
+
+pub fn trigger_auto_upload_on_save(abs_path: PathBuf, cx: &mut App) {
+    if remote_file_banner::parse_remote_path(&abs_path).is_some() {
+        return;
+    }
+    if !cx.has_global::<DeployShared>() {
+        return;
+    }
+    let shared = cx.global::<DeployShared>();
+    if !shared.auto_upload {
+        return;
+    }
+    let Some(active_name) = shared.active.clone().or_else(|| shared.servers.first().cloned()) else {
+        return;
+    };
+    let Some(root) = shared.root.clone() else {
+        return;
+    };
+
+    let config_path = deploy_config_path(&root);
+    let config = load_config_object(&config_path).unwrap_or_default();
+    let servers = config.get("servers").and_then(Value::as_array);
+    let server_entry = servers.and_then(|arr| {
+        arr.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(&active_name))
+    });
+    let local_root = server_entry.and_then(|s| s.get("local_root")).and_then(Value::as_str);
+
+    let Some(rel_path) = relative_upload_path(&abs_path, &root, local_root) else {
+        return;
+    };
+
+    let server_name = active_name.clone();
+    let server_root = root.clone();
+    let start_msg = format!("uploading {} to {}…", rel_path, server_name);
+    set_deploy_transfer_started(start_msg.clone(), cx);
+
+    let task_server = server_name.clone();
+    let task_rel = rel_path.clone();
+    let task: Task<Result<String, String>> = cx.background_spawn(async move {
+        let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
+        command
+            .current_dir(&server_root)
+            .arg("upload")
+            .arg("--server")
+            .arg(&task_server)
+            .arg("--path")
+            .arg(&task_rel)
+            .arg("--from")
+            .arg(&abs_path);
+        let output = command.output().await.map_err(|error| error.to_string())?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(if stdout.is_empty() {
+                format!("uploaded {} to {}", task_rel, task_server)
+            } else {
+                stdout
+            })
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!("exit {}", output.status.code().unwrap_or(1))
+            } else {
+                stderr
+            })
+        }
+    });
+
+    cx.spawn(async move |cx| {
+        let result = task.await;
+        cx.update(|cx| match result {
+            Ok(msg) => {
+                set_deploy_transfer_finished(true, msg, cx);
+            }
+            Err(err) => {
+                set_deploy_transfer_finished(false, format!("Auto-upload failed: {err}"), cx);
+            }
+        });
+    })
+    .detach();
+}
+
+pub fn init_workspace_deployment(workspace: &Workspace, cx: &mut App) {
+    let project = workspace.project().read(cx);
+    let Some(worktree) = project.visible_worktrees(cx).next() else {
+        return;
+    };
+    let root = worktree.read(cx).abs_path().to_path_buf();
+    let config_path = deploy_config_path(&root);
+    let mut config = load_config_object(&config_path).unwrap_or_default();
+    if !config.contains_key("servers") {
+        if let Some(imported) = load_deploy_config_for_root(&root) {
+            if let Some(obj) = imported.as_object() {
+                config = obj.clone();
+            }
+        }
+    }
+
+    let names = config
+        .get("servers")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let visible = s.get("visible").and_then(Value::as_bool).unwrap_or(true);
+                    if visible {
+                        s.get("name").and_then(Value::as_str).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if names.is_empty() {
+        return;
+    }
+
+    let configured_active = config.get("active").and_then(Value::as_str).map(str::to_string);
+    let configured_default = config.get("default").and_then(Value::as_str).map(str::to_string);
+    let active = resolve_active_server(configured_active, configured_default, &names);
+
+    let auto_upload = active.as_deref().map(|name| {
+        config
+            .get("servers")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(name)))
+            .and_then(|s| s.get("upload_on_save"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }).unwrap_or(false);
+
+    cx.set_global(DeployShared {
+        servers: names,
+        active,
+        auto_upload,
+        panel: None,
+        root: Some(root),
+    });
+
+    request_reload_menus(cx);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeployOperation {
     Upload,
@@ -11964,7 +12164,37 @@ struct RemoteContextMenu {
 
 impl PhpPanel {
     pub fn init(cx: &mut App) {
-        cx.observe_new(|workspace: &mut Workspace, _, _| {
+        cx.observe_new(|workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
+            init_workspace_deployment(workspace, cx);
+
+            if let Some(window) = window {
+                let indicator = cx.new(|cx| DeployServerIndicator::new(cx));
+                workspace.status_bar().update(cx, |status_bar, cx| {
+                    status_bar.add_right_item(indicator, window, cx);
+                });
+            }
+
+            cx.subscribe_self(|_workspace, event: &workspace::Event, cx| {
+                if let workspace::Event::UserSavedItem { item, .. } = event {
+                    if let Some(item_handle) = item.upgrade() {
+                        if let Some(editor) = item_handle.act_as::<Editor>(cx) {
+                            if let Some(abs_path) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
+                                trigger_auto_upload_on_save(abs_path, cx);
+                            }
+                        }
+                    }
+                }
+            }).detach();
+
+            let project = workspace.project().clone();
+            cx.subscribe(&project, |workspace, _project, event: &project::Event, cx| {
+                if matches!(event, project::Event::WorktreeAdded(_) | project::Event::WorktreeUpdatedEntries(..)) {
+                    if !cx.has_global::<DeployShared>() || cx.global::<DeployShared>().servers.is_empty() {
+                        init_workspace_deployment(workspace, cx);
+                    }
+                }
+            }).detach();
+
             workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
                 workspace.toggle_panel_focus::<PhpPanel>(window, cx);
             });
@@ -12084,6 +12314,12 @@ impl PhpPanel {
                     }
                 }
 
+                let status_msg = format!(
+                    "Automatic Upload is now {} for '{}'",
+                    if new_auto_upload { "ENABLED" } else { "DISABLED" },
+                    active_name
+                );
+                set_deploy_transfer_finished(true, status_msg, cx);
                 request_reload_menus(cx);
             });
             workspace.register_action(|workspace, _: &OpenDataSourcesDialog, _, cx| {
@@ -12720,9 +12956,9 @@ impl PhpPanel {
                     _subscriptions: vec![subscription, workspace_subscription],
                 }
             });
-            let indicator = cx.new(|cx| DeployServerIndicator::new(cx));
-            workspace.status_bar().update(cx, |status_bar, cx| {
-                status_bar.add_right_item(indicator, window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.refresh(cx);
+                panel.ensure_remote_selected(cx);
             });
             panel
         })
@@ -25415,21 +25651,26 @@ impl Render for DeployServerIndicator {
                     .clone()
                     .or_else(|| shared.servers.first().cloned());
                 let active_name = active.unwrap_or_else(|| "no server".to_string());
+                let auto_suffix = if shared.auto_upload { " (auto)" } else { "" };
 
                 let trigger = Button::new(
                     "deploy-server-indicator",
-                    format!("ftp: {active_name}"),
+                    format!("ftp: {active_name}{auto_suffix}"),
                 )
                 .size(ButtonSize::Compact)
                 .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
                 .start_icon(
-                    Icon::new(IconName::Server)
+                    Icon::new(if shared.auto_upload { IconName::CloudDownload } else { IconName::Server })
                         .size(IconSize::XSmall)
-                        .color(Color::Muted),
+                        .color(if shared.auto_upload { Color::Accent } else { Color::Muted }),
                 )
-                .tooltip(Tooltip::text(format!("Deployment server: {active_name} (Click for menu)")));
+                .tooltip(Tooltip::text(format!(
+                    "Deployment server: {active_name} (Auto-upload: {})\nClick to switch server or actions",
+                    if shared.auto_upload { "ENABLED" } else { "DISABLED" }
+                )));
 
                 PopoverMenu::new("deploy-server-menu")
+                    .trigger(trigger)
                     .menu(|window, cx| {
                         let shared = if cx.has_global::<DeployShared>() {
                             cx.global::<DeployShared>()
@@ -25440,6 +25681,7 @@ impl Render for DeployServerIndicator {
                         let active = shared.active.clone();
                         let panel = shared.panel.clone();
                         let root = shared.root.clone();
+                        let is_auto_upload = shared.auto_upload;
                         Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                             if let Some(active_server) = active.as_ref() {
                                 let s_deploy = active_server.clone();
@@ -25494,44 +25736,36 @@ impl Render for DeployServerIndicator {
                                 menu = menu.separator();
                             }
 
+                            // Toggle Automatic Upload directly from status bar popup
+                            let auto_label = if is_auto_upload {
+                                "✓ Automatic Upload (always)"
+                            } else {
+                                "   Automatic Upload (always)"
+                            };
+                            menu = menu.item(
+                                ContextMenuEntry::new(auto_label)
+                                    .icon(IconName::CloudDownload)
+                                    .handler(move |_window, cx| {
+                                        cx.dispatch_action(&ToggleAutomaticUpload);
+                                    }),
+                            );
+
+                            menu = menu.separator();
+
+                            // Server selection list (switches default active server without opening Remote Host panel)
                             for server in servers.iter() {
                                 let is_active = active.as_deref() == Some(server.as_str());
                                 let server_name = server.clone();
-                                let menu_panel = panel.clone();
                                 let entry = ui::ContextMenuEntry::new(server.clone())
                                     .toggleable(ui::IconPosition::Start, is_active)
                                     .handler(move |_window: &mut Window, cx: &mut App| {
-                                        if let Some(panel) =
-                                            menu_panel.clone().and_then(|panel| panel.upgrade())
-                                        {
-                                            panel.update(cx, |panel, cx| {
-                                                panel.set_active_server_from_status_bar(
-                                                    Some(server_name.clone()),
-                                                    cx,
-                                                );
-                                            });
-                                        }
+                                        set_active_deployment_server(Some(server_name.clone()), cx);
                                     });
                                 menu = menu.item(entry);
                             }
                             menu = menu.separator();
-                            let clear_panel = panel.clone();
                             menu = menu.entry("<no default server>", None, move |_window, cx| {
-                                if let Some(panel) = clear_panel.clone().and_then(|panel| panel.upgrade()) {
-                                    panel.update(cx, |panel, cx| {
-                                        let root = panel.worktree_root(cx);
-                                        let servers = panel
-                                            .remote_servers
-                                            .iter()
-                                            .filter(|server| server.visible)
-                                            .cloned()
-                                            .collect::<Vec<_>>();
-                                        if let Some(root) = root {
-                                            let _ = save_deploy_config(&root, &servers, None);
-                                        }
-                                        panel.set_active_server_from_status_bar(None, cx);
-                                    });
-                                }
+                                set_active_deployment_server(None, cx);
                             });
 
                             if let Some(root) = root.clone() {
@@ -25548,7 +25782,6 @@ impl Render for DeployServerIndicator {
                         }))
                     })
                     .anchor(Anchor::BottomRight)
-                    .trigger(trigger)
                     .into_any_element()
             }
         }

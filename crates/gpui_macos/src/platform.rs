@@ -454,9 +454,8 @@ impl MacPlatform {
                             .autorelease();
                     }
 
-                    if *checked {
-                        item.setState_(NSVisualEffectState::Active);
-                    }
+                    let state: NSInteger = if *checked { 1 } else { 0 };
+                    let _: () = msg_send![item, setState: state];
                     item.setEnabled_(if *disabled { NO } else { YES });
 
                     let tag = actions.len() as NSInteger;
