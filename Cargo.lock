@@ -13265,6 +13265,7 @@ dependencies = [
  "editor",
  "file_icons",
  "futures 0.3.34",
+ "git_ui_core",
  "gpui",
  "gpui_tokio",
  "http_client",

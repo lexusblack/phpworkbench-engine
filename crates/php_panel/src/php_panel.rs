@@ -4527,7 +4527,7 @@ pub fn set_active_deployment_server(name: Option<String>, cx: &mut App) {
     request_reload_menus(cx);
 }
 
-pub fn trigger_auto_upload_on_save(abs_path: PathBuf, cx: &mut App) {
+pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEntity<Workspace>>, cx: &mut App) {
     if remote_file_banner::parse_remote_path(&abs_path).is_some() {
         return;
     }
@@ -4559,10 +4559,26 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, cx: &mut App) {
 
     let server_name = active_name.clone();
     let server_root = root.clone();
-    let start_msg = format!("uploading {} to {}…", rel_path, server_name);
+    let file_display = Path::new(&rel_path).file_name().and_then(|f| f.to_str()).unwrap_or(&rel_path);
+    let start_msg = format!("Uploading {} to {}…", file_display, server_name);
     set_deploy_transfer_started(start_msg.clone(), cx);
 
+    if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
+        ws.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::unique::<DeployNotification>(),
+                    format!("Uploading {} to {}…", rel_path, server_name),
+                )
+                .autohide(),
+                cx,
+            );
+        });
+    }
+
+    let ws_clone = workspace.clone();
     let task_server = server_name.clone();
+    let task_server2 = server_name.clone();
     let task_rel = rel_path.clone();
     let task: Task<Result<String, String>> = cx.background_spawn(async move {
         let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
@@ -4597,10 +4613,33 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, cx: &mut App) {
         let result = task.await;
         cx.update(|cx| match result {
             Ok(msg) => {
-                set_deploy_transfer_finished(true, msg, cx);
+                set_deploy_transfer_finished(true, msg.clone(), cx);
+                if let Some(ws) = ws_clone.and_then(|w| w.upgrade()) {
+                    ws.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                msg,
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    });
+                }
             }
             Err(err) => {
                 set_deploy_transfer_finished(false, format!("Auto-upload failed: {err}"), cx);
+                if let Some(ws) = ws_clone.and_then(|w| w.upgrade()) {
+                    ws.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                format!("Auto-upload to {} failed: {}", task_server2, err),
+                            ),
+                            cx,
+                        );
+                    });
+                }
             }
         });
     })
@@ -4806,7 +4845,7 @@ impl ChooseServerModal {
                         }
                     }
                     DeployOperation::Compare => {
-                        execute_deploy_compare(workspace, window, root, server_name, rel_path, cx);
+                        execute_deploy_compare(workspace, window, root, server_name, abs_path, rel_path, cx);
                     }
                     DeployOperation::Sync => {
                         execute_deploy_sync(workspace, root, server_name, cx);
@@ -5469,6 +5508,7 @@ pub fn execute_deploy_compare(
     window: &mut Window,
     root: PathBuf,
     server: String,
+    abs_path: Option<String>,
     rel_path: String,
     cx: &mut Context<Workspace>,
 ) {
@@ -5483,6 +5523,10 @@ pub fn execute_deploy_compare(
         );
         return;
     }
+
+    let local_abs = abs_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(rel_path.trim_start_matches('/')));
 
     let file_name = Path::new(&rel_path)
         .file_name()
@@ -5503,6 +5547,7 @@ pub fn execute_deploy_compare(
         .join(rel_path.trim_start_matches('/'));
 
     let s_clone = server.clone();
+    let s_clone2 = server.clone();
     let r_clone = rel_path.clone();
     let pristine = pristine_path.clone();
     let root_clone = root.clone();
@@ -5560,7 +5605,31 @@ pub fn execute_deploy_compare(
 
         workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.split_abs_path(pristine_path, true, window, cx).detach_and_log_err(cx);
+                let is_identical = match (std::fs::read(&local_abs), std::fs::read(&pristine_path)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+
+                if is_identical {
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<DeployNotification>(),
+                            format!("Contents are identical to deployed version on {}", s_clone2),
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                }
+
+                git_ui_core::file_diff_view::FileDiffView::open(
+                    local_abs,
+                    pristine_path,
+                    None,
+                    workspace.weak_handle(),
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
             })
             .log_err();
     })
@@ -12447,13 +12516,20 @@ impl PhpPanel {
                 });
             }
 
-            cx.subscribe_self(|_workspace, event: &workspace::Event, cx| {
+            let ws_weak = workspace.weak_handle();
+            cx.subscribe_self(move |workspace, event: &workspace::Event, cx| {
                 if let workspace::Event::UserSavedItem { item, .. } = event {
                     if let Some(item_handle) = item.upgrade() {
-                        if let Some(editor) = item_handle.act_as::<Editor>(cx) {
-                            if let Some(abs_path) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
-                                trigger_auto_upload_on_save(abs_path, cx);
-                            }
+                        let abs_path = if let Some(editor) = item_handle.act_as::<Editor>(cx) {
+                            editor.update(cx, |editor, cx| editor.target_file_abs_path(cx))
+                        } else if let Some(project_path) = item_handle.project_path(cx) {
+                            let project = workspace.project().read(cx);
+                            project.absolute_path(&project_path, cx)
+                        } else {
+                            None
+                        };
+                        if let Some(abs_path) = abs_path {
+                            trigger_auto_upload_on_save(abs_path, Some(ws_weak.clone()), cx);
                         }
                     }
                 }
@@ -12934,7 +13010,7 @@ impl PhpPanel {
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
 
                 if let Some(server) = action.server.clone() {
-                    execute_deploy_compare(workspace, window, root, server, rel_path, cx);
+                    execute_deploy_compare(workspace, window, root, server, abs_path, rel_path, cx);
                 } else {
                     let servers = load_deploy_servers(&root);
                     if servers.is_empty() {
