@@ -14,7 +14,7 @@ use crate::{
     EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
     HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
     MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
+    SelectionDragState, SizingBehavior, SoftWrap, ScrollbarHoverPreview, SelectionEffects, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     cursor_animation::{CursorViewport, LogicalCursorPosition, animated_corners_overlap_target},
@@ -33,7 +33,7 @@ use crate::{
     },
     inlay_hint_settings,
     scroll::{
-        ActiveScrollbarState, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
+        ActiveScrollbarState, Autoscroll, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
         scroll_amount::ScrollAmount,
     },
 };
@@ -46,7 +46,7 @@ use gpui::{
     Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Edges,
     Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     ParentElement, Pixels, ScaledPixels, ScrollHandle, ShapedLine, SharedString, Size,
     StatefulInteractiveElement, Style, Styled, StyledText, TaskExt, TextAlign, TextRun,
     TextStyleRefinement, UnderlineStyle, WeakEntity, Window, div, fill, outline, pattern_slash,
@@ -2379,6 +2379,278 @@ impl EditorElement {
         });
 
         window.defer_draw(element, origin, 2, None);
+    }
+
+    fn layout_scrollbar_hover_preview(
+        &self,
+        snapshot: &EditorSnapshot,
+        text_hitbox: &Hitbox,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(preview) = self.editor.read(cx).scrollbar_hover_preview else {
+            return;
+        };
+
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let max_point = buffer_snapshot.max_point();
+        if max_point.row == 0 && buffer_snapshot.line_len(MultiBufferRow(0)) == 0 {
+            return;
+        }
+
+        let center_point = DisplayPoint::new(preview.display_row, 0).to_point(&snapshot.display_snapshot);
+        let mut center_row = center_point.row.min(max_point.row);
+
+        // Check if there is an error/warning diagnostic within ±2 rows, and snap to it
+        let search_start = Point::new(center_row.saturating_sub(2), 0);
+        let search_end = Point::new((center_row + 2).min(max_point.row), u32::MAX);
+        let nearby_diagnostics: Vec<_> = buffer_snapshot
+            .diagnostics_in_range::<Point>(search_start..search_end)
+            .collect();
+
+        if let Some(best_diag) = nearby_diagnostics
+            .iter()
+            .min_by_key(|d| d.diagnostic.severity)
+        {
+            center_row = best_diag.range.start.row.min(max_point.row);
+        }
+
+        // Window of ~10 lines around center_row (4 before, 5 after)
+        let mut start_row = center_row.saturating_sub(4);
+        let end_row = (center_row + 5).min(max_point.row);
+        if end_row.saturating_sub(start_row) < 9 && start_row > 0 {
+            start_row = start_row.saturating_sub(9 - (end_row - start_row));
+        }
+
+        let start_point = Point::new(start_row, 0);
+        let end_line_len = buffer_snapshot.line_len(MultiBufferRow(end_row));
+        let end_point = Point::new(end_row, end_line_len);
+
+        let diagnostics: Vec<_> = buffer_snapshot
+            .diagnostics_in_range::<Point>(start_point..end_point)
+            .collect();
+
+        let primary_diagnostic = diagnostics
+            .iter()
+            .filter(|d| (d.range.start.row..=d.range.end.row).contains(&center_row))
+            .min_by_key(|d| d.diagnostic.severity)
+            .or_else(|| {
+                diagnostics
+                    .iter()
+                    .min_by_key(|d| d.diagnostic.severity)
+            });
+
+        let theme = cx.theme();
+        let buffer_font = theme_settings::ThemeSettings::get_global(cx).buffer_font.clone();
+
+        let diagnostic_header = primary_diagnostic.map(|diag| {
+            let (badge_bg, badge_border, badge_color, icon_name) = match diag.diagnostic.severity {
+                lsp::DiagnosticSeverity::ERROR => (
+                    theme.status().error.opacity(0.12),
+                    theme.status().error.opacity(0.35),
+                    theme.status().error,
+                    IconName::Warning,
+                ),
+                lsp::DiagnosticSeverity::WARNING => (
+                    theme.status().warning.opacity(0.12),
+                    theme.status().warning.opacity(0.35),
+                    theme.status().warning,
+                    IconName::Warning,
+                ),
+                _ => (
+                    theme.status().info.opacity(0.12),
+                    theme.status().info.opacity(0.35),
+                    theme.status().info,
+                    IconName::Info,
+                ),
+            };
+
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .items_center()
+                .bg(badge_bg)
+                .border_b_1()
+                .border_color(badge_border)
+                .child(
+                    Icon::new(icon_name)
+                        .size(IconSize::XSmall)
+                        .color(Color::Custom(badge_color))
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(badge_color)
+                        .font_weight(FontWeight::MEDIUM)
+                        .overflow_x_hidden()
+                        .whitespace_nowrap()
+                        .child(diag.diagnostic.message.as_str().to_string())
+                )
+        });
+
+        let mut lines_col = v_flex().w_full().py_0p5();
+
+        for row in start_row..=end_row {
+            let line_len = buffer_snapshot.line_len(MultiBufferRow(row));
+            let line_range = Point::new(row, 0)..Point::new(row, line_len);
+
+            let has_error = diagnostics.iter().any(|d| {
+                (d.range.start.row..=d.range.end.row).contains(&row)
+                    && d.diagnostic.severity == lsp::DiagnosticSeverity::ERROR
+            });
+            let has_warning = !has_error && diagnostics.iter().any(|d| {
+                (d.range.start.row..=d.range.end.row).contains(&row)
+                    && d.diagnostic.severity == lsp::DiagnosticSeverity::WARNING
+            });
+
+            let is_center = row == center_row;
+
+            let line_bg = if has_error {
+                theme.status().error.opacity(0.15)
+            } else if has_warning {
+                theme.status().warning.opacity(0.12)
+            } else if is_center {
+                theme.colors().element_hover.opacity(0.6)
+            } else {
+                gpui::transparent_black()
+            };
+
+            let line_num_color = if has_error {
+                theme.status().error
+            } else if has_warning {
+                theme.status().warning
+            } else if is_center {
+                theme.colors().text
+            } else {
+                theme.colors().text_muted.opacity(0.6)
+            };
+
+            let chunks = buffer_snapshot.chunks(
+                line_range,
+                LanguageAwareStyling {
+                    tree_sitter: true,
+                    diagnostics: false,
+                },
+            );
+
+            let mut code_flex = h_flex().gap_0().whitespace_nowrap().overflow_x_hidden();
+            let mut has_text = false;
+
+            for chunk in chunks {
+                if chunk.text.is_empty() {
+                    continue;
+                }
+                has_text = true;
+                let color = chunk
+                    .highlight_style
+                    .and_then(|s| s.color)
+                    .or_else(|| {
+                        chunk
+                            .syntax_highlight_id
+                            .and_then(|id| theme.syntax().get(id))
+                            .and_then(|s| s.color)
+                    })
+                    .unwrap_or(theme.colors().text);
+
+                let clean_text = if chunk.text.contains('\t') {
+                    chunk.text.replace('\t', "    ")
+                } else {
+                    chunk.text.to_string()
+                };
+
+                code_flex = code_flex.child(
+                    div()
+                        .text_color(color)
+                        .child(clean_text)
+                );
+            }
+
+            if !has_text {
+                code_flex = code_flex.child(div().child(" "));
+            }
+
+            let line_row = h_flex()
+                .w_full()
+                .h(px(18.0))
+                .items_center()
+                .bg(line_bg)
+                .child(
+                    h_flex()
+                        .w(px(40.0))
+                        .h_full()
+                        .items_center()
+                        .justify_end()
+                        .pr_2()
+                        .border_r_1()
+                        .border_color(theme.colors().border_variant.opacity(0.3))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font(buffer_font.clone())
+                                .text_color(line_num_color)
+                                .child(format!("{}", row + 1))
+                        )
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .pl_2()
+                        .pr_2()
+                        .overflow_x_hidden()
+                        .font(buffer_font.clone())
+                        .text_xs()
+                        .child(code_flex)
+                );
+
+            lines_col = lines_col.child(line_row);
+        }
+
+        let editor = self.editor.clone();
+        let preview_width = px(520.0).min(text_hitbox.size.width - px(32.0));
+
+        let popover = div()
+            .id("scrollbar_lens_preview")
+            .occlude()
+            .w(preview_width)
+            .bg(theme.colors().elevated_surface_background)
+            .border_1()
+            .border_color(theme.colors().border)
+            .rounded_md()
+            .shadow_xl()
+            .overflow_hidden()
+            .cursor_pointer()
+            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let point = Point::new(center_row, 0);
+                    editor.change_selections(SelectionEffects::scroll(Autoscroll::center()), window, cx, |s| {
+                        s.select_ranges([point..point]);
+                    });
+                    editor.scrollbar_hover_preview = None;
+                    cx.notify();
+                });
+            })
+            .when_some(diagnostic_header, |this, header| this.child(header))
+            .child(lines_col);
+
+        let mut any_element = popover.into_any_element();
+        let size = any_element.layout_as_root(
+            AvailableSpace::min_size(),
+            window,
+            cx,
+        );
+
+        let preview_x = (preview.scrollbar_left - size.width - px(6.0)).max(text_hitbox.origin.x + px(8.0));
+        let max_y = (text_hitbox.origin.y + text_hitbox.size.height - size.height - px(8.0)).max(text_hitbox.origin.y + px(8.0));
+        let preview_y = (preview.mouse_y - size.height / 2.0).clamp(
+            text_hitbox.origin.y + px(8.0),
+            max_y,
+        );
+
+        let origin = point(preview_x, preview_y);
+        window.defer_draw(any_element, origin, 10, None);
     }
 
     fn layout_blame_entries(
@@ -6264,6 +6536,9 @@ impl EditorElement {
                         if (hitbox.origin.along(axis)..hitbox.bottom_right().along(axis))
                             .contains(&old_position)
                         {
+                            if editor.scrollbar_hover_preview.take().is_some() {
+                                cx.notify();
+                            }
                             let position = editor.scroll_position(cx).apply_along(axis, |p| {
                                 (p + ScrollOffset::from(
                                     (new_position - old_position) / *text_unit_size,
@@ -6287,9 +6562,32 @@ impl EditorElement {
                             editor.scroll_manager.reset_scrollbar_state(cx);
                         }
 
+                        if axis == ScrollbarAxis::Vertical {
+                            let rel_y = (event.position.y - layout.hitbox.origin.y).max(Pixels::ZERO);
+                            let display_row = if layout.text_unit_size > Pixels::ZERO {
+                                DisplayRow((rel_y / layout.text_unit_size).round() as u32)
+                            } else {
+                                DisplayRow(0)
+                            };
+                            let preview = ScrollbarHoverPreview {
+                                display_row,
+                                mouse_y: event.position.y,
+                                scrollbar_left: layout.hitbox.origin.x,
+                            };
+                            if editor.scrollbar_hover_preview != Some(preview) {
+                                editor.scrollbar_hover_preview = Some(preview);
+                                cx.notify();
+                            }
+                        } else if editor.scrollbar_hover_preview.take().is_some() {
+                            cx.notify();
+                        }
+
                         editor.scroll_manager.show_scrollbars(window, cx);
                     } else {
                         editor.scroll_manager.reset_scrollbar_state(cx);
+                        if editor.scrollbar_hover_preview.take().is_some() {
+                            cx.notify();
+                        }
                     }
 
                     mouse_position = event.position;
@@ -6343,6 +6641,9 @@ impl EditorElement {
                     };
 
                     editor.update(cx, |editor, cx| {
+                        if editor.scrollbar_hover_preview.take().is_some() {
+                            cx.notify();
+                        }
                         editor
                             .scroll_manager
                             .set_dragged_scroll_thumb_axis(axis, cx);
@@ -6373,6 +6674,20 @@ impl EditorElement {
                 }
             });
         }
+
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |_: &MouseExitEvent, phase, _window, cx| {
+                if phase == DispatchPhase::Capture {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    if editor.scrollbar_hover_preview.take().is_some() {
+                        cx.notify();
+                    }
+                });
+            }
+        });
     }
 
     fn collect_fast_scrollbar_markers(
@@ -9857,6 +10172,7 @@ impl Element for EditorElement {
 
                         self.layout_blame_popover(&snapshot, &hitbox, line_height, window, cx);
                         self.layout_color_picker(&snapshot, &hitbox, line_height, window, cx);
+                        self.layout_scrollbar_hover_preview(&snapshot, &hitbox, window, cx);
                     }
 
                     let mouse_context_menu = self.layout_mouse_context_menu(

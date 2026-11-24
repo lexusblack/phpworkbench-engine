@@ -929,6 +929,13 @@ struct GutterHoverButton {
     is_active: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarHoverPreview {
+    pub display_row: DisplayRow,
+    pub mouse_y: Pixels,
+    pub scrollbar_left: Pixels,
+}
+
 enum CodeActionsForSelection {
     None,
     Fetching(Shared<Task<Option<ActionFetchReady>>>),
@@ -1053,6 +1060,7 @@ pub struct Editor {
     context_menu_options: Option<ContextMenuOptions>,
     mouse_context_menu: Option<MouseContextMenu>,
     completion_tasks: Vec<(CompletionId, Task<()>)>,
+    pub(crate) scrollbar_hover_preview: Option<ScrollbarHoverPreview>,
     inline_blame_popover: Option<InlineBlamePopover>,
     inline_blame_popover_show_task: Option<Task<()>>,
     pub(crate) active_color_picker: Option<color_picker::ColorPickerState>,
@@ -2445,6 +2453,7 @@ impl Editor {
             context_menu_options: None,
             mouse_context_menu: None,
             completion_tasks: Vec::new(),
+            scrollbar_hover_preview: None,
             inline_blame_popover: None,
             inline_blame_popover_show_task: None,
             active_color_picker: None,
