@@ -1204,6 +1204,27 @@ impl ProjectPanel {
             let deploy_file_rel = entry.path.to_string().replace('\\', "/");
             let has_git_changes = !is_dir && self.has_git_changes(entry_id);
 
+            let effective_selections = self.disjoint_effective_entries_excluding_roots(cx);
+            let project = self.project.read(cx);
+            let mut batch_deploy_files: Vec<(String, String)> = Vec::new();
+            if effective_selections.len() > 1 {
+                for selection in &effective_selections {
+                    if let Some(worktree) = project.worktree_for_id(selection.worktree_id, cx) {
+                        let worktree = worktree.read(cx);
+                        if let Some(entry) = worktree.entry_for_id(selection.entry_id) {
+                            let abs = worktree.abs_path().join(entry.path.as_ref()).to_string_lossy().replace('\\', "/");
+                            let rel = entry.path.to_string().replace('\\', "/");
+                            batch_deploy_files.push((abs, rel));
+                        }
+                    }
+                }
+            }
+            let panel_batch_paths = if batch_deploy_files.len() > 1 {
+                Some(batch_deploy_files)
+            } else {
+                None
+            };
+
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
@@ -1345,6 +1366,8 @@ impl ProjectPanel {
                                 let abs = deploy_file_abs.clone();
                                 let rel = deploy_file_rel.clone();
                                 let srv = active_deploy_server.clone();
+                                let b_paths = panel_batch_paths.clone();
+                                let is_multiple = b_paths.is_some();
                                 let mut sub = menu
                                     .action(
                                         format!("Upload to {s_label}"),
@@ -1352,6 +1375,7 @@ impl ProjectPanel {
                                             abs_path: Some(abs.clone()),
                                             rel_path: Some(rel.clone()),
                                             server: srv.clone(),
+                                            paths: b_paths.clone(),
                                         }),
                                     )
                                     .action(
@@ -1360,6 +1384,7 @@ impl ProjectPanel {
                                             abs_path: Some(abs.clone()),
                                             rel_path: Some(rel.clone()),
                                             server: None,
+                                            paths: b_paths.clone(),
                                         }),
                                     )
                                     .action(
@@ -1368,6 +1393,7 @@ impl ProjectPanel {
                                             abs_path: Some(abs.clone()),
                                             rel_path: Some(rel.clone()),
                                             server: srv.clone(),
+                                            paths: b_paths.clone(),
                                         }),
                                     )
                                     .action(
@@ -1376,9 +1402,10 @@ impl ProjectPanel {
                                             abs_path: Some(abs.clone()),
                                             rel_path: Some(rel.clone()),
                                             server: None,
+                                            paths: b_paths.clone(),
                                         }),
                                     );
-                                if !is_dir {
+                                if !is_dir && !is_multiple {
                                     sub = sub
                                         .action(
                                             format!("Compare with Deployed Version on {s_label}"),
@@ -1397,21 +1424,23 @@ impl ProjectPanel {
                                             }),
                                         );
                                 }
-                                sub = sub
-                                    .action(
-                                        format!("Sync with Deployed to {s_label}..."),
-                                        Box::new(php_panel::SyncWithDeployServer {
-                                            rel_path: Some(rel.clone()),
-                                            server: srv.clone(),
-                                        }),
-                                    )
-                                    .action(
-                                        "Sync with Deployed To...",
-                                        Box::new(php_panel::SyncWithDeployServer {
-                                            rel_path: Some(rel.clone()),
-                                            server: None,
-                                        }),
-                                    );
+                                if !is_multiple {
+                                    sub = sub
+                                        .action(
+                                            format!("Sync with Deployed to {s_label}..."),
+                                            Box::new(php_panel::SyncWithDeployServer {
+                                                rel_path: Some(rel.clone()),
+                                                server: srv.clone(),
+                                            }),
+                                        )
+                                        .action(
+                                            "Sync with Deployed To...",
+                                            Box::new(php_panel::SyncWithDeployServer {
+                                                rel_path: Some(rel.clone()),
+                                                server: None,
+                                            }),
+                                        );
+                                }
                                 if !has_deploy_servers {
                                     sub = sub.separator().action(
                                         "Configuration…",

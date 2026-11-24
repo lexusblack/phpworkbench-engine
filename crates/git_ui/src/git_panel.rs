@@ -9425,19 +9425,100 @@ impl GitPanel {
         let focus_handle = self.focus_handle.clone();
 
         let entries = self.effective_status_entries();
-        let target_entry = entries.first();
         let repo = self.active_repository.as_ref().map(|r| r.read(cx));
         let work_dir = repo.as_ref().map(|r| r.work_directory_abs_path.clone());
-        let (deploy_file_abs, deploy_file_rel, is_dir) =
-            if let (Some(work_dir), Some(entry)) = (work_dir.as_ref(), target_entry) {
-                let abs = work_dir.join(entry.repo_path.as_std_path());
-                let is_d = abs.is_dir();
-                let abs_str = abs.to_string_lossy().replace('\\', "/");
-                let rel_str = entry.repo_path.as_std_path().to_string_lossy().replace('\\', "/");
-                (Some(abs_str), Some(rel_str), is_d)
+
+        // Batch detection:
+        // 1. If multiple files are selected (via Shift or Cmd), `entries.len() > 1`.
+        // 2. If checkboxes are used to stage/check multiple files (as in the Commit tool window):
+        //    gather all checked entries in the list.
+        let deploy_entries: Vec<GitStatusEntry> = if entries.len() > 1 {
+            entries
+        } else {
+            let checked_entries: Vec<GitStatusEntry> = if let Some(repo) = repo.as_ref() {
+                self.entries
+                    .iter()
+                    .filter_map(|e| e.status_entry())
+                    .filter(|status_entry| {
+                        let repo_path = &status_entry.repo_path;
+                        repo.pending_ops_for_path(repo_path)
+                            .map(|ops| !ops.last_op_errored() && (ops.staging() || ops.staged()))
+                            .or_else(|| {
+                                repo.status_for_path(repo_path)
+                                    .and_then(|status| status.status.staging().as_bool())
+                            })
+                            .or_else(|| status_entry.staging.as_bool())
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .unique_by(|e| e.repo_path.clone())
+                    .collect()
             } else {
-                (None, None, false)
+                Vec::new()
             };
+
+            if checked_entries.len() > 1
+                && (entries.is_empty()
+                    || entries
+                        .first()
+                        .is_some_and(|target| checked_entries.iter().any(|c| c.repo_path == target.repo_path)))
+            {
+                checked_entries
+            } else if entries.is_empty() {
+                // If clicked on a section header (e.g. Tracked, Changes):
+                let header_section = self
+                    .selected_entry
+                    .and_then(|ix| self.entries.get(ix))
+                    .and_then(|e| match e {
+                        GitListEntry::Header(h) => Some(h.clone()),
+                        _ => None,
+                    });
+                if let (Some(header), Some(repo)) = (header_section, repo.as_ref()) {
+                    self.entries
+                        .iter()
+                        .filter_map(|e| e.status_entry())
+                        .filter(|s| header.contains(s, repo))
+                        .cloned()
+                        .unique_by(|e| e.repo_path.clone())
+                        .collect()
+                } else {
+                    entries
+                }
+            } else {
+                entries
+            }
+        };
+
+        let deploy_files: Vec<(String, String)> = if let Some(work_dir) = work_dir.as_ref() {
+            deploy_entries
+                .iter()
+                .map(|entry| {
+                    let abs = work_dir.join(entry.repo_path.as_std_path());
+                    let abs_str = abs.to_string_lossy().replace('\\', "/");
+                    let rel_str = entry.repo_path.as_std_path().to_string_lossy().replace('\\', "/");
+                    (abs_str, rel_str)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let multiple_deploy = deploy_files.len() > 1;
+        let batch_paths = if multiple_deploy {
+            Some(deploy_files.clone())
+        } else {
+            None
+        };
+        let (deploy_file_abs, deploy_file_rel, is_dir) = if let Some(first) = deploy_files.first() {
+            let is_d = if let Some(work_dir) = work_dir.as_ref() {
+                work_dir.join(&first.1).is_dir()
+            } else {
+                false
+            };
+            (Some(first.0.clone()), Some(first.1.clone()), is_d)
+        } else {
+            (None, None, false)
+        };
 
         let (active_deploy_server, has_deploy_servers) = if cx.has_global::<php_panel::DeployShared>() {
             let shared = cx.global::<php_panel::DeployShared>();
@@ -9489,16 +9570,18 @@ impl GitPanel {
             let abs = deploy_file_abs.clone();
             let rel = deploy_file_rel.clone();
             let srv = active_deploy_server.clone();
+            let b_paths = batch_paths.clone();
 
             menu = menu.submenu("Deployment", move |sub, _, _| {
                 let mut sub = sub
                     .action_disabled_when(
-                        !has_deploy_servers || abs.is_none(),
+                        !has_deploy_servers || (abs.is_none() && b_paths.is_none()),
                         format!("Upload to {s_label}"),
                         Box::new(php_panel::UploadToDeployServer {
                             abs_path: abs.clone(),
                             rel_path: rel.clone(),
                             server: srv.clone(),
+                            paths: b_paths.clone(),
                         }),
                     )
                     .action_disabled_when(
@@ -9508,15 +9591,17 @@ impl GitPanel {
                             abs_path: abs.clone(),
                             rel_path: rel.clone(),
                             server: None,
+                            paths: b_paths.clone(),
                         }),
                     )
                     .action_disabled_when(
-                        !has_deploy_servers || abs.is_none(),
+                        !has_deploy_servers || (abs.is_none() && b_paths.is_none()),
                         format!("Download from {s_label}"),
                         Box::new(php_panel::DownloadFromDeployServer {
                             abs_path: abs.clone(),
                             rel_path: rel.clone(),
                             server: srv.clone(),
+                            paths: b_paths.clone(),
                         }),
                     )
                     .action_disabled_when(
@@ -9526,9 +9611,10 @@ impl GitPanel {
                             abs_path: abs.clone(),
                             rel_path: rel.clone(),
                             server: None,
+                            paths: b_paths.clone(),
                         }),
                     );
-                if !is_dir {
+                if !is_dir && !multiple_deploy {
                     sub = sub
                         .action_disabled_when(
                             !has_deploy_servers || abs.is_none(),
@@ -9549,23 +9635,25 @@ impl GitPanel {
                             }),
                         );
                 }
-                sub = sub
-                    .action_disabled_when(
-                        !has_deploy_servers || rel.is_none(),
-                        format!("Sync with Deployed to {s_label}..."),
-                        Box::new(php_panel::SyncWithDeployServer {
-                            rel_path: rel.clone(),
-                            server: srv.clone(),
-                        }),
-                    )
-                    .action_disabled_when(
-                        !has_deploy_servers || rel.is_none(),
-                        "Sync with Deployed To...",
-                        Box::new(php_panel::SyncWithDeployServer {
-                            rel_path: rel.clone(),
-                            server: None,
-                        }),
-                    );
+                if !multiple_deploy {
+                    sub = sub
+                        .action_disabled_when(
+                            !has_deploy_servers || rel.is_none(),
+                            format!("Sync with Deployed to {s_label}..."),
+                            Box::new(php_panel::SyncWithDeployServer {
+                                rel_path: rel.clone(),
+                                server: srv.clone(),
+                            }),
+                        )
+                        .action_disabled_when(
+                            !has_deploy_servers || rel.is_none(),
+                            "Sync with Deployed To...",
+                            Box::new(php_panel::SyncWithDeployServer {
+                                rel_path: rel.clone(),
+                                server: None,
+                            }),
+                        );
+                }
                 if !has_deploy_servers {
                     sub = sub.separator().action(
                         "Configuration…",

@@ -184,6 +184,8 @@ pub struct UploadToDeployServer {
     pub rel_path: Option<String>,
     #[serde(default)]
     pub server: Option<String>,
+    #[serde(default)]
+    pub paths: Option<Vec<(String, String)>>,
 }
 
 /// Downloads a file, directory, or project from the target deployment server.
@@ -197,6 +199,8 @@ pub struct DownloadFromDeployServer {
     pub rel_path: Option<String>,
     #[serde(default)]
     pub server: Option<String>,
+    #[serde(default)]
+    pub paths: Option<Vec<(String, String)>>,
 }
 
 /// Compares a local file with the deployed version on the target deployment server.
@@ -4697,6 +4701,7 @@ pub struct ChooseServerModal {
     root: PathBuf,
     abs_path: Option<String>,
     rel_path: String,
+    paths: Option<Vec<(String, String)>>,
     servers: Vec<RemoteServer>,
     selected_index: usize,
     focus_handle: FocusHandle,
@@ -4722,6 +4727,30 @@ impl ChooseServerModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_paths(
+            workspace,
+            operation,
+            root,
+            abs_path,
+            rel_path,
+            None,
+            servers,
+            window,
+            cx,
+        )
+    }
+
+    pub fn with_paths(
+        workspace: WeakEntity<Workspace>,
+        operation: DeployOperation,
+        root: PathBuf,
+        abs_path: Option<String>,
+        rel_path: String,
+        paths: Option<Vec<(String, String)>>,
+        servers: Vec<RemoteServer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
@@ -4741,6 +4770,7 @@ impl ChooseServerModal {
             root,
             abs_path,
             rel_path,
+            paths,
             servers,
             selected_index,
             focus_handle,
@@ -4753,6 +4783,7 @@ impl ChooseServerModal {
             let root = self.root.clone();
             let abs_path = self.abs_path.clone();
             let rel_path = self.rel_path.clone();
+            let paths = self.paths.clone();
             let operation = self.operation;
             let workspace = self.workspace.clone();
 
@@ -4761,10 +4792,18 @@ impl ChooseServerModal {
             workspace
                 .update_in(cx, |workspace, window, cx| match operation {
                     DeployOperation::Upload => {
-                        execute_deploy_upload(workspace, root, server_name, abs_path, rel_path, cx);
+                        if let Some(files) = paths.filter(|p| p.len() > 1) {
+                            execute_deploy_batch_upload(workspace, root, server_name, files, cx);
+                        } else {
+                            execute_deploy_upload(workspace, root, server_name, abs_path, rel_path, cx);
+                        }
                     }
                     DeployOperation::Download => {
-                        execute_deploy_download(workspace, root, server_name, abs_path, rel_path, cx);
+                        if let Some(files) = paths.filter(|p| p.len() > 1) {
+                            execute_deploy_batch_download(workspace, root, server_name, files, cx);
+                        } else {
+                            execute_deploy_download(workspace, root, server_name, abs_path, rel_path, cx);
+                        }
                     }
                     DeployOperation::Compare => {
                         execute_deploy_compare(workspace, window, root, server_name, rel_path, cx);
@@ -4780,7 +4819,15 @@ impl ChooseServerModal {
 
 impl Render for ChooseServerModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.operation.title();
+        let title = if let Some(files) = self.paths.as_ref().filter(|p| p.len() > 1) {
+            match self.operation {
+                DeployOperation::Upload => format!("Upload {} files To...", files.len()),
+                DeployOperation::Download => format!("Download {} files from...", files.len()),
+                _ => self.operation.title().to_string(),
+            }
+        } else {
+            self.operation.title().to_string()
+        };
         let selected_idx = self.selected_index;
 
         v_flex()
@@ -5141,6 +5188,232 @@ pub fn execute_deploy_download(
         } else {
             let err = String::from_utf8_lossy(&output.stderr);
             Err(err.trim().to_string())
+        }
+    });
+
+    cx.spawn(async move |workspace, cx| {
+        let result = task.await;
+        workspace
+            .update(cx, |workspace, cx| {
+                match &result {
+                    Ok(msg) => {
+                        set_deploy_transfer_finished(true, msg.clone(), cx);
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                msg.clone(),
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        set_deploy_transfer_finished(false, format!("Download failed: {err}"), cx);
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                format!("Download from {} failed: {}", server_name, err),
+                            ),
+                            cx,
+                        );
+                    }
+                }
+
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| {
+                                match result {
+                                    Ok(msg) => panel.saved_message = Some(msg),
+                                    Err(err) => panel.saved_message = Some(format!("download error: {err}")),
+                                }
+                                cx.notify();
+                            })
+                            .log_err();
+                    }
+                }
+            })
+            .log_err();
+    })
+    .detach();
+}
+
+pub fn execute_deploy_batch_upload(
+    workspace: &mut Workspace,
+    root: PathBuf,
+    server: String,
+    files: Vec<(String, String)>,
+    cx: &mut Context<Workspace>,
+) {
+    let count = files.len();
+    if count == 0 {
+        return;
+    }
+    let server_clone = server.clone();
+    let server_name = server.clone();
+    let root_clone = root.clone();
+
+    set_deploy_transfer_started(format!("Uploading {} file(s) to {}…", count, server), cx);
+
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::unique::<DeployNotification>(),
+            format!("Uploading {} file(s) to {}…", count, server),
+        )
+        .autohide(),
+        cx,
+    );
+
+    let task: Task<Result<String, String>> = cx.background_spawn(async move {
+        let mut uploaded = 0;
+        let mut errors = Vec::new();
+        for (abs, rel) in files {
+            let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+            cmd.current_dir(&root_clone)
+                .arg("upload")
+                .arg("--server")
+                .arg(&server_clone)
+                .arg("--path")
+                .arg(&rel)
+                .arg("--from")
+                .arg(&abs);
+            match cmd.output() {
+                Ok(out) if out.status.success() => uploaded += 1,
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let err_display = if err.is_empty() {
+                        String::from_utf8_lossy(&out.stdout).trim().to_string()
+                    } else {
+                        err
+                    };
+                    errors.push(format!("{rel}: {err_display}"));
+                }
+                Err(e) => errors.push(format!("{rel}: {e}")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(format!("Uploaded {} file(s) to {}", uploaded, server_clone))
+        } else {
+            Err(format!(
+                "Uploaded {}/{} file(s) to {}, errors: {}",
+                uploaded,
+                count,
+                server_clone,
+                errors.join("; ")
+            ))
+        }
+    });
+
+    cx.spawn(async move |workspace, cx| {
+        let result = task.await;
+        workspace
+            .update(cx, |workspace, cx| {
+                match &result {
+                    Ok(msg) => {
+                        set_deploy_transfer_finished(true, msg.clone(), cx);
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                msg.clone(),
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        set_deploy_transfer_finished(false, format!("Upload failed: {err}"), cx);
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                format!("Upload to {} failed: {}", server_name, err),
+                            ),
+                            cx,
+                        );
+                    }
+                }
+
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| {
+                                match result {
+                                    Ok(msg) => panel.saved_message = Some(msg),
+                                    Err(err) => panel.saved_message = Some(format!("upload error: {err}")),
+                                }
+                                cx.notify();
+                            })
+                            .log_err();
+                    }
+                }
+            })
+            .log_err();
+    })
+    .detach();
+}
+
+pub fn execute_deploy_batch_download(
+    workspace: &mut Workspace,
+    root: PathBuf,
+    server: String,
+    files: Vec<(String, String)>,
+    cx: &mut Context<Workspace>,
+) {
+    let count = files.len();
+    if count == 0 {
+        return;
+    }
+    let server_clone = server.clone();
+    let server_name = server.clone();
+    let root_clone = root.clone();
+
+    set_deploy_transfer_started(format!("Downloading {} file(s) from {}…", count, server), cx);
+
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::unique::<DeployNotification>(),
+            format!("Downloading {} file(s) from {}…", count, server),
+        )
+        .autohide(),
+        cx,
+    );
+
+    let task: Task<Result<String, String>> = cx.background_spawn(async move {
+        let mut downloaded = 0;
+        let mut errors = Vec::new();
+        for (abs, rel) in files {
+            let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
+            cmd.current_dir(&root_clone)
+                .arg("download")
+                .arg("--server")
+                .arg(&server_clone)
+                .arg("--path")
+                .arg(&rel)
+                .arg("--to")
+                .arg(&abs);
+            match cmd.output() {
+                Ok(out) if out.status.success() => downloaded += 1,
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let err_display = if err.is_empty() {
+                        String::from_utf8_lossy(&out.stdout).trim().to_string()
+                    } else {
+                        err
+                    };
+                    errors.push(format!("{rel}: {err_display}"));
+                }
+                Err(e) => errors.push(format!("{rel}: {e}")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(format!("Downloaded {} file(s) from {}", downloaded, server_clone))
+        } else {
+            Err(format!(
+                "Downloaded {}/{} file(s) from {}, errors: {}",
+                downloaded,
+                count,
+                server_clone,
+                errors.join("; ")
+            ))
         }
     });
 
@@ -12492,6 +12765,61 @@ impl PhpPanel {
             workspace.register_action(|workspace, action: &UploadToDeployServer, window, cx| {
                 let root = resolve_deploy_root(workspace, cx);
                 let Some(root) = root else { return; };
+
+                if let Some(files) = action.paths.clone().filter(|p| !p.is_empty()) {
+                    if files.len() > 1 {
+                        if let Some(server) = action.server.clone() {
+                            execute_deploy_batch_upload(workspace, root, server, files, cx);
+                        } else {
+                            let servers = load_deploy_servers(&root);
+                            if servers.is_empty() {
+                                open_deployment_window(root, cx);
+                                return;
+                            }
+                            let workspace_handle = workspace.weak_handle();
+                            workspace.toggle_modal(window, cx, move |window, cx| {
+                                ChooseServerModal::with_paths(
+                                    workspace_handle,
+                                    DeployOperation::Upload,
+                                    root,
+                                    None,
+                                    String::new(),
+                                    Some(files),
+                                    servers,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                        return;
+                    } else if let Some((abs, rel)) = files.into_iter().next() {
+                        let (abs_path, rel_path) = (Some(abs), rel);
+                        if let Some(server) = action.server.clone() {
+                            execute_deploy_upload(workspace, root, server, abs_path, rel_path, cx);
+                        } else {
+                            let servers = load_deploy_servers(&root);
+                            if servers.is_empty() {
+                                open_deployment_window(root, cx);
+                                return;
+                            }
+                            let workspace_handle = workspace.weak_handle();
+                            workspace.toggle_modal(window, cx, move |window, cx| {
+                                ChooseServerModal::new(
+                                    workspace_handle,
+                                    DeployOperation::Upload,
+                                    root,
+                                    abs_path,
+                                    rel_path,
+                                    servers,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                        return;
+                    }
+                }
+
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
 
                 if let Some(server) = action.server.clone() {
@@ -12520,6 +12848,61 @@ impl PhpPanel {
             workspace.register_action(|workspace, action: &DownloadFromDeployServer, window, cx| {
                 let root = resolve_deploy_root(workspace, cx);
                 let Some(root) = root else { return; };
+
+                if let Some(files) = action.paths.clone().filter(|p| !p.is_empty()) {
+                    if files.len() > 1 {
+                        if let Some(server) = action.server.clone() {
+                            execute_deploy_batch_download(workspace, root, server, files, cx);
+                        } else {
+                            let servers = load_deploy_servers(&root);
+                            if servers.is_empty() {
+                                open_deployment_window(root, cx);
+                                return;
+                            }
+                            let workspace_handle = workspace.weak_handle();
+                            workspace.toggle_modal(window, cx, move |window, cx| {
+                                ChooseServerModal::with_paths(
+                                    workspace_handle,
+                                    DeployOperation::Download,
+                                    root,
+                                    None,
+                                    String::new(),
+                                    Some(files),
+                                    servers,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                        return;
+                    } else if let Some((abs, rel)) = files.into_iter().next() {
+                        let (abs_path, rel_path) = (Some(abs), rel);
+                        if let Some(server) = action.server.clone() {
+                            execute_deploy_download(workspace, root, server, abs_path, rel_path, cx);
+                        } else {
+                            let servers = load_deploy_servers(&root);
+                            if servers.is_empty() {
+                                open_deployment_window(root, cx);
+                                return;
+                            }
+                            let workspace_handle = workspace.weak_handle();
+                            workspace.toggle_modal(window, cx, move |window, cx| {
+                                ChooseServerModal::new(
+                                    workspace_handle,
+                                    DeployOperation::Download,
+                                    root,
+                                    abs_path,
+                                    rel_path,
+                                    servers,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                        return;
+                    }
+                }
+
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
 
                 if let Some(server) = action.server.clone() {
