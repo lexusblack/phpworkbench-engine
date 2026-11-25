@@ -331,7 +331,7 @@ fn action_for_entry_menu_item(action_id: &str) -> Option<Box<dyn Action>> {
         ids::SHOW_DIFF_NEW_TAB => Some(menu::SecondaryConfirm.boxed_clone()),
         ids::JUMP_TO_SOURCE => Some(ViewFile.boxed_clone()),
         ids::COPY_PATH => Some(CopyPath.boxed_clone()),
-        ids::ASK_AI => Some(zed_actions::assistant::ToggleFocus.boxed_clone()),
+        ids::ASK_AI => Some(php_panel::LaunchActiveAiAgent.boxed_clone()),
         ids::DELETE => Some(DeleteFile.boxed_clone()),
         ids::ADD_TO_VCS => Some(git::StageFile.boxed_clone()),
         ids::ADD_TO_GITIGNORE => Some(git::AddToGitignore.boxed_clone()),

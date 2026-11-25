@@ -138,7 +138,9 @@ actions!(
         FocusNextDialogField,
         FocusPreviousDialogField,
         ToggleAutomaticUpload,
-        ConvertSchemaFileDialog
+        ConvertSchemaFileDialog,
+        LaunchActiveAiAgent,
+        OpenAiCliSettings
     ]
 );
 
@@ -12508,11 +12510,14 @@ impl PhpPanel {
     pub fn init(cx: &mut App) {
         cx.observe_new(|workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
             init_workspace_deployment(workspace, cx);
+            init_workspace_ai_cli(workspace, cx);
 
             if let Some(window) = window {
                 let indicator = cx.new(|cx| DeployServerIndicator::new(cx));
+                let ai_indicator = cx.new(|cx| AiCliIndicator::new(cx));
                 workspace.status_bar().update(cx, |status_bar, cx| {
                     status_bar.add_right_item(indicator, window, cx);
+                    status_bar.add_right_item(ai_indicator, window, cx);
                 });
             }
 
@@ -13285,6 +13290,16 @@ impl PhpPanel {
                         });
                     }
                 }
+            });
+            workspace.register_action(|workspace, _: &LaunchActiveAiAgent, window, cx| {
+                let root = resolve_deploy_root(workspace, cx);
+                if let Some(root) = root {
+                    launch_active_ai_agent(workspace, root, None, window, cx);
+                }
+            });
+            workspace.register_action(|workspace, _: &OpenAiCliSettings, window, cx| {
+                let root = resolve_deploy_root(workspace, cx);
+                open_ai_cli_settings(workspace, root, window, cx);
             });
         })
         .detach();
@@ -26248,6 +26263,356 @@ impl Render for DeployServerIndicator {
 }
 
 impl StatusItemView for DeployServerIndicator {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn workspace::ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _cx: &App) -> Option<workspace::HideStatusItem> {
+        None
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AI CLI Agent Integration
+// -----------------------------------------------------------------------------
+
+static AI_TASK_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AiCliConfig {
+    pub agent: String,
+    pub custom_command: Option<String>,
+    pub custom_args: Option<Vec<String>>,
+    pub send_context_flag: Option<bool>,
+}
+
+impl Default for AiCliConfig {
+    fn default() -> Self {
+        Self {
+            agent: detect_default_ai_agent(),
+            custom_command: None,
+            custom_args: None,
+            send_context_flag: Some(true),
+        }
+    }
+}
+
+pub struct AiCliShared {
+    pub agent: String,
+    pub root: Option<PathBuf>,
+}
+
+impl gpui::Global for AiCliShared {}
+
+pub fn detect_default_ai_agent() -> String {
+    let known = ["claude", "openclaw", "codex", "gemini", "aider"];
+    for agent in &known {
+        if resolve_cli_executable(agent).is_some() {
+            return agent.to_string();
+        }
+    }
+    "claude".to_string()
+}
+
+pub fn ai_agent_display_name(agent: &str) -> &'static str {
+    match agent {
+        "claude" => "Claude Code",
+        "openclaw" => "OpenClaw",
+        "codex" => "Codex CLI",
+        "gemini" => "Gemini CLI",
+        "aider" => "Aider",
+        "custom" => "Custom Agent",
+        _ => "AI Agent",
+    }
+}
+
+pub fn resolve_cli_executable(bin_name: &str) -> Option<PathBuf> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(bin_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return None;
+    }
+    let home_path = PathBuf::from(&home);
+    let common_locations = [
+        home_path.join(".local").join("bin").join(bin_name),
+        home_path.join(".cargo").join("bin").join(bin_name),
+        PathBuf::from("/opt/homebrew/bin").join(bin_name),
+        PathBuf::from("/usr/local/bin").join(bin_name),
+        home_path.join(".npm-global").join("bin").join(bin_name),
+    ];
+    for candidate in &common_locations {
+        if candidate.is_file() {
+            return Some(candidate.clone());
+        }
+    }
+
+    // Check nvm node paths: ~/.nvm/versions/node/*/bin/<bin_name>
+    let nvm_node_dir = home_path.join(".nvm").join("versions").join("node");
+    if nvm_node_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(nvm_node_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let candidate = entry.path().join("bin").join(bin_name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn load_ai_cli_config(root: &Option<PathBuf>) -> AiCliConfig {
+    if let Some(root) = root {
+        let project_file = root.join(".phpworkbench").join("ai-cli.json");
+        if project_file.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&project_file) {
+                if let Ok(cfg) = serde_json::from_str::<AiCliConfig>(&content) {
+                    return cfg;
+                }
+            }
+        }
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        let global_file = PathBuf::from(home).join(".phpworkbench").join("ai-cli.json");
+        if global_file.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&global_file) {
+                if let Ok(cfg) = serde_json::from_str::<AiCliConfig>(&content) {
+                    return cfg;
+                }
+            }
+        }
+    }
+
+    AiCliConfig::default()
+}
+
+pub fn save_ai_cli_config(root: &Option<PathBuf>, cfg: &AiCliConfig) {
+    let target_file = if let Some(root) = root {
+        root.join(".phpworkbench").join("ai-cli.json")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join(".phpworkbench").join("ai-cli.json")
+    };
+
+    if let Some(parent) = target_file.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    if let Ok(content) = serde_json::to_string_pretty(cfg) {
+        std::fs::write(target_file, content).ok();
+    }
+}
+
+pub fn init_workspace_ai_cli(workspace: &Workspace, cx: &mut Context<Workspace>) {
+    let root = resolve_deploy_root(workspace, cx);
+    let cfg = load_ai_cli_config(&root);
+    cx.set_global(AiCliShared {
+        agent: cfg.agent,
+        root,
+    });
+}
+
+pub fn set_active_ai_agent(agent: String, root: Option<PathBuf>, cx: &mut App) {
+    let mut cfg = load_ai_cli_config(&root);
+    cfg.agent = agent.clone();
+    save_ai_cli_config(&root, &cfg);
+    if cx.has_global::<AiCliShared>() {
+        let shared = cx.global_mut::<AiCliShared>();
+        shared.agent = agent;
+        shared.root = root;
+    } else {
+        cx.set_global(AiCliShared {
+            agent,
+            root,
+        });
+    }
+}
+
+pub fn launch_active_ai_agent(
+    workspace: &mut Workspace,
+    root: PathBuf,
+    active_file: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let cfg = load_ai_cli_config(&Some(root.clone()));
+    let (cmd, args) = match cfg.agent.as_str() {
+        "custom" => {
+            let cmd = cfg.custom_command.unwrap_or_else(|| "claude".to_string());
+            let mut args = cfg.custom_args.unwrap_or_default();
+            if let Some(file) = active_file {
+                args.push(file);
+            }
+            (cmd, args)
+        }
+        agent => {
+            let exe = resolve_cli_executable(agent)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| agent.to_string());
+            let mut args = Vec::new();
+            if let Some(file) = active_file {
+                args.push(file);
+            }
+            (exe, args)
+        }
+    };
+
+    let count = AI_TASK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let display_name = ai_agent_display_name(&cfg.agent);
+    let full_label = format!("{} {}", cmd, args.join(" "));
+    let task = task::SpawnInTerminal {
+        id: task::TaskId(format!("ai-agent-{}-{}", cfg.agent, count)),
+        full_label: full_label.clone(),
+        label: format!("{display_name} (AI CLI)"),
+        command: Some(cmd),
+        args,
+        command_label: full_label,
+        cwd: Some(root),
+        reveal_target: task::RevealTarget::Dock,
+        ..Default::default()
+    };
+    workspace.spawn_in_terminal(task, window, cx).detach();
+}
+
+pub fn open_ai_cli_settings(
+    workspace: &mut Workspace,
+    root: Option<PathBuf>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let settings_path = if let Some(root) = root.as_ref() {
+        root.join(".phpworkbench").join("ai-cli.json")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join(".phpworkbench").join("ai-cli.json")
+    };
+
+    if !settings_path.exists() {
+        let cfg = load_ai_cli_config(&root);
+        save_ai_cli_config(&root, &cfg);
+    }
+
+    workspace
+        .open_paths(
+            vec![settings_path],
+            workspace::OpenOptions::default(),
+            None,
+            window,
+            cx,
+        )
+        .detach();
+}
+
+pub struct AiCliIndicator;
+
+impl AiCliIndicator {
+    fn new(_cx: &mut gpui::Context<Self>) -> Self {
+        Self
+    }
+}
+
+impl Render for AiCliIndicator {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (current_agent, current_root) = if cx.has_global::<AiCliShared>() {
+            let shared = cx.global::<AiCliShared>();
+            (shared.agent.clone(), shared.root.clone())
+        } else {
+            (detect_default_ai_agent(), None)
+        };
+
+        let display_name = ai_agent_display_name(&current_agent);
+        let trigger = Button::new("ai-cli-status-indicator", format!("🤖 AI: {display_name}"))
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
+            .tooltip(Tooltip::text(format!(
+                "Active AI CLI Agent: {display_name}\nClick to launch, switch agent or configure"
+            )));
+
+        let agent_for_launch = current_agent.clone();
+        let root_for_launch = current_root.clone();
+
+        PopoverMenu::new("ai-cli-menu")
+            .trigger(trigger)
+            .menu(move |window, cx| {
+                let current_agent = if cx.has_global::<AiCliShared>() {
+                    cx.global::<AiCliShared>().agent.clone()
+                } else {
+                    current_agent.clone()
+                };
+                let root = if cx.has_global::<AiCliShared>() {
+                    cx.global::<AiCliShared>().root.clone()
+                } else {
+                    current_root.clone()
+                };
+
+                let r_launch = root.clone();
+                let r_config = root.clone();
+                let agents = [
+                    ("claude", "Claude Code (claude)"),
+                    ("openclaw", "OpenClaw (openclaw)"),
+                    ("codex", "Codex CLI (codex)"),
+                    ("gemini", "Gemini CLI (gemini)"),
+                    ("aider", "Aider (aider)"),
+                    ("custom", "Custom Agent…"),
+                ];
+
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    let r_l = r_launch.clone();
+                    menu = menu.item(
+                        ContextMenuEntry::new("▶ Launch Active Agent Terminal")
+                            .icon(IconName::ArrowRight)
+                            .handler(move |_window, cx| {
+                                cx.dispatch_action(&LaunchActiveAiAgent);
+                            }),
+                    );
+
+                    menu = menu.separator();
+
+                    for (agent_id, agent_title) in agents {
+                        let is_active = current_agent == agent_id;
+                        let r_set = root.clone();
+                        let a_id = agent_id.to_string();
+                        let entry = ui::ContextMenuEntry::new(agent_title.to_string())
+                            .toggleable(ui::IconPosition::Start, is_active)
+                            .handler(move |_window: &mut Window, cx: &mut App| {
+                                set_active_ai_agent(a_id.clone(), r_set.clone(), cx);
+                            });
+                        menu = menu.item(entry);
+                    }
+
+                    menu = menu.separator();
+                    let r_cfg = r_config.clone();
+                    menu = menu.item(
+                        ContextMenuEntry::new("Configure AI Agent (.phpworkbench/ai-cli.json)…")
+                            .icon(IconName::Settings)
+                            .handler(move |_window, cx| {
+                                cx.dispatch_action(&OpenAiCliSettings);
+                            }),
+                    );
+
+                    menu
+                }))
+            })
+            .anchor(Anchor::BottomRight)
+            .into_any_element()
+    }
+}
+
+impl StatusItemView for AiCliIndicator {
     fn set_active_pane_item(
         &mut self,
         _active_pane_item: Option<&dyn workspace::ItemHandle>,

@@ -732,12 +732,36 @@ pub fn register_actions(workspace: &mut Workspace, _cx: &mut Context<Workspace>)
         show_toast(workspace, "Plugin state: All extensions and PHP language tools loaded", cx);
     });
 
-    workspace.register_action(|_workspace, _: &phpstorm_menu::AskAgentWithContext, window, cx| {
-        window.dispatch_action(Box::new(zed_actions::assistant::ToggleFocus), cx);
+    workspace.register_action(|workspace, _: &phpstorm_menu::AskAgentWithContext, window, cx| {
+        let root = get_project_root(workspace, cx);
+        let active_file = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx))
+            .and_then(|editor| editor.update(cx, |ed, cx| ed.target_file_abs_path(cx)))
+            .map(|p| {
+                if let Ok(rel) = p.strip_prefix(&root) {
+                    rel.to_string_lossy().to_string()
+                } else {
+                    p.to_string_lossy().to_string()
+                }
+            });
+        php_panel::launch_active_ai_agent(workspace, root, active_file, window, cx);
     });
 
-    workspace.register_action(|_workspace, _: &phpstorm_menu::AskAgentDependingOnContext, window, cx| {
-        window.dispatch_action(Box::new(zed_actions::assistant::ToggleFocus), cx);
+    workspace.register_action(|workspace, _: &phpstorm_menu::AskAgentDependingOnContext, window, cx| {
+        let root = get_project_root(workspace, cx);
+        let active_file = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx))
+            .and_then(|editor| editor.update(cx, |ed, cx| ed.target_file_abs_path(cx)))
+            .map(|p| {
+                if let Ok(rel) = p.strip_prefix(&root) {
+                    rel.to_string_lossy().to_string()
+                } else {
+                    p.to_string_lossy().to_string()
+                }
+            });
+        php_panel::launch_active_ai_agent(workspace, root, active_file, window, cx);
     });
 
     // Vagrant (9 items)

@@ -13280,6 +13280,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "task",
  "theme",
  "theme_settings",
  "time",

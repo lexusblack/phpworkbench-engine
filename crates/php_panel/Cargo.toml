@@ -39,5 +39,6 @@ util.workspace = true
 workspace.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
+task.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["sync", "macros"] }

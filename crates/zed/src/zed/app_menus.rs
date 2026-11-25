@@ -801,6 +801,8 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 items.push(MenuItem::action("Show Plugin Loading State", phpstorm_menu::ShowPluginLoadingState));
                 items.push(MenuItem::action("Ask Agent with Context", phpstorm_menu::AskAgentWithContext));
                 items.push(MenuItem::action("Ask Agent Depending on Context", phpstorm_menu::AskAgentDependingOnContext));
+                items.push(MenuItem::action("Launch AI Agent Terminal", php_panel::LaunchActiveAiAgent));
+                items.push(MenuItem::action("AI CLI Settings…", php_panel::OpenAiCliSettings));
 
                 items.push(MenuItem::submenu(Menu::new("Vagrant").items([
                     MenuItem::action("Up", phpstorm_menu::VagrantUp),
