@@ -4818,7 +4818,7 @@ impl ChooseServerModal {
         }
     }
 
-    fn confirm_selection(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_selection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(server) = self.servers.get(index) {
             let server_name = server.name.clone();
             let root = self.root.clone();
@@ -4830,8 +4830,8 @@ impl ChooseServerModal {
 
             cx.emit(DismissEvent);
 
-            workspace
-                .update_in(cx, |workspace, window, cx| match operation {
+            if let Some(ws) = workspace.upgrade() {
+                ws.update(cx, |workspace, cx| match operation {
                     DeployOperation::Upload => {
                         if let Some(files) = paths.filter(|p| p.len() > 1) {
                             execute_deploy_batch_upload(workspace, root, server_name, files, cx);
@@ -4852,8 +4852,8 @@ impl ChooseServerModal {
                     DeployOperation::Sync => {
                         execute_deploy_sync(workspace, root, server_name, cx);
                     }
-                })
-                .ok();
+                });
+            }
         }
     }
 }
