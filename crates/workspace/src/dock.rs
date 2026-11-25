@@ -1471,7 +1471,7 @@ impl Dock {
                 "Sync / Fetch",
                 false,
                 |_, window, cx| {
-                    window.dispatch_action(Box::new(zed_actions::git::Branch), cx);
+                    window.dispatch_action(Box::new(git::Fetch), cx);
                 },
                 cx,
             ))

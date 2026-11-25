@@ -140,7 +140,8 @@ actions!(
         ToggleAutomaticUpload,
         ConvertSchemaFileDialog,
         LaunchActiveAiAgent,
-        OpenAiCliSettings
+        OpenAiCliSettings,
+        OpenFileTransferLog
     ]
 );
 
@@ -4359,10 +4360,63 @@ pub enum DeployTransferState {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransferLogEntry {
+    pub timestamp: String,
+    pub operation: String,
+    pub server: String,
+    pub file: String,
+    pub success: bool,
+    pub message: String,
+}
+
 #[derive(Clone, Default)]
 pub struct DeployTransferGlobal {
     pub state: DeployTransferState,
     pub indicator: Option<WeakEntity<DeployServerIndicator>>,
+    pub history: Vec<TransferLogEntry>,
+}
+
+pub fn current_time_str() -> String {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, mins, seconds)
+}
+
+pub fn record_transfer_log(
+    operation: &str,
+    server: &str,
+    file: &str,
+    success: bool,
+    message: String,
+    cx: &mut App,
+) {
+    let entry = TransferLogEntry {
+        timestamp: current_time_str(),
+        operation: operation.to_string(),
+        server: server.to_string(),
+        file: file.to_string(),
+        success,
+        message,
+    };
+    if cx.has_global::<DeployTransferGlobal>() {
+        let global = cx.global_mut::<DeployTransferGlobal>();
+        global.history.push(entry);
+        if global.history.len() > 200 {
+            global.history.remove(0);
+        }
+    } else {
+        cx.set_global(DeployTransferGlobal {
+            state: DeployTransferState::Idle,
+            indicator: None,
+            history: vec![entry],
+        });
+    }
 }
 
 impl Default for DeployTransferState {
@@ -4411,6 +4465,7 @@ pub fn set_deploy_transfer_started(message: String, cx: &mut App) {
                 started_at: std::time::Instant::now(),
             },
             indicator: None,
+            history: Vec::new(),
         });
     }
 }
@@ -4537,12 +4592,21 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEnti
         return;
     }
     let shared = cx.global::<DeployShared>();
-    if !shared.auto_upload {
-        return;
-    }
     let Some(active_name) = shared.active.clone().or_else(|| shared.servers.first().cloned()) else {
         return;
     };
+    if !shared.auto_upload {
+        let file_display = abs_path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+        record_transfer_log(
+            "Auto-Upload (skipped)",
+            &active_name,
+            file_display,
+            false,
+            format!("Auto-upload skipped: Automatic Upload is disabled for server '{active_name}'. Enable via status bar (⚏ ftp: {active_name}) or Tools > Deployment > Automatic Upload"),
+            cx,
+        );
+        return;
+    }
     let Some(root) = shared.root.clone() else {
         return;
     };
@@ -4564,6 +4628,14 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEnti
     let file_display = Path::new(&rel_path).file_name().and_then(|f| f.to_str()).unwrap_or(&rel_path);
     let start_msg = format!("Uploading {} to {}…", file_display, server_name);
     set_deploy_transfer_started(start_msg.clone(), cx);
+    record_transfer_log(
+        "Auto-Upload",
+        &server_name,
+        &rel_path,
+        true,
+        format!("Uploading {rel_path} to {server_name}…"),
+        cx,
+    );
 
     if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
         ws.update(cx, |workspace, cx| {
@@ -4582,6 +4654,7 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEnti
     let task_server = server_name.clone();
     let task_server2 = server_name.clone();
     let task_rel = rel_path.clone();
+    let task_rel2 = rel_path.clone();
     let task: Task<Result<String, String>> = cx.background_spawn(async move {
         let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
         command
@@ -4616,6 +4689,14 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEnti
         cx.update(|cx| match result {
             Ok(msg) => {
                 set_deploy_transfer_finished(true, msg.clone(), cx);
+                record_transfer_log(
+                    "Auto-Upload",
+                    &task_server2,
+                    &task_rel2,
+                    true,
+                    msg.clone(),
+                    cx,
+                );
                 if let Some(ws) = ws_clone.and_then(|w| w.upgrade()) {
                     ws.update(cx, |workspace, cx| {
                         workspace.show_toast(
@@ -4631,6 +4712,14 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEnti
             }
             Err(err) => {
                 set_deploy_transfer_finished(false, format!("Auto-upload failed: {err}"), cx);
+                record_transfer_log(
+                    "Auto-Upload (failed)",
+                    &task_server2,
+                    &task_rel2,
+                    false,
+                    format!("Auto-upload failed: {err}"),
+                    cx,
+                );
                 if let Some(ws) = ws_clone.and_then(|w| w.upgrade()) {
                     ws.update(cx, |workspace, cx| {
                         workspace.show_toast(
@@ -5016,6 +5105,272 @@ impl Render for ChooseServerModal {
     }
 }
 
+pub struct FileTransferLogModal {
+    workspace: WeakEntity<Workspace>,
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<DismissEvent> for FileTransferLogModal {}
+impl ModalView for FileTransferLogModal {}
+
+impl Focusable for FileTransferLogModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl FileTransferLogModal {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+        Self {
+            workspace,
+            focus_handle,
+        }
+    }
+}
+
+impl Render for FileTransferLogModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (history, active_server, is_auto_upload) = if cx.has_global::<DeployTransferGlobal>() {
+            let global = cx.global::<DeployTransferGlobal>();
+            let shared = if cx.has_global::<DeployShared>() {
+                Some(cx.global::<DeployShared>())
+            } else {
+                None
+            };
+            let active = shared.and_then(|s| s.active.clone()).unwrap_or_else(|| "No Server".to_string());
+            let auto = shared.map(|s| s.auto_upload).unwrap_or(false);
+            (global.history.clone(), active, auto)
+        } else {
+            (Vec::new(), "No Server".to_string(), false)
+        };
+
+        let auto_status_str = if is_auto_upload { "ENABLED" } else { "DISABLED" };
+
+        v_flex()
+            .key_context("FileTransferLogModal")
+            .track_focus(&self.focus_handle)
+            .w(rems(44.))
+            .max_h(rems(36.))
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .overflow_hidden()
+            .on_action(cx.listener(|_this, _: &editor_actions::Cancel, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
+            .on_key_down(cx.listener(|_this, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key.as_str() == "escape" {
+                    cx.emit(DismissEvent);
+                    cx.stop_propagation();
+                }
+            }))
+            // Header
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().surface_background)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::Server).size(IconSize::Small).color(Color::Accent))
+                            .child(
+                                Label::new("File Transfer Log & Console")
+                                    .size(LabelSize::Default)
+                                    .weight(FontWeight::SEMIBOLD)
+                                    .color(Color::Default),
+                            )
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_xs()
+                                    .bg(if is_auto_upload { gpui::rgb(0x1d3a2e) } else { gpui::rgb(0x3a2e1d) })
+                                    .child(
+                                        Label::new(format!("{active_server} (Auto-upload: {auto_status_str})"))
+                                            .size(LabelSize::Custom(Rems(0.72)))
+                                            .color(if is_auto_upload { Color::Success } else { Color::Warning }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        IconButton::new("close-transfer-log", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close (Esc)"))
+                            .on_click(cx.listener(|_this, _, _window, cx| {
+                                cx.emit(DismissEvent);
+                            })),
+                    ),
+            )
+            // Log entries list
+            .child(
+                v_flex()
+                    .id("transfer-log-list")
+                    .w_full()
+                    .flex_1()
+                    .max_h(rems(26.))
+                    .overflow_y_scroll()
+                    .p_2()
+                    .gap_1p5()
+                    .when(history.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .w_full()
+                                .py_8()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .child(Icon::new(IconName::File).size(IconSize::Medium).color(Color::Muted))
+                                .child(
+                                    Label::new("No file transfers recorded in this session")
+                                        .size(LabelSize::Default)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(format!(
+                                        "Active server is '{active_server}' with Automatic Upload {}. When files are saved or uploaded, logs will appear here.",
+                                        if is_auto_upload { "ENABLED" } else { "DISABLED (enable in status bar or Tools > Deployment)" }
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                ),
+                        )
+                    })
+                    .children(history.iter().rev().enumerate().map(|(idx, entry)| {
+                        let is_err = !entry.success;
+                        let status_color = if is_err { Color::Error } else { Color::Success };
+                        let icon_name = if is_err { IconName::Warning } else { IconName::Check };
+
+                        h_flex()
+                            .id(format!("log-entry-{}", idx))
+                            .w_full()
+                            .items_start()
+                            .px_2p5()
+                            .py_1p5()
+                            .rounded_sm()
+                            .gap_2()
+                            .border_1()
+                            .when(is_err, |this| {
+                                this.bg(gpui::rgba(0x281919ff))
+                                    .border_color(gpui::rgba(0x5c2525ff))
+                            })
+                            .when(!is_err, |this| {
+                                this.bg(cx.theme().colors().element_background)
+                                    .border_color(cx.theme().colors().border_variant)
+                            })
+                            .child(
+                                Icon::new(icon_name)
+                                    .size(IconSize::Small)
+                                    .color(status_color),
+                            )
+                            .child(
+                                Label::new(entry.timestamp.clone())
+                                    .size(LabelSize::Custom(Rems(0.72)))
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div()
+                                    .px_1()
+                                    .rounded_xs()
+                                    .bg(cx.theme().colors().surface_background)
+                                    .child(
+                                        Label::new(entry.operation.clone())
+                                            .size(LabelSize::Custom(Rems(0.70)))
+                                            .weight(FontWeight::BOLD)
+                                            .color(if entry.operation.contains("failed") || entry.operation.contains("skipped") {
+                                                Color::Warning
+                                            } else {
+                                                Color::Accent
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                Label::new(format!("[{}]", entry.server))
+                                    .size(LabelSize::Custom(Rems(0.72)))
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new(entry.file.clone())
+                                            .size(LabelSize::Small)
+                                            .weight(FontWeight::MEDIUM)
+                                            .color(Color::Default),
+                                    )
+                                    .child(
+                                        Label::new(entry.message.clone())
+                                            .size(LabelSize::Custom(Rems(0.74)))
+                                            .color(if is_err { Color::Error } else { Color::Muted }),
+                                    ),
+                            )
+                    }))
+            )
+            // Footer
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().surface_background)
+                    .child(
+                        Button::new(
+                            "toggle-auto-upload-modal",
+                            if is_auto_upload { "Disable Automatic Upload" } else { "Enable Automatic Upload" },
+                        )
+                        .size(ButtonSize::Compact)
+                        .style(if is_auto_upload { ButtonStyle::Subtle } else { ButtonStyle::Filled })
+                        .on_click(cx.listener(|_this, _, _window, cx| {
+                            cx.dispatch_action(&ToggleAutomaticUpload);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("clear-transfer-log", "Clear History")
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|_this, _, _window, cx| {
+                                        if cx.has_global::<DeployTransferGlobal>() {
+                                            cx.global_mut::<DeployTransferGlobal>().history.clear();
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("close-transfer-log-btn", "Close")
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|_this, _, _window, cx| {
+                                        cx.emit(DismissEvent);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+}
+
 fn resolve_deploy_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     let root = if cx.has_global::<DeployShared>() {
         cx.global::<DeployShared>().root.clone()
@@ -5078,7 +5433,9 @@ pub fn execute_deploy_upload(
         "project".to_string()
     };
 
-    set_deploy_transfer_started(format!("Uploading {} to {}…", file_desc, server), cx);
+    let start_desc = format!("Uploading {} to {}…", file_desc, server);
+    set_deploy_transfer_started(start_desc.clone(), cx);
+    record_transfer_log("Upload", &server, &file_desc, true, start_desc, cx);
 
     workspace.show_toast(
         Toast::new(
@@ -5094,6 +5451,7 @@ pub fn execute_deploy_upload(
     let server_name = server.clone();
     let rel_clone = rel_path.clone();
     let file_desc_clone = file_desc.clone();
+    let file_desc_log = file_desc.clone();
 
     let task: Task<Result<String, String>> = cx.background_spawn(async move {
         let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
@@ -5136,6 +5494,7 @@ pub fn execute_deploy_upload(
                 match &result {
                     Ok(msg) => {
                         set_deploy_transfer_finished(true, msg.clone(), cx);
+                        record_transfer_log("Upload", &server_name, &file_desc_log, true, msg.clone(), cx);
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<DeployNotification>(),
@@ -5147,6 +5506,7 @@ pub fn execute_deploy_upload(
                     }
                     Err(err) => {
                         set_deploy_transfer_finished(false, format!("Upload failed: {err}"), cx);
+                        record_transfer_log("Upload (failed)", &server_name, &file_desc_log, false, format!("Upload to {server_name} failed: {err}"), cx);
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<DeployNotification>(),
@@ -5206,6 +5566,7 @@ pub fn execute_deploy_download(
     let server_name = server.clone();
     let rel_clone = rel_path.clone();
     let file_desc_clone = file_desc.clone();
+    let file_desc_log = file_desc.clone();
 
     let task: Task<Result<String, String>> = cx.background_spawn(async move {
         let mut cmd = std::process::Command::new(resolve_helper_tool("php-deploy"));
@@ -5293,6 +5654,7 @@ pub fn execute_deploy_batch_upload(
     let server_clone = server.clone();
     let server_name = server.clone();
     let root_clone = root.clone();
+    let count_log = count;
 
     set_deploy_transfer_started(format!("Uploading {} file(s) to {}…", count, server), cx);
 
@@ -5352,6 +5714,7 @@ pub fn execute_deploy_batch_upload(
                 match &result {
                     Ok(msg) => {
                         set_deploy_transfer_finished(true, msg.clone(), cx);
+                        record_transfer_log("Batch Upload", &server_name, &format!("{count_log} files"), true, msg.clone(), cx);
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<DeployNotification>(),
@@ -5363,6 +5726,7 @@ pub fn execute_deploy_batch_upload(
                     }
                     Err(err) => {
                         set_deploy_transfer_finished(false, format!("Upload failed: {err}"), cx);
+                        record_transfer_log("Batch Upload (failed)", &server_name, &format!("{count_log} files"), false, format!("Upload to {server_name} failed: {err}"), cx);
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<DeployNotification>(),
@@ -13300,6 +13664,12 @@ impl PhpPanel {
             workspace.register_action(|workspace, _: &OpenAiCliSettings, window, cx| {
                 let root = resolve_deploy_root(workspace, cx);
                 open_ai_cli_settings(workspace, root, window, cx);
+            });
+            workspace.register_action(|workspace, _: &OpenFileTransferLog, window, cx| {
+                let ws_weak = workspace.weak_handle();
+                workspace.toggle_modal(window, cx, move |window, cx| {
+                    FileTransferLogModal::new(ws_weak, window, cx)
+                });
             });
         })
         .detach();
@@ -26071,6 +26441,7 @@ impl DeployServerIndicator {
             cx.set_global(DeployTransferGlobal {
                 state: DeployTransferState::Idle,
                 indicator: Some(weak),
+                history: Vec::new(),
             });
         }
         Self {
@@ -26088,9 +26459,9 @@ impl Render for DeployServerIndicator {
                     .size(ButtonSize::Compact)
                     .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .loading(true)
-                    .tooltip(Tooltip::text(format!("{msg} (Click to open Remote Host)")))
+                    .tooltip(Tooltip::text(format!("{msg} (Click to open File Transfer Log)")))
                     .on_click(move |_, _, cx| {
-                        cx.dispatch_action(&BrowseRemoteHost);
+                        cx.dispatch_action(&OpenFileTransferLog);
                     })
                     .into_any_element()
             }
@@ -26106,9 +26477,9 @@ impl Render for DeployServerIndicator {
                     .size(ButtonSize::Compact)
                     .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .start_icon(Icon::new(icon).size(IconSize::Small).color(color))
-                    .tooltip(Tooltip::text(format!("{msg} (Click to open Remote Host)")))
+                    .tooltip(Tooltip::text(format!("{msg} (Click to open File Transfer Log)")))
                     .on_click(move |_, _, cx| {
-                        cx.dispatch_action(&BrowseRemoteHost);
+                        cx.dispatch_action(&OpenFileTransferLog);
                     })
                     .into_any_element()
             }
@@ -26244,6 +26615,13 @@ impl Render for DeployServerIndicator {
 
                             if let Some(root) = root.clone() {
                                 menu = menu.separator();
+                                menu = menu.item(
+                                    ContextMenuEntry::new("File Transfer Log & Console…")
+                                        .icon(IconName::ListTree)
+                                        .handler(move |_window, cx| {
+                                            cx.dispatch_action(&OpenFileTransferLog);
+                                        }),
+                                );
                                 menu = menu.item(
                                     ContextMenuEntry::new("Deployment Configuration…")
                                         .icon(IconName::Settings)
@@ -26488,33 +26866,360 @@ pub fn launch_active_ai_agent(
     workspace.spawn_in_terminal(task, window, cx).detach();
 }
 
+pub struct AiAgentSettingsModal {
+    workspace: WeakEntity<Workspace>,
+    root: PathBuf,
+    selected_agent: String,
+    custom_command: String,
+    custom_args: String,
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<DismissEvent> for AiAgentSettingsModal {}
+impl ModalView for AiAgentSettingsModal {}
+
+impl Focusable for AiAgentSettingsModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl AiAgentSettingsModal {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+        let cfg = load_ai_cli_config(&Some(root.clone()));
+        let custom_command = cfg.custom_command.unwrap_or_else(|| "claude".to_string());
+        let custom_args = cfg.custom_args.unwrap_or_default().join(" ");
+        Self {
+            workspace,
+            root,
+            selected_agent: cfg.agent,
+            custom_command,
+            custom_args,
+            focus_handle,
+        }
+    }
+
+    fn save_and_close(&mut self, launch: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let custom_args_vec = if self.custom_args.trim().is_empty() {
+            None
+        } else {
+            Some(
+                self.custom_args
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect(),
+            )
+        };
+        let cfg = AiCliConfig {
+            agent: self.selected_agent.clone(),
+            custom_command: if self.selected_agent == "custom" {
+                Some(self.custom_command.trim().to_string())
+            } else {
+                None
+            },
+            custom_args: custom_args_vec,
+            send_context_flag: Some(true),
+        };
+        save_ai_cli_config(&Some(self.root.clone()), &cfg);
+
+        set_active_ai_agent(self.selected_agent.clone(), Some(self.root.clone()), cx);
+
+        let agent_name = ai_agent_display_name(&self.selected_agent);
+        if let Some(ws) = self.workspace.upgrade() {
+            let root = self.root.clone();
+            ws.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<DeployNotification>(),
+                        format!("AI CLI Agent configured: {}", agent_name),
+                    )
+                    .autohide(),
+                    cx,
+                );
+                if launch {
+                    launch_active_ai_agent(workspace, root, None, window, cx);
+                }
+            });
+        }
+        cx.emit(DismissEvent);
+    }
+}
+
+impl Render for AiAgentSettingsModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let agents = [
+            ("claude", "Claude Code", "Anthropic Claude Code CLI (`claude`)"),
+            ("openclaw", "OpenClaw", "OpenClaw agentic coding assistant (`openclaw`)"),
+            ("codex", "Codex CLI", "OpenAI Codex CLI (`codex`)"),
+            ("gemini", "Gemini CLI", "Google Gemini CLI agent (`gemini`)"),
+            ("aider", "Aider", "Aider AI pair programming CLI (`aider`)"),
+            ("custom", "Custom Agent", "Custom command & executable"),
+        ];
+
+        let selected = self.selected_agent.clone();
+        let root_display = self.root.display().to_string();
+
+        v_flex()
+            .key_context("AiAgentSettingsModal")
+            .track_focus(&self.focus_handle)
+            .w(rems(46.))
+            .max_h(rems(38.))
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .overflow_hidden()
+            .on_action(cx.listener(|_this, _: &editor_actions::Cancel, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
+            .on_key_down(cx.listener(|_this, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key.as_str() == "escape" {
+                    cx.emit(DismissEvent);
+                    cx.stop_propagation();
+                }
+            }))
+            // Header
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_2p5()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().surface_background)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::Sparkle).size(IconSize::Small).color(Color::Accent))
+                            .child(
+                                Label::new("AI CLI Agent Settings")
+                                    .size(LabelSize::Default)
+                                    .weight(FontWeight::SEMIBOLD)
+                                    .color(Color::Default),
+                            ),
+                    )
+                    .child(
+                        IconButton::new("close-ai-agent-modal", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Close (Esc)"))
+                            .on_click(cx.listener(|_this, _, _window, cx| {
+                                cx.emit(DismissEvent);
+                            })),
+                    ),
+            )
+            // Description & Root Scope
+            .child(
+                v_flex()
+                    .w_full()
+                    .px_4()
+                    .py_2()
+                    .bg(cx.theme().colors().surface_background)
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .gap_1()
+                    .child(
+                        Label::new("Select the active AI CLI coding agent to launch in this project workspace.")
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                Label::new("Working directory:")
+                                    .size(LabelSize::Custom(Rems(0.74)))
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(root_display)
+                                    .size(LabelSize::Custom(Rems(0.74)))
+                                    .weight(FontWeight::MEDIUM)
+                                    .color(Color::Accent),
+                            ),
+                    ),
+            )
+            // Agent list
+            .child(
+                v_flex()
+                    .id("ai-agent-list")
+                    .w_full()
+                    .p_3()
+                    .gap_1p5()
+                    .children(agents.iter().map(|(agent_id, name, desc)| {
+                        let is_active = selected == *agent_id;
+                        let a_id = agent_id.to_string();
+                        let exe_path = resolve_cli_executable(agent_id);
+
+                        h_flex()
+                            .id(format!("agent-opt-{}", agent_id))
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(if is_active {
+                                cx.theme().colors().element_selected
+                            } else {
+                                cx.theme().colors().element_background
+                            })
+                            .hover(|s| s.bg(cx.theme().colors().element_hover))
+                            .border_1()
+                            .border_color(if is_active {
+                                cx.theme().colors().border_focused
+                            } else {
+                                cx.theme().colors().border_variant
+                            })
+                            .on_click(cx.listener({
+                                let a_id = a_id.clone();
+                                move |this, _, _window, cx| {
+                                    this.selected_agent = a_id.clone();
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2p5()
+                                    .child(
+                                        Icon::new(if is_active {
+                                            IconName::Check
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .size(IconSize::Small)
+                                        .color(if is_active { Color::Accent } else { Color::Muted }),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                Label::new(*name)
+                                                    .size(LabelSize::Default)
+                                                    .weight(FontWeight::MEDIUM)
+                                                    .color(Color::Default),
+                                            )
+                                            .child(
+                                                Label::new(*desc)
+                                                    .size(LabelSize::Custom(Rems(0.74)))
+                                                    .color(Color::Muted),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                if let Some(path) = exe_path {
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Icon::new(IconName::Check)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Success),
+                                        )
+                                        .child(
+                                            Label::new(path.to_string_lossy().to_string())
+                                                .size(LabelSize::Custom(Rems(0.70)))
+                                                .color(Color::Success),
+                                        )
+                                        .into_any_element()
+                                } else if *agent_id == "custom" {
+                                    Label::new("Custom command")
+                                        .size(LabelSize::Custom(Rems(0.70)))
+                                        .color(Color::Muted)
+                                        .into_any_element()
+                                } else {
+                                    Label::new("Not found on PATH")
+                                        .size(LabelSize::Custom(Rems(0.70)))
+                                        .color(Color::Muted)
+                                        .into_any_element()
+                                }
+                            )
+                    }))
+            )
+            // Footer
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_2p5()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().surface_background)
+                    .child(
+                        Button::new("edit-ai-cli-json", "Edit ai-cli.json")
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(Tooltip::text("Open .phpworkbench/ai-cli.json in editor tab"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let target_file = this.root.join(".phpworkbench").join("ai-cli.json");
+                                if let Some(ws) = this.workspace.upgrade() {
+                                    ws.update(cx, |workspace, cx| {
+                                        workspace.open_abs_path(target_file, workspace::OpenOptions::default(), window, cx).detach();
+                                    });
+                                }
+                                cx.emit(DismissEvent);
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-ai-agent-modal", "Cancel")
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|_this, _, _window, cx| {
+                                        cx.emit(DismissEvent);
+                                    })),
+                            )
+                            .child(
+                                Button::new("save-ai-agent-modal", "Save & Apply")
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_and_close(false, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("save-and-launch-ai-agent", "▶ Save & Launch")
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_and_close(true, window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+}
+
 pub fn open_ai_cli_settings(
     workspace: &mut Workspace,
     root: Option<PathBuf>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let settings_path = if let Some(root) = root.as_ref() {
-        root.join(".phpworkbench").join("ai-cli.json")
-    } else {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".phpworkbench").join("ai-cli.json")
-    };
-
-    if !settings_path.exists() {
-        let cfg = load_ai_cli_config(&root);
-        save_ai_cli_config(&root, &cfg);
+    let target_root = root.or_else(|| resolve_deploy_root(workspace, cx));
+    if let Some(target_root) = target_root {
+        let ws_weak = workspace.weak_handle();
+        workspace.toggle_modal(window, cx, move |window, cx| {
+            AiAgentSettingsModal::new(ws_weak, target_root, window, cx)
+        });
     }
-
-    workspace
-        .open_paths(
-            vec![settings_path],
-            workspace::OpenOptions::default(),
-            None,
-            window,
-            cx,
-        )
-        .detach();
 }
 
 pub struct AiCliIndicator {
@@ -26582,13 +27287,15 @@ impl Render for AiCliIndicator {
                     menu = menu.item(
                         ContextMenuEntry::new("▶ Launch Active Agent (Editor Tab)")
                             .icon(IconName::ArrowRight)
-                            .handler(move |_window, cx| {
-                                let _ = ws_l.update_in(cx, |workspace, window, cx| {
-                                    let root = r_l.clone().or_else(|| resolve_deploy_root(workspace, cx));
-                                    if let Some(root) = root {
-                                        launch_active_ai_agent(workspace, root, None, window, cx);
-                                    }
-                                });
+                            .handler(move |window: &mut Window, cx: &mut App| {
+                                if let Some(ws) = ws_l.upgrade() {
+                                    ws.update(cx, |workspace, cx| {
+                                        let root = r_l.clone().or_else(|| resolve_deploy_root(workspace, cx));
+                                        if let Some(root) = root {
+                                            launch_active_ai_agent(workspace, root, None, window, cx);
+                                        }
+                                    });
+                                }
                             }),
                     );
 
@@ -26628,13 +27335,15 @@ impl Render for AiCliIndicator {
                     let r_cfg = r_config.clone();
                     let ws_c = ws_config.clone();
                     menu = menu.item(
-                        ContextMenuEntry::new("Configure AI Agent (.phpworkbench/ai-cli.json)…")
+                        ContextMenuEntry::new("Configure AI Agent…")
                             .icon(IconName::Settings)
-                            .handler(move |_window, cx| {
-                                let _ = ws_c.update_in(cx, |workspace, window, cx| {
-                                    let root = r_cfg.clone().or_else(|| resolve_deploy_root(workspace, cx));
-                                    open_ai_cli_settings(workspace, root, window, cx);
-                                });
+                            .handler(move |window: &mut Window, cx: &mut App| {
+                                if let Some(ws) = ws_c.upgrade() {
+                                    ws.update(cx, |workspace, cx| {
+                                        let root = r_cfg.clone().or_else(|| resolve_deploy_root(workspace, cx));
+                                        open_ai_cli_settings(workspace, root, window, cx);
+                                    });
+                                }
                             }),
                     );
 

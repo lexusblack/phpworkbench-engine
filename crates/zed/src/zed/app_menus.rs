@@ -392,7 +392,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                         MenuItem::action("Database", php_panel::ToggleFocus),
                         MenuItem::action("Database Changes", php_panel::ToggleFocus),
                         MenuItem::action("Database Output", php_panel::ToggleFocus),
-                        MenuItem::action("File Transfer", php_panel::BrowseRemoteHost),
+                        MenuItem::action("File Transfer", php_panel::OpenFileTransferLog),
                         MenuItem::action("Hierarchy", outline_panel::ToggleFocus),
                         MenuItem::action("Laravel", php_panel::ToggleFocus),
                         MenuItem::action("make", zed_actions::Spawn::ViaModal { reveal_target: None }),
@@ -925,6 +925,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     dep_items.push(MenuItem::action(auto_upload_title, php_panel::ToggleAutomaticUpload).checked(is_auto_upload));
                     dep_items.push(MenuItem::separator());
                     dep_items.push(MenuItem::action("Browse Remote Host", php_panel::BrowseRemoteHost));
+                    dep_items.push(MenuItem::action("File Transfer Log…", php_panel::OpenFileTransferLog));
 
                     dep_items
                 })));
@@ -1164,16 +1165,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Find Action…", zed_actions::command_palette::Toggle),
                 MenuItem::separator(),
-                MenuItem::action("Help", zed_actions::OpenOnboarding),
-                MenuItem::separator(),
+                MenuItem::action("PhpWorkbench Documentation", zed_actions::OpenOnboarding),
                 MenuItem::action("What's New in PhpWorkbench", zed_actions::About),
                 MenuItem::action("Check for Updates…", zed_actions::CheckForUpdates),
                 MenuItem::separator(),
-                MenuItem::action("Getting Started", phpstorm_menu::GettingStarted),
-                MenuItem::action("PhpWorkbench on YouTube", phpstorm_menu::PhpWorkbenchOnYouTube),
-                MenuItem::action("Keyboard Shortcuts PDF", zed_actions::OpenDefaultKeymap),
-                MenuItem::separator(),
-                MenuItem::action("Contact Support…", phpstorm_menu::ContactSupport),
                 MenuItem::action("Submit a Bug Report…", phpstorm_menu::SubmitBugReport),
                 MenuItem::action("Submit Feedback…", phpstorm_menu::SubmitFeedback),
                 MenuItem::separator(),
@@ -1187,12 +1182,6 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     MenuItem::action("Debug Log Settings…", phpstorm_menu::DiagnosticDebugLogSettings),
                     MenuItem::action("Special Files and Folders…", phpstorm_menu::DiagnosticSpecialFilesAndFolders),
                 ])),
-                MenuItem::action("Change Memory Settings", phpstorm_menu::ChangeMemorySettings),
-                MenuItem::action("Edit Custom Properties…", phpstorm_menu::EditCustomProperties),
-                MenuItem::action("Edit Custom VM Options…", phpstorm_menu::EditCustomVmOptions),
-                MenuItem::action("Delete Leftover IDE Directories…", phpstorm_menu::DeleteLeftoverIdeDirectories),
-                MenuItem::separator(),
-                MenuItem::action("Register…", phpstorm_menu::RegisterIdeLicense),
             ],
         },
     ]
