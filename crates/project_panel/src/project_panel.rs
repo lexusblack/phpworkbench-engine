@@ -1298,6 +1298,10 @@ impl ProjectPanel {
                                     // 12. Restore File… / Add to VCS
                                     .when(has_git_repo && has_git_changes, |menu| {
                                         menu.action(
+                                            "Add to VCS",
+                                            Box::new(git::StageFile),
+                                        )
+                                        .action(
                                             "Restore File…",
                                             Box::new(git::RestoreFile { skip_prompt: false }),
                                         )
@@ -1332,10 +1336,15 @@ impl ProjectPanel {
                                 menu.submenu("Git", move |menu, _, _| {
                                     let mut sub = menu;
                                     if has_git_changes {
-                                        sub = sub.action(
-                                            "Restore File…",
-                                            Box::new(git::RestoreFile { skip_prompt: false }),
-                                        );
+                                        sub = sub
+                                            .action(
+                                                "Add to VCS",
+                                                Box::new(git::StageFile),
+                                            )
+                                            .action(
+                                                "Restore File…",
+                                                Box::new(git::RestoreFile { skip_prompt: false }),
+                                            );
                                     }
                                     sub = sub
                                         .action("Add to .gitignore", Box::new(git::AddToGitignore))

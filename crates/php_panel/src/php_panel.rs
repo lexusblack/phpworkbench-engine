@@ -12514,7 +12514,7 @@ impl PhpPanel {
 
             if let Some(window) = window {
                 let indicator = cx.new(|cx| DeployServerIndicator::new(cx));
-                let ai_indicator = cx.new(|cx| AiCliIndicator::new(cx));
+                let ai_indicator = cx.new(|cx| AiCliIndicator::new(workspace.weak_handle(), cx));
                 workspace.status_bar().update(cx, |status_bar, cx| {
                     status_bar.add_right_item(indicator, window, cx);
                     status_bar.add_right_item(ai_indicator, window, cx);
@@ -26482,7 +26482,7 @@ pub fn launch_active_ai_agent(
         args,
         command_label: full_label,
         cwd: Some(root),
-        reveal_target: task::RevealTarget::Dock,
+        reveal_target: task::RevealTarget::Center,
         ..Default::default()
     };
     workspace.spawn_in_terminal(task, window, cx).detach();
@@ -26517,11 +26517,13 @@ pub fn open_ai_cli_settings(
         .detach();
 }
 
-pub struct AiCliIndicator;
+pub struct AiCliIndicator {
+    workspace: WeakEntity<Workspace>,
+}
 
 impl AiCliIndicator {
-    fn new(_cx: &mut gpui::Context<Self>) -> Self {
-        Self
+    fn new(workspace: WeakEntity<Workspace>, _cx: &mut gpui::Context<Self>) -> Self {
+        Self { workspace }
     }
 }
 
@@ -26542,8 +26544,8 @@ impl Render for AiCliIndicator {
                 "Active AI CLI Agent: {display_name}\nClick to launch, switch agent or configure"
             )));
 
-        let agent_for_launch = current_agent.clone();
-        let root_for_launch = current_root.clone();
+        let ws = self.workspace.clone();
+        let ind_weak = cx.weak_entity();
 
         PopoverMenu::new("ai-cli-menu")
             .trigger(trigger)
@@ -26561,6 +26563,10 @@ impl Render for AiCliIndicator {
 
                 let r_launch = root.clone();
                 let r_config = root.clone();
+                let ws_launch = ws.clone();
+                let ws_set = ws.clone();
+                let ws_config = ws.clone();
+                let ind_weak = ind_weak.clone();
                 let agents = [
                     ("claude", "Claude Code (claude)"),
                     ("openclaw", "OpenClaw (openclaw)"),
@@ -26572,11 +26578,17 @@ impl Render for AiCliIndicator {
 
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     let r_l = r_launch.clone();
+                    let ws_l = ws_launch.clone();
                     menu = menu.item(
-                        ContextMenuEntry::new("▶ Launch Active Agent Terminal")
+                        ContextMenuEntry::new("▶ Launch Active Agent (Editor Tab)")
                             .icon(IconName::ArrowRight)
                             .handler(move |_window, cx| {
-                                cx.dispatch_action(&LaunchActiveAiAgent);
+                                let _ = ws_l.update_in(cx, |workspace, window, cx| {
+                                    let root = r_l.clone().or_else(|| resolve_deploy_root(workspace, cx));
+                                    if let Some(root) = root {
+                                        launch_active_ai_agent(workspace, root, None, window, cx);
+                                    }
+                                });
                             }),
                     );
 
@@ -26586,21 +26598,43 @@ impl Render for AiCliIndicator {
                         let is_active = current_agent == agent_id;
                         let r_set = root.clone();
                         let a_id = agent_id.to_string();
+                        let a_title = agent_title.to_string();
+                        let ws_s = ws_set.clone();
+                        let ind = ind_weak.clone();
                         let entry = ui::ContextMenuEntry::new(agent_title.to_string())
                             .toggleable(ui::IconPosition::Start, is_active)
                             .handler(move |_window: &mut Window, cx: &mut App| {
                                 set_active_ai_agent(a_id.clone(), r_set.clone(), cx);
+                                if let Some(ind) = ind.upgrade() {
+                                    ind.update(cx, |_, cx| cx.notify());
+                                }
+                                if let Some(ws) = ws_s.upgrade() {
+                                    ws.update(cx, |workspace, cx| {
+                                        workspace.show_toast(
+                                            Toast::new(
+                                                NotificationId::unique::<DeployNotification>(),
+                                                format!("Active AI Agent set to: {}", a_title),
+                                            )
+                                            .autohide(),
+                                            cx,
+                                        );
+                                    });
+                                }
                             });
                         menu = menu.item(entry);
                     }
 
                     menu = menu.separator();
                     let r_cfg = r_config.clone();
+                    let ws_c = ws_config.clone();
                     menu = menu.item(
                         ContextMenuEntry::new("Configure AI Agent (.phpworkbench/ai-cli.json)…")
                             .icon(IconName::Settings)
                             .handler(move |_window, cx| {
-                                cx.dispatch_action(&OpenAiCliSettings);
+                                let _ = ws_c.update_in(cx, |workspace, window, cx| {
+                                    let root = r_cfg.clone().or_else(|| resolve_deploy_root(workspace, cx));
+                                    open_ai_cli_settings(workspace, root, window, cx);
+                                });
                             }),
                     );
 

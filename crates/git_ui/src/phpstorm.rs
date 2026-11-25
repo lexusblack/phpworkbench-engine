@@ -376,7 +376,7 @@ impl EntryMenuState {
 pub fn menu_items_for(state: EntryMenuState) -> Vec<MenuItemSpec> {
     use entry_menu_action as ids;
 
-    let tracked = !state.untracked && state.has_files;
+    let tracked = (!state.untracked || state.staged) && state.has_files;
     let commit_label = if state.multiple {
         "Commit Files..."
     } else {
@@ -401,7 +401,7 @@ pub fn menu_items_for(state: EntryMenuState) -> Vec<MenuItemSpec> {
         item("Ask Agent with Context", state.has_files, ids::ASK_AI),
         MenuItemSpec::separator(),
         item("Delete...", state.has_files, ids::DELETE),
-        item("Add to VCS", state.has_files && !state.staged, ids::ADD_TO_VCS),
+        item("Add to VCS", state.has_files && (state.untracked || !state.staged), ids::ADD_TO_VCS),
         item("Add to .gitignore", state.has_files && state.untracked, ids::ADD_TO_GITIGNORE),
         MenuItemSpec::separator(),
         item("+ New Changelist...", true, ids::NEW_CHANGELIST),

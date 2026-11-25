@@ -9717,7 +9717,7 @@ impl GitPanel {
             staged: section == Section::Staged
                 || (has_files && entries.iter().all(|entry| entry.staging.is_fully_staged())),
             untracked: section == Section::New
-                || (has_files && entries.iter().all(|entry| entry.status.is_created())),
+                || (has_files && entries.iter().all(|entry| entry.status.is_untracked())),
             deleted: has_files && entries.iter().all(|entry| entry.status.is_deleted()),
             multiple: true,
             has_files,
@@ -9759,7 +9759,7 @@ impl GitPanel {
             staged: entries
                 .iter()
                 .all(|entry| entry.staging.is_fully_staged()),
-            untracked: entries.iter().all(|entry| entry.status.is_created()),
+            untracked: entries.iter().all(|entry| entry.status.is_untracked()),
             deleted: entries.iter().all(|entry| entry.status.is_deleted()),
             multiple: entries.len() > 1,
             has_files: true,
@@ -9790,7 +9790,7 @@ impl GitPanel {
         let has_files = !entries.is_empty();
         let state = phpstorm::EntryMenuState {
             staged: has_files && entries.iter().all(|entry| entry.staging.is_fully_staged()),
-            untracked: has_files && entries.iter().all(|entry| entry.status.is_created()),
+            untracked: has_files && entries.iter().all(|entry| entry.status.is_untracked()),
             deleted: has_files && entries.iter().all(|entry| entry.status.is_deleted()),
             multiple: true,
             has_files,
