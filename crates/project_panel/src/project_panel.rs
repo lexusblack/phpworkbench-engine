@@ -993,7 +993,7 @@ impl ProjectPanel {
                 window,
                 |project_panel, _, editor_event, window, cx| match editor_event {
                     EditorEvent::BufferEdited => {
-                        project_panel.update_search_matches(window, cx);
+                        project_panel.update_search_matches(true, window, cx);
                     }
                     _ => {}
                 },
@@ -5404,7 +5404,7 @@ impl ProjectPanel {
                     this.autoscroll(cx);
                 }
                 if this.show_search && !this.search_editor.read(cx).text(cx).is_empty() {
-                    this.update_search_matches(window, cx);
+                    this.update_search_matches(false, window, cx);
                 }
                 this.preload_initial_entry_icons(window, cx);
                 cx.notify();
@@ -5498,10 +5498,8 @@ impl ProjectPanel {
         cx: &mut Context<Self>,
     ) {
         self.project.update(cx, |project, cx| {
-            if let Some((worktree, expanded_dir_ids)) = project
-                .worktree_for_id(worktree_id, cx)
-                .zip(self.state.expanded_dir_ids.get_mut(&worktree_id))
-            {
+            let expanded_dir_ids = self.state.expanded_dir_ids.entry(worktree_id).or_default();
+            if let Some(worktree) = project.worktree_for_id(worktree_id, cx) {
                 project.expand_entry(worktree_id, entry_id, cx);
                 let worktree = worktree.read(cx);
 
@@ -8110,7 +8108,38 @@ impl ProjectPanel {
         cx.notify();
     }
 
-    fn next_search_match(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_search_match_internal(
+        &mut self,
+        target_idx: usize,
+        expand_if_hidden: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let target_idx = target_idx % self.search_matches.len();
+        self.current_match_index = Some(target_idx);
+        let (entry_id, selection, _) = self.search_matches[target_idx];
+        self.selection = Some(selection);
+
+        let is_visible = self.index_for_entry(entry_id, selection.worktree_id).is_some();
+        if !is_visible && expand_if_hidden {
+            self.expand_entry(selection.worktree_id, entry_id, cx);
+            self.update_visible_entries(
+                Some((selection.worktree_id, entry_id)),
+                false,
+                true,
+                window,
+                cx,
+            );
+        } else {
+            self.autoscroll(cx);
+            cx.notify();
+        }
+    }
+
+    fn next_search_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_matches.is_empty() {
             return;
         }
@@ -8118,13 +8147,10 @@ impl ProjectPanel {
             Some(idx) => (idx + 1) % self.search_matches.len(),
             None => 0,
         };
-        self.current_match_index = Some(next_idx);
-        self.selection = Some(self.search_matches[next_idx].1);
-        self.autoscroll(cx);
-        cx.notify();
+        self.select_search_match_internal(next_idx, true, window, cx);
     }
 
-    fn prev_search_match(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn prev_search_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_matches.is_empty() {
             return;
         }
@@ -8138,10 +8164,7 @@ impl ProjectPanel {
             }
             None => 0,
         };
-        self.current_match_index = Some(prev_idx);
-        self.selection = Some(self.search_matches[prev_idx].1);
-        self.autoscroll(cx);
-        cx.notify();
+        self.select_search_match_internal(prev_idx, true, window, cx);
     }
 
     fn next_search_match_action(
@@ -8162,7 +8185,12 @@ impl ProjectPanel {
         self.prev_search_match(window, cx);
     }
 
-    fn update_search_matches(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn update_search_matches(
+        &mut self,
+        expand_if_hidden: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let query = self.search_editor.read(cx).text(cx).trim().to_string();
         self.search_matches.clear();
         self.search_indices.clear();
@@ -8173,13 +8201,25 @@ impl ProjectPanel {
             return;
         }
 
+        let panel_settings = ProjectPanelSettings::get_global(cx);
+        let hide_gitignore = panel_settings.hide_gitignore;
+        let hide_hidden = panel_settings.hide_hidden;
+        let project = self.project.read(cx);
+        let worktrees: Vec<_> = project.visible_worktrees(cx).collect();
+
         let mut matches = Vec::new();
-        for visible in &self.state.visible_entries {
-            for entry in &visible.entries {
-                let file_name = entry.path.file_name().unwrap_or_default().to_string();
-                if let Some(indices) = find_match_indices(&file_name, &query) {
+        for worktree_handle in worktrees {
+            let worktree = worktree_handle.read(cx);
+            let worktree_id = worktree.id();
+            let root_name = worktree.root_name();
+            for entry in worktree.entries(!hide_gitignore, 0) {
+                if hide_hidden && entry.is_hidden {
+                    continue;
+                }
+                let file_name = entry_file_name(entry, root_name);
+                if let Some(indices) = find_match_indices(file_name, &query) {
                     let selection = SelectedEntry {
-                        worktree_id: visible.worktree_id,
+                        worktree_id,
                         entry_id: entry.id,
                     };
                     self.search_indices.insert(entry.id, indices.clone());
@@ -8194,15 +8234,12 @@ impl ProjectPanel {
             });
 
             let target_idx = current_pos.unwrap_or(0);
-            self.selection = Some(matches[target_idx].1);
-            self.current_match_index = Some(target_idx);
             self.search_matches = matches;
-            self.autoscroll(cx);
+            self.select_search_match_internal(target_idx, expand_if_hidden, window, cx);
         } else {
             self.search_matches = matches;
+            cx.notify();
         }
-
-        cx.notify();
     }
 
     fn render_search_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -9263,6 +9300,18 @@ mod speed_search_tests {
         let indices = find_match_indices("PacklistExtra.php", "packlist");
         assert!(indices.is_some());
         assert_eq!(indices.unwrap().len(), 8);
+    }
+
+    #[test]
+    fn test_m260_prefix_match() {
+        let indices = find_match_indices("m260505_140000_add_column.php", "m260");
+        assert!(indices.is_some());
+        assert_eq!(indices.unwrap(), vec![0, 1, 2, 3]);
+
+        // Also via Russian layout "ь260" -> "m260"
+        let indices_ru = find_match_indices("m260505_140000_add_column.php", "ь260");
+        assert!(indices_ru.is_some());
+        assert_eq!(indices_ru.unwrap(), vec![0, 1, 2, 3]);
     }
 }
 
