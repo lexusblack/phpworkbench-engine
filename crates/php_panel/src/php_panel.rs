@@ -5433,17 +5433,23 @@ fn resolve_deploy_target_paths(
     {
         (action_abs, action_rel.unwrap_or_default())
     } else if let Some(active_item) = workspace.active_item(cx) {
-        if let Some(editor) = active_item.act_as::<Editor>(cx) {
-            if let Some(target_abs) = editor.update(cx, |editor, cx| editor.target_file_abs_path(cx)) {
-                let rel = target_abs
-                    .strip_prefix(root)
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                (Some(target_abs.to_string_lossy().to_string()), rel)
-            } else {
-                (None, String::new())
-            }
+        let target_abs = if let Some(editor) = active_item.act_as::<Editor>(cx) {
+            editor.update(cx, |editor, cx| editor.target_file_abs_path(cx))
+        } else if let Some(diff_view) = active_item.act_as::<git_ui_core::file_diff_view::FileDiffView>(cx) {
+            diff_view.read(cx).new_buffer().read(cx).file().and_then(|f| f.as_local().map(|f| f.abs_path(cx)))
+        } else if let Some(project_path) = active_item.project_path(cx) {
+            let project = workspace.project().read(cx);
+            project.absolute_path(&project_path, cx)
+        } else {
+            None
+        };
+        if let Some(target_abs) = target_abs {
+            let rel = target_abs
+                .strip_prefix(root)
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (Some(target_abs.to_string_lossy().to_string()), rel)
         } else {
             (None, String::new())
         }
@@ -6041,7 +6047,16 @@ pub fn execute_deploy_sync(
     server: String,
     cx: &mut Context<Workspace>,
 ) {
-    set_deploy_transfer_started(format!("Syncing with {}…", server), cx);
+    let start_msg = format!("Syncing with {}…", server);
+    set_deploy_transfer_started(start_msg.clone(), cx);
+    record_transfer_log(
+        "Sync",
+        &server,
+        "project",
+        true,
+        format!("Starting deployment sync with {}…", server),
+        cx,
+    );
 
     workspace.show_toast(
         Toast::new(
@@ -6052,15 +6067,94 @@ pub fn execute_deploy_sync(
         cx,
     );
 
-    if cx.has_global::<DeployShared>() {
-        if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
-            panel
-                .update(cx, |panel, cx| {
-                    panel.sync_server(server, root, cx);
-                })
-                .log_err();
+    let server_name = server.clone();
+    let server_clone = server.clone();
+    let root_clone = root.clone();
+
+    let task: Task<Result<String, String>> = cx.background_spawn(async move {
+        let output = std::process::Command::new(resolve_helper_tool("php-deploy"))
+            .arg("sync")
+            .arg("--server")
+            .arg(&server_clone)
+            .current_dir(&root_clone)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            Ok(if trimmed.is_empty() {
+                format!("Synced with {server_clone}")
+            } else {
+                trimmed.to_string()
+            })
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let message = stderr
+                .lines()
+                .chain(stdout.lines())
+                .find(|line| !line.trim().is_empty())
+                .map(|line| line.trim().to_string())
+                .unwrap_or_else(|| "sync failed".to_string());
+            Err(message)
         }
-    }
+    });
+
+    cx.spawn(async move |workspace, cx| {
+        let result = task.await;
+        workspace
+            .update(cx, |workspace, cx| {
+                match &result {
+                    Ok(msg) => {
+                        set_deploy_transfer_finished(true, msg.clone(), cx);
+                        record_transfer_log("Sync", &server_name, "project", true, msg.clone(), cx);
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                msg.clone(),
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        set_deploy_transfer_finished(false, format!("Sync failed: {err}"), cx);
+                        record_transfer_log(
+                            "Sync (failed)",
+                            &server_name,
+                            "project",
+                            false,
+                            format!("Sync with {server_name} failed: {err}"),
+                            cx,
+                        );
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<DeployNotification>(),
+                                format!("Sync with {} failed: {}", server_name, err),
+                            ),
+                            cx,
+                        );
+                    }
+                }
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        let status = match &result {
+                            Ok(_) => SyncStatus::Ok,
+                            Err(e) => SyncStatus::Failed(e.clone()),
+                        };
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.sync_status.insert(server_name.clone(), status);
+                                cx.notify();
+                            })
+                            .log_err();
+                    }
+                }
+            })
+            .log_err();
+    })
+    .detach();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12924,6 +13018,8 @@ impl PhpPanel {
                     if let Some(item_handle) = item.upgrade() {
                         let abs_path = if let Some(editor) = item_handle.act_as::<Editor>(cx) {
                             editor.update(cx, |editor, cx| editor.target_file_abs_path(cx))
+                        } else if let Some(diff_view) = item_handle.act_as::<git_ui_core::file_diff_view::FileDiffView>(cx) {
+                            diff_view.read(cx).new_buffer().read(cx).file().and_then(|f| f.as_local().map(|f| f.abs_path(cx)))
                         } else if let Some(project_path) = item_handle.project_path(cx) {
                             let project = workspace.project().read(cx);
                             project.absolute_path(&project_path, cx)
@@ -26491,8 +26587,8 @@ impl Render for DeployServerIndicator {
                     .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .loading(true)
                     .tooltip(Tooltip::text(format!("{msg} (Click to open File Transfer Log)")))
-                    .on_click(move |_, _, cx| {
-                        cx.dispatch_action(&OpenFileTransferLog);
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(OpenFileTransferLog), cx);
                     })
                     .into_any_element()
             }
@@ -26509,8 +26605,8 @@ impl Render for DeployServerIndicator {
                     .label_size(LabelSize::Custom(PANEL_TEXT_REMS))
                     .start_icon(Icon::new(icon).size(IconSize::Small).color(color))
                     .tooltip(Tooltip::text(format!("{msg} (Click to open File Transfer Log)")))
-                    .on_click(move |_, _, cx| {
-                        cx.dispatch_action(&OpenFileTransferLog);
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(OpenFileTransferLog), cx);
                     })
                     .into_any_element()
             }
@@ -26555,57 +26651,56 @@ impl Render for DeployServerIndicator {
                         };
                         let servers = shared.servers.clone();
                         let active = shared.active.clone();
-                        let panel = shared.panel.clone();
                         let root = shared.root.clone();
                         let is_auto_upload = shared.auto_upload;
                         Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                             if let Some(active_server) = active.as_ref() {
                                 let s_deploy = active_server.clone();
-                                let r_root = root.clone();
-                                let menu_panel = panel.clone();
                                 menu = menu.item(
                                     ContextMenuEntry::new(format!("Upload to {s_deploy} (Deploy)"))
                                         .icon(IconName::ArrowUp)
-                                        .handler(move |_window, cx| {
-                                            if let Some(panel) = menu_panel.clone().and_then(|panel| panel.upgrade()) {
-                                                panel.update(cx, |panel, cx| {
-                                                    if let Some(root) = r_root.clone() {
-                                                        panel.upload_project(s_deploy.clone(), root, cx);
-                                                    }
-                                                });
-                                            }
+                                        .handler(move |window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(UploadToDeployServer {
+                                                    server: Some(s_deploy.clone()),
+                                                    abs_path: None,
+                                                    rel_path: None,
+                                                    paths: None,
+                                                }),
+                                                cx,
+                                            );
                                         }),
                                 );
 
                                 let s_dl = active_server.clone();
-                                let r_root_dl = root.clone();
-                                let menu_panel_dl = panel.clone();
                                 menu = menu.item(
                                     ContextMenuEntry::new(format!("Download from {s_dl}"))
                                         .icon(IconName::Download)
-                                        .handler(move |_window, cx| {
-                                            if let Some(panel) = menu_panel_dl.clone().and_then(|panel| panel.upgrade()) {
-                                                panel.update(cx, |panel, cx| {
-                                                    panel.download_from_remote_path(s_dl.clone(), ".".to_string(), true, r_root_dl.clone(), cx);
-                                                });
-                                            }
+                                        .handler(move |window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(DownloadFromDeployServer {
+                                                    server: Some(s_dl.clone()),
+                                                    abs_path: None,
+                                                    rel_path: None,
+                                                    paths: None,
+                                                }),
+                                                cx,
+                                            );
                                         }),
                                 );
 
                                 let s_sync = active_server.clone();
-                                let r_root_sync = root.clone();
-                                let menu_panel_sync = panel.clone();
                                 menu = menu.item(
                                     ContextMenuEntry::new(format!("Sync with {s_sync}…"))
                                         .icon(IconName::RotateCw)
-                                        .handler(move |_window, cx| {
-                                            if let Some(panel) = menu_panel_sync.clone().and_then(|panel| panel.upgrade()) {
-                                                panel.update(cx, |panel, cx| {
-                                                    if let Some(root) = r_root_sync.clone() {
-                                                        panel.sync_server(s_sync.clone(), root, cx);
-                                                    }
-                                                });
-                                            }
+                                        .handler(move |window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(SyncWithDeployServer {
+                                                    server: Some(s_sync.clone()),
+                                                    rel_path: None,
+                                                }),
+                                                cx,
+                                            );
                                         }),
                                 );
 
@@ -26621,8 +26716,8 @@ impl Render for DeployServerIndicator {
                             menu = menu.item(
                                 ContextMenuEntry::new(auto_label)
                                     .icon(IconName::CloudDownload)
-                                    .handler(move |_window, cx| {
-                                        cx.dispatch_action(&ToggleAutomaticUpload);
+                                    .handler(move |window, cx| {
+                                        window.dispatch_action(Box::new(ToggleAutomaticUpload), cx);
                                     }),
                             );
 
@@ -26649,8 +26744,8 @@ impl Render for DeployServerIndicator {
                                 menu = menu.item(
                                     ContextMenuEntry::new("File Transfer Log & Console…")
                                         .icon(IconName::ListTree)
-                                        .handler(move |_window, cx| {
-                                            cx.dispatch_action(&OpenFileTransferLog);
+                                        .handler(move |window, cx| {
+                                            window.dispatch_action(Box::new(OpenFileTransferLog), cx);
                                         }),
                                 );
                                 menu = menu.item(

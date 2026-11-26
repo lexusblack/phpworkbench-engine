@@ -12,7 +12,7 @@ use gpui::{
     Font, IntoElement, Render, Task, WeakEntity, Window,
 };
 use language::{Buffer, HighlightedText, Point};
-use project::{Project, ProjectPath};
+use project::{Project, ProjectItem, ProjectPath};
 use settings::Settings;
 use std::{
     any::{Any, TypeId},
@@ -217,6 +217,14 @@ impl FileDiffView {
             }),
         }
     }
+
+    pub fn new_buffer(&self) -> &Entity<Buffer> {
+        &self.new_buffer
+    }
+
+    pub fn old_buffer(&self) -> &Entity<Buffer> {
+        &self.old_buffer
+    }
 }
 
 #[ztracing::instrument(skip_all)]
@@ -340,7 +348,10 @@ impl Item for FileDiffView {
     }
 
     fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
-        self.editor.read(cx).active_project_path(cx)
+        self.editor
+            .read(cx)
+            .active_project_path(cx)
+            .or_else(|| self.new_buffer.read(cx).project_path(cx))
     }
 
     fn set_nav_history(

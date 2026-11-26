@@ -1480,9 +1480,7 @@ impl Dock {
                 is_file_transfer_active,
                 {
                     let is_active = is_file_transfer_active;
-                    let focus = focus_handle.clone();
                     move |_, window, cx| {
-                        window.focus(&focus, cx);
                         if is_active {
                             window.dispatch_action(Box::new(crate::ToggleBottomDock), cx);
                         } else {
