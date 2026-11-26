@@ -144,6 +144,8 @@ actions!(
     ]
 );
 
+pub mod file_transfer_panel;
+pub use file_transfer_panel::FileTransferPanel;
 pub use zed_actions::php_panel::OpenFileTransferLog;
 
 /// Adds a SQLite file picked in the project tree as a data source.
@@ -4375,18 +4377,20 @@ pub struct TransferLogEntry {
 pub struct DeployTransferGlobal {
     pub state: DeployTransferState,
     pub indicator: Option<WeakEntity<DeployServerIndicator>>,
+    pub file_transfer_panel: Option<WeakEntity<FileTransferPanel>>,
     pub history: Vec<TransferLogEntry>,
 }
 
 pub fn current_time_str() -> String {
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-    let hours = (secs % 86400) / 3600;
-    let mins = (secs % 3600) / 60;
-    let seconds = secs % 60;
-    format!("{:02}:{:02}:{:02}", hours, mins, seconds)
+    let now = OffsetDateTime::now_utc();
+    format!(
+        "{:02}/{:02}/{}, {:02}:{:02}",
+        now.day(),
+        now.month() as u8,
+        now.year(),
+        now.hour(),
+        now.minute()
+    )
 }
 
 pub fn record_transfer_log(
@@ -4405,17 +4409,25 @@ pub fn record_transfer_log(
         success,
         message,
     };
-    if cx.has_global::<DeployTransferGlobal>() {
+    let ftp = if cx.has_global::<DeployTransferGlobal>() {
         let global = cx.global_mut::<DeployTransferGlobal>();
         global.history.push(entry);
         if global.history.len() > 200 {
             global.history.remove(0);
         }
+        global.file_transfer_panel.clone()
     } else {
         cx.set_global(DeployTransferGlobal {
             state: DeployTransferState::Idle,
             indicator: None,
+            file_transfer_panel: None,
             history: vec![entry],
+        });
+        None
+    };
+    if let Some(panel) = ftp.and_then(|p| p.upgrade()) {
+        panel.update(cx, |_, cx| {
+            cx.notify();
         });
     }
 }
@@ -4430,19 +4442,18 @@ impl gpui::Global for DeployTransferGlobal {}
 
 pub fn set_deploy_transfer_started(message: String, cx: &mut App) {
     if cx.has_global::<DeployTransferGlobal>() {
-        let (indicator, panel) = {
+        let (indicator, ftp) = {
             let mut global = cx.global_mut::<DeployTransferGlobal>();
             global.state = DeployTransferState::Transferring {
                 message: message.clone(),
                 started_at: std::time::Instant::now(),
             };
-            let ind = global.indicator.clone();
-            let p = if cx.has_global::<DeployShared>() {
-                cx.global::<DeployShared>().panel.clone()
-            } else {
-                None
-            };
-            (ind, p)
+            (global.indicator.clone(), global.file_transfer_panel.clone())
+        };
+        let panel = if cx.has_global::<DeployShared>() {
+            cx.global::<DeployShared>().panel.clone()
+        } else {
+            None
         };
         if let Some(indicator) = indicator.and_then(|i| i.upgrade()) {
             indicator.update(cx, |this, cx| {
@@ -4459,6 +4470,11 @@ pub fn set_deploy_transfer_started(message: String, cx: &mut App) {
                 cx.notify();
             });
         }
+        if let Some(ftp) = ftp.and_then(|p| p.upgrade()) {
+            ftp.update(cx, |_, cx| {
+                cx.notify();
+            });
+        }
     } else {
         cx.set_global(DeployTransferGlobal {
             state: DeployTransferState::Transferring {
@@ -4466,6 +4482,7 @@ pub fn set_deploy_transfer_started(message: String, cx: &mut App) {
                 started_at: std::time::Instant::now(),
             },
             indicator: None,
+            file_transfer_panel: None,
             history: Vec::new(),
         });
     }
@@ -4473,20 +4490,19 @@ pub fn set_deploy_transfer_started(message: String, cx: &mut App) {
 
 pub fn set_deploy_transfer_finished(success: bool, message: String, cx: &mut App) {
     if cx.has_global::<DeployTransferGlobal>() {
-        let (indicator, panel) = {
+        let (indicator, ftp) = {
             let mut global = cx.global_mut::<DeployTransferGlobal>();
             global.state = DeployTransferState::Finished {
                 message: message.clone(),
                 success,
                 at: std::time::Instant::now(),
             };
-            let ind = global.indicator.clone();
-            let p = if cx.has_global::<DeployShared>() {
-                cx.global::<DeployShared>().panel.clone()
-            } else {
-                None
-            };
-            (ind, p)
+            (global.indicator.clone(), global.file_transfer_panel.clone())
+        };
+        let panel = if cx.has_global::<DeployShared>() {
+            cx.global::<DeployShared>().panel.clone()
+        } else {
+            None
         };
         if let Some(indicator) = indicator.and_then(|i| i.upgrade()) {
             indicator.update(cx, |this, cx| {
@@ -4524,6 +4540,22 @@ pub fn set_deploy_transfer_finished(success: bool, message: String, cx: &mut App
                 cx.notify();
             });
         }
+        if let Some(ftp) = ftp.and_then(|p| p.upgrade()) {
+            ftp.update(cx, |_, cx| {
+                cx.notify();
+            });
+        }
+    } else {
+        cx.set_global(DeployTransferGlobal {
+            state: DeployTransferState::Finished {
+                message: message.clone(),
+                success,
+                at: std::time::Instant::now(),
+            },
+            indicator: None,
+            file_transfer_panel: None,
+            history: Vec::new(),
+        });
     }
 }
 
@@ -13667,10 +13699,7 @@ impl PhpPanel {
                 open_ai_cli_settings(workspace, root, window, cx);
             });
             workspace.register_action(|workspace, _: &OpenFileTransferLog, window, cx| {
-                let ws_weak = workspace.weak_handle();
-                workspace.toggle_modal(window, cx, move |window, cx| {
-                    FileTransferLogModal::new(ws_weak, window, cx)
-                });
+                workspace.toggle_panel_focus::<FileTransferPanel>(window, cx);
             });
         })
         .detach();
@@ -26442,6 +26471,7 @@ impl DeployServerIndicator {
             cx.set_global(DeployTransferGlobal {
                 state: DeployTransferState::Idle,
                 indicator: Some(weak),
+                file_transfer_panel: None,
                 history: Vec::new(),
             });
         }

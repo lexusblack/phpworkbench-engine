@@ -1367,8 +1367,16 @@ impl Dock {
         let outline_panel_ix = self.panel_index_for_persistent_name("OutlinePanel", cx);
         let is_outline_active = self.is_open && self.active_panel_index == outline_panel_ix;
 
+        let is_file_transfer_active = self.workspace.upgrade().map_or(false, |ws| {
+            let ws = ws.read(cx);
+            ws.bottom_dock().read(cx).is_open()
+                && ws.bottom_dock().read(cx).visible_panel().is_some_and(|p| p.panel_key() == "FileTransferPanel")
+        });
+
         let is_terminal_active = self.workspace.upgrade().map_or(false, |ws| {
-            ws.read(cx).bottom_dock().read(cx).is_open()
+            let ws = ws.read(cx);
+            ws.bottom_dock().read(cx).is_open()
+                && ws.bottom_dock().read(cx).visible_panel().is_some_and(|p| p.panel_key() == "TerminalPanel")
         });
 
         let focus_handle = self.focus_handle(cx);
@@ -1469,9 +1477,18 @@ impl Dock {
                 "left-stripe-file-transfer",
                 ui::IconName::ArrowUpDown,
                 "File Transfer",
-                false,
-                |_, window, cx| {
-                    window.dispatch_action(Box::new(zed_actions::php_panel::OpenFileTransferLog), cx);
+                is_file_transfer_active,
+                {
+                    let is_active = is_file_transfer_active;
+                    let focus = focus_handle.clone();
+                    move |_, window, cx| {
+                        window.focus(&focus, cx);
+                        if is_active {
+                            window.dispatch_action(Box::new(crate::ToggleBottomDock), cx);
+                        } else {
+                            window.dispatch_action(Box::new(zed_actions::php_panel::OpenFileTransferLog), cx);
+                        }
+                    }
                 },
                 cx,
             ))
