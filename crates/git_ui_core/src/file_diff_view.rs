@@ -401,6 +401,26 @@ impl Item for FileDiffView {
         });
     }
 
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.editor.read(cx).is_dirty(cx) || self.new_buffer.read(cx).is_dirty()
+    }
+
+    fn buffer_kind(&self, _cx: &App) -> workspace::item::ItemBufferKind {
+        workspace::item::ItemBufferKind::Singleton
+    }
+
+    fn has_conflict(&self, cx: &App) -> bool {
+        self.editor.read(cx).has_conflict(cx) || self.new_buffer.read(cx).has_conflict()
+    }
+
+    fn has_deleted_file(&self, cx: &App) -> bool {
+        self.editor.read(cx).has_deleted_file(cx)
+    }
+
+    fn capability(&self, cx: &App) -> language::Capability {
+        self.editor.read(cx).capability(cx)
+    }
+
     fn can_save(&self, cx: &App) -> bool {
         self.editor.read(cx).rhs_editor().read(cx).can_save(cx)
     }

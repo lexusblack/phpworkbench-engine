@@ -26,7 +26,7 @@ use gpui::{
     anchored,
     deferred, px, size,
 };
-use project::{Project, ProjectPath};
+use project::{Project, ProjectItem, ProjectPath};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -4617,9 +4617,32 @@ pub fn set_active_deployment_server(name: Option<String>, cx: &mut App) {
     request_reload_menus(cx);
 }
 
+static LAST_AUTO_UPLOAD: std::sync::Mutex<Option<(PathBuf, std::time::Instant)>> = std::sync::Mutex::new(None);
+
 pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEntity<Workspace>>, cx: &mut App) {
     if remote_file_banner::parse_remote_path(&abs_path).is_some() {
         return;
+    }
+    if let Ok(mut last) = LAST_AUTO_UPLOAD.lock() {
+        let now = std::time::Instant::now();
+        if let Some((ref last_path, last_time)) = *last {
+            if last_path == &abs_path && now.duration_since(last_time) < std::time::Duration::from_millis(400) {
+                return;
+            }
+        }
+        *last = Some((abs_path.clone(), now));
+    }
+    if !cx.has_global::<DeployShared>() || cx.global::<DeployShared>().servers.is_empty() {
+        if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
+            ws.update(cx, |workspace, cx| {
+                init_workspace_deployment(workspace, cx);
+            });
+        }
+        if !cx.has_global::<DeployShared>() || cx.global::<DeployShared>().servers.is_empty() {
+            if let Some(root) = find_root_for_path(&abs_path) {
+                sync_deploy_shared_for_root(&root, cx);
+            }
+        }
     }
     if !cx.has_global::<DeployShared>() {
         return;
@@ -4770,16 +4793,24 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEnti
     .detach();
 }
 
-pub fn init_workspace_deployment(workspace: &Workspace, cx: &mut App) {
-    let project = workspace.project().read(cx);
-    let Some(worktree) = project.visible_worktrees(cx).next() else {
-        return;
-    };
-    let root = worktree.read(cx).abs_path().to_path_buf();
-    let config_path = deploy_config_path(&root);
+pub fn find_root_for_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if ancestor.join(".phpworkbench/deploy.json").is_file()
+            || ancestor.join(".idea/webServers.xml").is_file()
+            || ancestor.join(".zed/deploy.json").is_file()
+            || ancestor.join(".git").exists()
+        {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+pub fn sync_deploy_shared_for_root(root: &Path, cx: &mut App) {
+    let config_path = deploy_config_path(root);
     let mut config = load_config_object(&config_path).unwrap_or_default();
     if !config.contains_key("servers") {
-        if let Some(imported) = load_deploy_config_for_root(&root) {
+        if let Some(imported) = load_deploy_config_for_root(root) {
             if let Some(obj) = imported.as_object() {
                 config = obj.clone();
             }
@@ -4821,15 +4852,30 @@ pub fn init_workspace_deployment(workspace: &Workspace, cx: &mut App) {
             .unwrap_or(false)
     }).unwrap_or(false);
 
+    let panel = if cx.has_global::<DeployShared>() {
+        cx.global::<DeployShared>().panel.clone()
+    } else {
+        None
+    };
+
     cx.set_global(DeployShared {
         servers: names,
         active,
         auto_upload,
-        panel: None,
-        root: Some(root),
+        panel,
+        root: Some(root.to_path_buf()),
     });
 
     request_reload_menus(cx);
+}
+
+pub fn init_workspace_deployment(workspace: &Workspace, cx: &mut App) {
+    let project = workspace.project().read(cx);
+    let Some(worktree) = project.visible_worktrees(cx).next() else {
+        return;
+    };
+    let root = worktree.read(cx).abs_path().to_path_buf();
+    sync_deploy_shared_for_root(&root, cx);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5500,10 +5546,8 @@ pub fn execute_deploy_upload(
             .arg(&server_clone);
 
         if !rel_clone.is_empty() && rel_clone != "." {
-            cmd.arg("--path").arg(&rel_clone);
-            if let Some(abs) = abs_path {
-                cmd.arg("--from").arg(&abs);
-            }
+            let from_path = abs_path.unwrap_or_else(|| root_clone.join(&rel_clone).to_string_lossy().to_string());
+            cmd.arg("--path").arg(&rel_clone).arg("--from").arg(&from_path);
         } else {
             cmd.arg("--path").arg(".");
         }
@@ -5616,9 +5660,8 @@ pub fn execute_deploy_download(
             .arg("--path")
             .arg(if rel_clone.is_empty() { "." } else { &rel_clone });
 
-        if let Some(abs) = abs_path {
-            cmd.arg("--to").arg(&abs);
-        }
+        let to_path = abs_path.unwrap_or_else(|| root_clone.join(if rel_clone.is_empty() { "." } else { &rel_clone }).to_string_lossy().to_string());
+        cmd.arg("--to").arg(&to_path);
 
         let output = cmd.output().map_err(|e| e.to_string())?;
         if output.status.success() {
@@ -13013,13 +13056,24 @@ impl PhpPanel {
             }
 
             let ws_weak = workspace.weak_handle();
+            let ws_weak_user_save = ws_weak.clone();
             cx.subscribe_self(move |workspace, event: &workspace::Event, cx| {
                 if let workspace::Event::UserSavedItem { item, .. } = event {
                     if let Some(item_handle) = item.upgrade() {
-                        let abs_path = if let Some(editor) = item_handle.act_as::<Editor>(cx) {
+                        let abs_path = if let Some(diff_view) = item_handle.act_as::<git_ui_core::file_diff_view::FileDiffView>(cx) {
+                            diff_view.read(cx).new_buffer().read(cx).file().and_then(|f| f.file_system_abs_path(cx))
+                        } else if let Some(editor) = item_handle.act_as::<Editor>(cx) {
                             editor.update(cx, |editor, cx| editor.target_file_abs_path(cx))
-                        } else if let Some(diff_view) = item_handle.act_as::<git_ui_core::file_diff_view::FileDiffView>(cx) {
-                            diff_view.read(cx).new_buffer().read(cx).file().and_then(|f| f.as_local().map(|f| f.abs_path(cx)))
+                                .or_else(|| {
+                                    editor.read(cx).active_buffer(cx).and_then(|b| {
+                                        b.read(cx).file().and_then(|f| f.file_system_abs_path(cx))
+                                    })
+                                })
+                                .or_else(|| {
+                                    item_handle.project_path(cx).and_then(|pp| {
+                                        workspace.project().read(cx).absolute_path(&pp, cx)
+                                    })
+                                })
                         } else if let Some(project_path) = item_handle.project_path(cx) {
                             let project = workspace.project().read(cx);
                             project.absolute_path(&project_path, cx)
@@ -13027,13 +13081,55 @@ impl PhpPanel {
                             None
                         };
                         if let Some(abs_path) = abs_path {
-                            trigger_auto_upload_on_save(abs_path, Some(ws_weak.clone()), cx);
+                            trigger_auto_upload_on_save(abs_path, Some(ws_weak_user_save.clone()), cx);
                         }
                     }
                 }
             }).detach();
 
             let project = workspace.project().clone();
+            let buffer_store = project.read(cx).buffer_store().clone();
+            let ws_weak_buffers = ws_weak.clone();
+
+            let subscribe_to_buffer = {
+                let ws_weak = ws_weak_buffers.clone();
+                move |buffer: &Entity<language::Buffer>, cx: &mut Context<Workspace>| {
+                    let ws_weak = ws_weak.clone();
+                    cx.subscribe(buffer, move |_workspace, buffer, event: &language::BufferEvent, cx| {
+                        if matches!(event, language::BufferEvent::Saved) {
+                            let abs_path = if let Some(file) = buffer.read(cx).file() {
+                                file.file_system_abs_path(cx)
+                                    .or_else(|| worktree::File::from_dyn(Some(file)).map(|f| f.worktree.read(cx).absolutize(&f.path)))
+                                    .or_else(|| {
+                                        let full = file.full_path(cx);
+                                        if full.is_absolute() { Some(full) } else { None }
+                                    })
+                            } else {
+                                None
+                            }.or_else(|| {
+                                buffer.read(cx).project_path(cx).and_then(|pp| {
+                                    ws_weak.upgrade().and_then(|ws| ws.read(cx).project().read(cx).absolute_path(&pp, cx))
+                                })
+                            });
+                            if let Some(abs_path) = abs_path {
+                                trigger_auto_upload_on_save(abs_path, Some(ws_weak.clone()), cx);
+                            }
+                        }
+                    }).detach();
+                }
+            };
+
+            let existing_buffers = buffer_store.read(cx).buffers().collect::<Vec<_>>();
+            for buffer in existing_buffers {
+                subscribe_to_buffer(&buffer, cx);
+            }
+
+            let subscribe_to_buffer_clone = subscribe_to_buffer.clone();
+            cx.subscribe(&buffer_store, move |_workspace, _store, event: &project::buffer_store::BufferStoreEvent, cx| {
+                if let project::buffer_store::BufferStoreEvent::BufferAdded(buffer) = event {
+                    subscribe_to_buffer_clone(buffer, cx);
+                }
+            }).detach();
             cx.subscribe(&project, |workspace, _project, event: &project::Event, cx| {
                 if matches!(event, project::Event::WorktreeAdded(_) | project::Event::WorktreeUpdatedEntries(..)) {
                     if !cx.has_global::<DeployShared>() || cx.global::<DeployShared>().servers.is_empty() {
@@ -13339,10 +13435,16 @@ impl PhpPanel {
             workspace.register_action(|workspace, action: &UploadToDeployServer, window, cx| {
                 let root = resolve_deploy_root(workspace, cx);
                 let Some(root) = root else { return; };
+                let default_server = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().active.clone()
+                } else {
+                    None
+                }.or_else(|| load_active_deploy_server(&root));
+                let target_server = action.server.clone().or_else(|| default_server.clone());
 
                 if let Some(files) = action.paths.clone().filter(|p| !p.is_empty()) {
                     if files.len() > 1 {
-                        if let Some(server) = action.server.clone() {
+                        if let Some(server) = target_server.clone() {
                             execute_deploy_batch_upload(workspace, root, server, files, cx);
                         } else {
                             let servers = load_deploy_servers(&root);
@@ -13368,7 +13470,7 @@ impl PhpPanel {
                         return;
                     } else if let Some((abs, rel)) = files.into_iter().next() {
                         let (abs_path, rel_path) = (Some(abs), rel);
-                        if let Some(server) = action.server.clone() {
+                        if let Some(server) = target_server.clone() {
                             execute_deploy_upload(workspace, root, server, abs_path, rel_path, cx);
                         } else {
                             let servers = load_deploy_servers(&root);
@@ -13396,7 +13498,7 @@ impl PhpPanel {
 
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
 
-                if let Some(server) = action.server.clone() {
+                if let Some(server) = target_server {
                     execute_deploy_upload(workspace, root, server, abs_path, rel_path, cx);
                 } else {
                     let servers = load_deploy_servers(&root);
@@ -13422,10 +13524,16 @@ impl PhpPanel {
             workspace.register_action(|workspace, action: &DownloadFromDeployServer, window, cx| {
                 let root = resolve_deploy_root(workspace, cx);
                 let Some(root) = root else { return; };
+                let default_server = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().active.clone()
+                } else {
+                    None
+                }.or_else(|| load_active_deploy_server(&root));
+                let target_server = action.server.clone().or_else(|| default_server.clone());
 
                 if let Some(files) = action.paths.clone().filter(|p| !p.is_empty()) {
                     if files.len() > 1 {
-                        if let Some(server) = action.server.clone() {
+                        if let Some(server) = target_server.clone() {
                             execute_deploy_batch_download(workspace, root, server, files, cx);
                         } else {
                             let servers = load_deploy_servers(&root);
@@ -13451,7 +13559,7 @@ impl PhpPanel {
                         return;
                     } else if let Some((abs, rel)) = files.into_iter().next() {
                         let (abs_path, rel_path) = (Some(abs), rel);
-                        if let Some(server) = action.server.clone() {
+                        if let Some(server) = target_server.clone() {
                             execute_deploy_download(workspace, root, server, abs_path, rel_path, cx);
                         } else {
                             let servers = load_deploy_servers(&root);
@@ -13479,7 +13587,7 @@ impl PhpPanel {
 
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
 
-                if let Some(server) = action.server.clone() {
+                if let Some(server) = target_server {
                     execute_deploy_download(workspace, root, server, abs_path, rel_path, cx);
                 } else {
                     let servers = load_deploy_servers(&root);
@@ -13505,9 +13613,16 @@ impl PhpPanel {
             workspace.register_action(|workspace, action: &CompareWithDeployServer, window, cx| {
                 let root = resolve_deploy_root(workspace, cx);
                 let Some(root) = root else { return; };
+                let default_server = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().active.clone()
+                } else {
+                    None
+                }.or_else(|| load_active_deploy_server(&root));
+                let target_server = action.server.clone().or_else(|| default_server.clone());
+
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
 
-                if let Some(server) = action.server.clone() {
+                if let Some(server) = target_server {
                     execute_deploy_compare(workspace, window, root, server, abs_path, rel_path, cx);
                 } else {
                     let servers = load_deploy_servers(&root);
@@ -13533,9 +13648,16 @@ impl PhpPanel {
             workspace.register_action(|workspace, action: &SyncWithDeployServer, window, cx| {
                 let root = resolve_deploy_root(workspace, cx);
                 let Some(root) = root else { return; };
+                let default_server = if cx.has_global::<DeployShared>() {
+                    cx.global::<DeployShared>().active.clone()
+                } else {
+                    None
+                }.or_else(|| load_active_deploy_server(&root));
+                let target_server = action.server.clone().or_else(|| default_server.clone());
+
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, None, action.rel_path.clone(), cx);
 
-                if let Some(server) = action.server.clone() {
+                if let Some(server) = target_server {
                     execute_deploy_sync(workspace, root, server, cx);
                 } else {
                     let servers = load_deploy_servers(&root);
@@ -13812,13 +13934,15 @@ impl PhpPanel {
 
             let panel = cx.new(|cx| {
                 let focus_handle = cx.focus_handle();
-                let subscription = cx.subscribe(&project, |_: &mut Self, _, event, cx| {
+                let subscription = cx.subscribe(&project, |panel: &mut Self, _, event, cx| {
                     if matches!(
                         event,
                         project::Event::WorktreeAdded(_)
                             | project::Event::WorktreeRemoved(_)
                             | project::Event::WorktreeUpdatedEntries(..)
                     ) {
+                        panel.refresh(cx);
+                        panel.ensure_remote_selected(cx);
                         cx.notify();
                     }
                 });
@@ -26571,6 +26695,10 @@ impl DeployServerIndicator {
                 history: Vec::new(),
             });
         }
+        cx.observe_global::<DeployShared>(|_, cx| {
+            cx.notify();
+        })
+        .detach();
         Self {
             transfer_state: DeployTransferState::Idle,
         }

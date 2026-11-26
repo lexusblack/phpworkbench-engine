@@ -505,6 +505,10 @@ impl Item for ProjectDiff {
         self.diff.read(cx).is_dirty(cx)
     }
 
+    fn buffer_kind(&self, _: &App) -> workspace::item::ItemBufferKind {
+        workspace::item::ItemBufferKind::Multibuffer
+    }
+
     fn has_conflict(&self, cx: &App) -> bool {
         self.diff.read(cx).has_conflict(cx)
     }

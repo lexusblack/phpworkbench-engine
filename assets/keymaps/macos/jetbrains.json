@@ -236,7 +236,21 @@
   {
     "context": "Workspace",
     "bindings": {
+      "cmd-s": "workspace::Save",
+      "cmd-alt-s": "workspace::SaveAll",
       "alt-shift-cmd-x": ["php_panel::UploadToDeployServer", {}],
+    },
+  },
+  {
+    "context": "Editor",
+    "bindings": {
+      "cmd-s": "workspace::Save",
+    },
+  },
+  {
+    "context": "Pane",
+    "bindings": {
+      "cmd-s": "workspace::Save",
     },
   },
 ]
