@@ -172,6 +172,7 @@
   {
     "context": "ProjectPanel",
     "bindings": {
+      "ctrl-f": "project_panel::ToggleSearch",
       "enter": "project_panel::Open",
       "ctrl-shift-f": "project_panel::NewSearchInDirectory",
       "backspace": ["project_panel::Trash", { "skip_prompt": false }],

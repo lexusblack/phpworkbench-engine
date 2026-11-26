@@ -61,7 +61,7 @@ use std::{
 use svg_preview::svg_preview_view::SvgPreviewView;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
+    ContextMenu, DecoratedIcon, HighlightedLabel, IconDecoration, IconDecorationKind, IndentGuideColors,
     IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
     ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
 };
@@ -82,7 +82,7 @@ use workspace::{
 };
 use worktree::CreatedEntry;
 use zed_actions::{
-    project_panel::{Toggle, ToggleFocus},
+    project_panel::{Toggle, ToggleFocus, ToggleSearch},
     workspace::OpenWithSystem,
 };
 
@@ -167,6 +167,11 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     state: State,
+    search_editor: Entity<Editor>,
+    show_search: bool,
+    search_matches: Vec<(ProjectEntryId, SelectedEntry, Vec<usize>)>,
+    search_indices: HashMap<ProjectEntryId, Vec<usize>>,
+    current_match_index: Option<usize>,
 }
 
 struct UpdateVisibleEntriesTask {
@@ -452,6 +457,10 @@ actions!(
         OpenContextMenu,
         /// Opens an SVG preview for the selected file.
         OpenSvgPreview,
+        /// Jumps to the next search match.
+        NextSearchMatch,
+        /// Jumps to the previous search match.
+        PrevSearchMatch,
     ]
 );
 
@@ -702,6 +711,172 @@ enum RemovalKind {
     Delete,
 }
 
+fn ru_to_en_layout(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            'й' => 'q', 'Й' => 'Q',
+            'ц' => 'w', 'Ц' => 'W',
+            'у' => 'e', 'У' => 'E',
+            'к' => 'r', 'К' => 'R',
+            'е' => 't', 'Е' => 'T',
+            'н' => 'y', 'Н' => 'Y',
+            'г' => 'u', 'Г' => 'U',
+            'ш' => 'i', 'Ш' => 'I',
+            'щ' => 'o', 'Щ' => 'O',
+            'з' => 'p', 'З' => 'P',
+            'х' => '[', 'Х' => '{',
+            'ъ' => ']', 'Ъ' => '}',
+            'ф' => 'a', 'Ф' => 'A',
+            'ы' => 's', 'Ы' => 'S',
+            'в' => 'd', 'В' => 'D',
+            'а' => 'f', 'А' => 'F',
+            'п' => 'g', 'П' => 'G',
+            'р' => 'h', 'Р' => 'H',
+            'о' => 'j', 'О' => 'J',
+            'л' => 'k', 'Л' => 'K',
+            'д' => 'l', 'Д' => 'L',
+            'ж' => ';', 'Ж' => ':',
+            'э' => '\'', 'Э' => '"',
+            'я' => 'z', 'Я' => 'Z',
+            'ч' => 'x', 'Ч' => 'X',
+            'с' => 'c', 'С' => 'C',
+            'м' => 'v', 'М' => 'V',
+            'и' => 'b', 'И' => 'B',
+            'т' => 'n', 'Т' => 'N',
+            'ь' => 'm', 'Ь' => 'M',
+            'б' => ',', 'Б' => '<',
+            'ю' => '.', 'Ю' => '>',
+            other => other,
+        })
+        .collect()
+}
+
+fn en_to_ru_layout(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            'q' => 'й', 'Q' => 'Й',
+            'w' => 'ц', 'W' => 'Ц',
+            'e' => 'у', 'E' => 'У',
+            'r' => 'к', 'R' => 'К',
+            't' => 'е', 'T' => 'Е',
+            'y' => 'н', 'Y' => 'Н',
+            'u' => 'г', 'U' => 'Г',
+            'i' => 'ш', 'I' => 'Ш',
+            'o' => 'щ', 'O' => 'Щ',
+            'p' => 'з', 'P' => 'З',
+            '[' => 'х', '{' => 'Х',
+            ']' => 'ъ', '}' => 'Ъ',
+            'a' => 'ф', 'A' => 'Ф',
+            's' => 'ы', 'S' => 'Ы',
+            'd' => 'в', 'D' => 'В',
+            'f' => 'а', 'F' => 'А',
+            'g' => 'п', 'G' => 'П',
+            'h' => 'р', 'H' => 'Р',
+            'j' => 'о', 'J' => 'О',
+            'k' => 'л', 'K' => 'Л',
+            'l' => 'д', 'L' => 'Д',
+            ';' => 'ж', ':' => 'Ж',
+            '\'' => 'э', '"' => 'Э',
+            'z' => 'я', 'Z' => 'Я',
+            'x' => 'ч', 'X' => 'Ч',
+            'c' => 'с', 'C' => 'С',
+            'v' => 'м', 'V' => 'М',
+            'b' => 'и', 'B' => 'И',
+            'n' => 'т', 'N' => 'Т',
+            'm' => 'ь', 'M' => 'Ь',
+            ',' => 'б', '<' => 'Б',
+            '.' => 'ю', '>' => 'Ю',
+            other => other,
+        })
+        .collect()
+}
+
+fn find_substr(text: &str, query: &str) -> Option<Vec<usize>> {
+    let lower_text = text.to_lowercase();
+    let lower_query = query.to_lowercase();
+    let byte_pos = lower_text.find(&lower_query)?;
+
+    let char_offset = lower_text[..byte_pos].chars().count();
+    let match_char_count = lower_query.chars().count();
+
+    let mut indices = Vec::with_capacity(match_char_count);
+    let mut current_char_ix = 0;
+    for (b_ix, _) in text.char_indices() {
+        if current_char_ix >= char_offset && current_char_ix < char_offset + match_char_count {
+            indices.push(b_ix);
+        }
+        current_char_ix += 1;
+        if current_char_ix >= char_offset + match_char_count {
+            break;
+        }
+    }
+    Some(indices)
+}
+
+fn find_subseq(text: &str, query: &str) -> Option<Vec<usize>> {
+    let mut indices = Vec::with_capacity(query.len());
+    let mut query_chars = query.chars().peekable();
+
+    for (b_ix, c) in text.char_indices() {
+        if let Some(&target_char) = query_chars.peek() {
+            if c.to_lowercase().eq(target_char.to_lowercase()) {
+                indices.push(b_ix);
+                query_chars.next();
+            }
+        } else {
+            break;
+        }
+    }
+
+    if query_chars.peek().is_none() {
+        Some(indices)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn find_match_indices(text: &str, query: &str) -> Option<Vec<usize>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+
+    // 1. Case-insensitive substring match
+    if let Some(indices) = find_substr(text, q) {
+        return Some(indices);
+    }
+
+    // 2. Russian-to-English layout converted
+    let ru_to_en = ru_to_en_layout(q);
+    if ru_to_en != q {
+        if let Some(indices) = find_substr(text, &ru_to_en) {
+            return Some(indices);
+        }
+    }
+
+    // 3. English-to-Russian layout converted
+    let en_to_ru = en_to_ru_layout(q);
+    if en_to_ru != q {
+        if let Some(indices) = find_substr(text, &en_to_ru) {
+            return Some(indices);
+        }
+    }
+
+    // 4. Sub-sequence (fuzzy in-order) match
+    if let Some(indices) = find_subseq(text, q) {
+        return Some(indices);
+    }
+    if ru_to_en != q {
+        if let Some(indices) = find_subseq(text, &ru_to_en) {
+            return Some(indices);
+        }
+    }
+
+    None
+}
+
 impl ProjectPanel {
     fn new(
         workspace: &mut Workspace,
@@ -807,6 +982,23 @@ impl ProjectPanel {
             .detach();
 
             let filename_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let search_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Search files…", window, cx);
+                editor
+            });
+
+            cx.subscribe_in(
+                &search_editor,
+                window,
+                |project_panel, _, editor_event, window, cx| match editor_event {
+                    EditorEvent::BufferEdited => {
+                        project_panel.update_search_matches(window, cx);
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
 
             cx.subscribe_in(
                 &filename_editor,
@@ -893,6 +1085,11 @@ impl ProjectPanel {
                 selection: None,
                 context_menu: None,
                 filename_editor,
+                search_editor,
+                show_search: false,
+                search_matches: Vec::new(),
+                search_indices: HashMap::default(),
+                current_match_index: None,
                 clipboard: None,
                 _dragged_entry_destination: None,
                 workspace: workspace.weak_handle(),
@@ -2638,6 +2835,27 @@ impl ProjectPanel {
         if cx.stop_active_drag(window) {
             self.clear_drag_state(cx);
             return;
+        }
+        if self.show_search {
+            let has_query = !self.search_editor.read(cx).text(cx).is_empty();
+            if has_query {
+                self.search_editor.update(cx, |editor, cx| {
+                    editor.set_text("", window, cx);
+                });
+                self.search_matches.clear();
+                self.search_indices.clear();
+                self.current_match_index = None;
+                cx.notify();
+                return;
+            } else {
+                self.show_search = false;
+                self.search_matches.clear();
+                self.search_indices.clear();
+                self.current_match_index = None;
+                window.focus(&self.focus_handle, cx);
+                cx.notify();
+                return;
+            }
         }
         self.marked_entries.clear();
         cx.notify();
@@ -5185,6 +5403,9 @@ impl ProjectPanel {
                     this.update_visible_entries_task.autoscroll = false;
                     this.autoscroll(cx);
                 }
+                if this.show_search && !this.search_editor.read(cx).text(cx).is_empty() {
+                    this.update_search_matches(window, cx);
+                }
                 this.preload_initial_entry_icons(window, cx);
                 cx.notify();
             })
@@ -6384,6 +6605,11 @@ impl ProjectPanel {
             .is_some_and(|selection| selection.entry_id == entry_id);
 
         let file_name = details.filename.clone();
+        let match_indices = if self.show_search {
+            self.search_indices.get(&entry_id).cloned()
+        } else {
+            None
+        };
 
         let chevron = details.chevron.clone();
         let mut icon = details.icon.clone();
@@ -7132,14 +7358,25 @@ impl ProjectPanel {
                                 }
 
                                 None => this.child(
-                                    Label::new(file_name)
-                                        .single_line()
-                                        .color(filename_text_color)
-                                        .when(
-                                            settings.bold_folder_labels && kind.is_dir(),
-                                            |this| this.weight(FontWeight::MEDIUM),
-                                        )
-                                        .into_any_element(),
+                                    if let Some(indices) = match_indices {
+                                        HighlightedLabel::new(file_name, indices)
+                                            .single_line()
+                                            .color(filename_text_color)
+                                            .when(
+                                                settings.bold_folder_labels && kind.is_dir(),
+                                                |this| this.weight(FontWeight::MEDIUM),
+                                            )
+                                            .into_any_element()
+                                    } else {
+                                        Label::new(file_name)
+                                            .single_line()
+                                            .color(filename_text_color)
+                                            .when(
+                                                settings.bold_folder_labels && kind.is_dir(),
+                                                |this| this.weight(FontWeight::MEDIUM),
+                                            )
+                                            .into_any_element()
+                                    },
                                 ),
                             })
                     })
@@ -7210,12 +7447,25 @@ impl ProjectPanel {
         let active_index = folded_ancestors.active_index();
         let components_len = components.len();
         let delimiter = SharedString::new(path_style.primary_separator());
+        let search_query = if self.show_search {
+            let q = self.search_editor.read(cx).text(cx);
+            if !q.trim().is_empty() {
+                Some(q)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let path_component_elements =
             components
                 .into_iter()
                 .enumerate()
                 .map(move |(index, component)| {
+                    let match_indices = search_query
+                        .as_deref()
+                        .and_then(|q| find_match_indices(&component, q));
                     div()
                         .id(SharedString::from(format!(
                             "project_panel_path_component_{}_{index}",
@@ -7314,15 +7564,29 @@ impl ProjectPanel {
                         )
                         .debug_selector(|| format!("project_panel_path_component_{component}"))
                         .child(
-                            Label::new(component)
-                                .single_line()
-                                .color(filename_text_color)
-                                .when(bold_folder_labels && !is_file, |this| {
-                                    this.weight(FontWeight::MEDIUM)
-                                })
-                                .when(index == active_index && is_active_or_marked, |this| {
-                                    this.underline()
-                                }),
+                            if let Some(indices) = match_indices {
+                                HighlightedLabel::new(component, indices)
+                                    .single_line()
+                                    .color(filename_text_color)
+                                    .when(bold_folder_labels && !is_file, |this| {
+                                        this.weight(FontWeight::MEDIUM)
+                                    })
+                                    .when(index == active_index && is_active_or_marked, |this| {
+                                        this.underline()
+                                    })
+                                    .into_any_element()
+                            } else {
+                                Label::new(component)
+                                    .single_line()
+                                    .color(filename_text_color)
+                                    .when(bold_folder_labels && !is_file, |this| {
+                                        this.weight(FontWeight::MEDIUM)
+                                    })
+                                    .when(index == active_index && is_active_or_marked, |this| {
+                                        this.underline()
+                                    })
+                                    .into_any_element()
+                            },
                         )
                         .into_any()
                 });
@@ -7565,7 +7829,9 @@ impl ProjectPanel {
         dispatch_context.add("ProjectPanel");
         dispatch_context.add("menu");
 
-        let identifier = if self.filename_editor.focus_handle(cx).is_focused(window) {
+        let identifier = if self.filename_editor.focus_handle(cx).is_focused(window)
+            || self.search_editor.focus_handle(cx).is_focused(window)
+        {
             "editing"
         } else {
             "not_editing"
@@ -7820,6 +8086,219 @@ impl ProjectPanel {
             })
             .collect()
     }
+
+    fn toggle_search(&mut self, _: &ToggleSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_search && self.search_editor.focus_handle(cx).is_focused(window) {
+            if self.search_editor.read(cx).text(cx).is_empty() {
+                self.show_search = false;
+                self.search_matches.clear();
+                self.search_indices.clear();
+                self.current_match_index = None;
+                window.focus(&self.focus_handle, cx);
+            } else {
+                self.search_editor.update(cx, |editor, cx| {
+                    editor.select_all(&editor::actions::SelectAll, window, cx);
+                });
+            }
+        } else {
+            self.show_search = true;
+            self.search_editor.focus_handle(cx).focus(window, cx);
+            self.search_editor.update(cx, |editor, cx| {
+                editor.select_all(&editor::actions::SelectAll, window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn next_search_match(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let next_idx = match self.current_match_index {
+            Some(idx) => (idx + 1) % self.search_matches.len(),
+            None => 0,
+        };
+        self.current_match_index = Some(next_idx);
+        self.selection = Some(self.search_matches[next_idx].1);
+        self.autoscroll(cx);
+        cx.notify();
+    }
+
+    fn prev_search_match(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let prev_idx = match self.current_match_index {
+            Some(idx) => {
+                if idx == 0 {
+                    self.search_matches.len() - 1
+                } else {
+                    idx - 1
+                }
+            }
+            None => 0,
+        };
+        self.current_match_index = Some(prev_idx);
+        self.selection = Some(self.search_matches[prev_idx].1);
+        self.autoscroll(cx);
+        cx.notify();
+    }
+
+    fn next_search_match_action(
+        &mut self,
+        _: &NextSearchMatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.next_search_match(window, cx);
+    }
+
+    fn prev_search_match_action(
+        &mut self,
+        _: &PrevSearchMatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prev_search_match(window, cx);
+    }
+
+    fn update_search_matches(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_editor.read(cx).text(cx).trim().to_string();
+        self.search_matches.clear();
+        self.search_indices.clear();
+        self.current_match_index = None;
+
+        if query.is_empty() {
+            cx.notify();
+            return;
+        }
+
+        let mut matches = Vec::new();
+        for visible in &self.state.visible_entries {
+            for entry in &visible.entries {
+                let file_name = entry.path.file_name().unwrap_or_default().to_string();
+                if let Some(indices) = find_match_indices(&file_name, &query) {
+                    let selection = SelectedEntry {
+                        worktree_id: visible.worktree_id,
+                        entry_id: entry.id,
+                    };
+                    self.search_indices.insert(entry.id, indices.clone());
+                    matches.push((entry.id, selection, indices));
+                }
+            }
+        }
+
+        if !matches.is_empty() {
+            let current_pos = self.selection.and_then(|sel| {
+                matches.iter().position(|(_, s, _)| *s == sel)
+            });
+
+            let target_idx = current_pos.unwrap_or(0);
+            self.selection = Some(matches[target_idx].1);
+            self.current_match_index = Some(target_idx);
+            self.search_matches = matches;
+            self.autoscroll(cx);
+        } else {
+            self.search_matches = matches;
+        }
+
+        cx.notify();
+    }
+
+    fn render_search_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let total_matches = self.search_matches.len();
+        let current_match = self.current_match_index.map(|i| i + 1).unwrap_or(0);
+        let has_query = !self.search_editor.read(cx).text(cx).is_empty();
+
+        h_flex()
+            .id("project_panel_search_bar")
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .items_center()
+            .bg(colors.tab_bar_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .key_context({
+                let mut kc = KeyContext::new_with_defaults();
+                kc.add("ProjectPanelSearch");
+                kc.add("menu");
+                kc
+            })
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.next_search_match(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                this.cancel(&menu::Cancel, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::SelectNext, window, cx| {
+                this.next_search_match(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
+                this.prev_search_match(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor::actions::Newline, window, cx| {
+                this.next_search_match(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::SecondaryConfirm, window, cx| {
+                this.open(&Open, window, cx);
+            }))
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .child(self.search_editor.clone()),
+            )
+            .when(has_query, |this| {
+                this.child(
+                    Label::new(if total_matches > 0 {
+                        format!("{}/{}", current_match, total_matches)
+                    } else {
+                        "0/0".to_string()
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(if total_matches > 0 { Color::Muted } else { Color::Error }),
+                )
+                .child(
+                    IconButton::new("search_prev", IconName::ChevronUp)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Previous Match (Shift+Enter)"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.prev_search_match(window, cx);
+                        })),
+                )
+                .child(
+                    IconButton::new("search_next", IconName::ChevronDown)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Next Match (Enter)"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.next_search_match(window, cx);
+                        })),
+                )
+            })
+            .child(
+                IconButton::new("search_close", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Close (Esc)"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.search_editor.update(cx, |editor, cx| {
+                            editor.set_text("", window, cx);
+                        });
+                        this.show_search = false;
+                        this.search_matches.clear();
+                        this.search_indices.clear();
+                        this.current_match_index = None;
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    })),
+            )
+    }
 }
 
 #[derive(Clone)]
@@ -7858,7 +8337,16 @@ impl Render for ProjectPanel {
         }
 
         let has_worktree = !self.state.visible_entries.is_empty();
-        let project = self.project.read(cx);
+        let (is_collab, is_local, is_read_only, is_local_or_wsl, is_remote) = {
+            let project = self.project.read(cx);
+            (
+                project.is_via_collab(),
+                project.is_local(),
+                project.is_read_only(cx),
+                project.is_local() || project.is_via_wsl_with_host_interop(cx),
+                project.is_via_remote_server(),
+            )
+        };
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
         let show_indent_guides = panel_settings.indent_guides.show == ShowIndentGuides::Always;
@@ -7872,17 +8360,6 @@ impl Render for ProjectPanel {
                 false
             }
         };
-
-        // Trashing, undo, and redo rely on the `TrashProjectEntry` and
-        // `RestoreProjectEntry` messages, which older collab hosts can't
-        // decode, with the operation silently never completing. As such, we
-        // keep all three disabled for collab guests. Trashing is already
-        // disabled in collab today, so existing users will not lose any
-        // functionality and the plan is to eventually remove this check, once a
-        // considerable portion of collab hosts had the chance to upgrade to a
-        // version that understands these messages.
-        let is_collab = project.is_via_collab();
-        let is_local = project.is_local();
 
         if has_worktree {
             let item_count = self
@@ -8021,7 +8498,10 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::remove_from_project))
                 .on_action(cx.listener(Self::compare_marked_files))
                 .on_action(cx.listener(Self::open_context_menu))
-                .when(!project.is_read_only(cx), |el| {
+                .on_action(cx.listener(Self::toggle_search))
+                .on_action(cx.listener(Self::next_search_match_action))
+                .on_action(cx.listener(Self::prev_search_match_action))
+                .when(!is_read_only, |el| {
                     el.on_action(cx.listener(Self::new_file))
                         .on_action(cx.listener(Self::new_directory))
                         .on_action(cx.listener(Self::rename))
@@ -8039,21 +8519,21 @@ impl Render for ProjectPanel {
                                 .on_action(cx.listener(Self::redo))
                         })
                 })
-                .when(
-                    project.is_local() || project.is_via_wsl_with_host_interop(cx),
-                    |el| {
-                        el.on_action(cx.listener(Self::reveal_in_finder))
-                            .on_action(cx.listener(Self::open_system))
-                            .on_action(cx.listener(Self::open_in_terminal))
-                    },
-                )
-                .when(project.is_via_remote_server(), |el| {
+                .when(is_local_or_wsl, |el| {
+                    el.on_action(cx.listener(Self::reveal_in_finder))
+                        .on_action(cx.listener(Self::open_system))
+                        .on_action(cx.listener(Self::open_in_terminal))
+                })
+                .when(is_remote, |el| {
                     el.on_action(cx.listener(Self::open_in_terminal))
                         .on_action(cx.listener(Self::download_from_remote))
                 })
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
+                        .when(self.show_search, |this| {
+                            this.child(self.render_search_bar(window, cx))
+                        })
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
@@ -8414,7 +8894,7 @@ impl Render for ProjectPanel {
                                         }
                                     }),
                                 )
-                                .when(!project.is_read_only(cx), |el| {
+                                .when(!is_read_only, |el| {
                                     el.on_click(cx.listener(
                                         |this, event: &gpui::ClickEvent, window, cx| {
                                             if event.click_count() > 1
@@ -8750,6 +9230,40 @@ fn git_status_indicator(git_status: GitSummary) -> Option<(&'static str, Color)>
         return Some(("A", Color::Created));
     }
     None
+}
+
+#[cfg(test)]
+mod speed_search_tests {
+    use super::*;
+
+    #[test]
+    fn test_ru_to_en_conversion() {
+        assert_eq!(ru_to_en_layout("ь26"), "m26");
+        assert_eq!(ru_to_en_layout("фыв"), "asd");
+    }
+
+    #[test]
+    fn test_exact_substring_match() {
+        let indices = find_match_indices("m240926_083037_create_custom_card_table.php", "26");
+        assert!(indices.is_some());
+        let idx = indices.unwrap();
+        assert_eq!(idx, vec![5, 6]);
+    }
+
+    #[test]
+    fn test_russian_layout_match() {
+        let indices = find_match_indices("m240926_083037_create_custom_card_table.php", "ь26");
+        assert!(indices.is_some());
+        let idx = indices.unwrap();
+        assert_eq!(idx, vec![0, 1, 6]);
+    }
+
+    #[test]
+    fn test_case_insensitive_match() {
+        let indices = find_match_indices("PacklistExtra.php", "packlist");
+        assert!(indices.is_some());
+        assert_eq!(indices.unwrap().len(), 8);
+    }
 }
 
 #[cfg(test)]

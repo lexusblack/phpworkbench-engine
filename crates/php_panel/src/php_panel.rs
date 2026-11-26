@@ -140,10 +140,11 @@ actions!(
         ToggleAutomaticUpload,
         ConvertSchemaFileDialog,
         LaunchActiveAiAgent,
-        OpenAiCliSettings,
-        OpenFileTransferLog
+        OpenAiCliSettings
     ]
 );
+
+pub use zed_actions::php_panel::OpenFileTransferLog;
 
 /// Adds a SQLite file picked in the project tree as a data source.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]

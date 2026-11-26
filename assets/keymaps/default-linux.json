@@ -987,6 +987,7 @@
   {
     "context": "ProjectPanel",
     "bindings": {
+      "ctrl-f": "project_panel::ToggleSearch",
       "left": "project_panel::CollapseSelectedEntry",
       "ctrl-left": "project_panel::CollapseAllEntries",
       "right": "project_panel::ExpandSelectedEntry",

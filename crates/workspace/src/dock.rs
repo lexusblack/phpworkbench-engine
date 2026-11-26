@@ -1464,14 +1464,14 @@ impl Dock {
             .w_full()
             .items_center()
             .gap(px(2.0))
-            // 1. Sync / Fetch
+            // 1. File Transfer (matches PhpStorm tool window)
             .child(self.render_stripe_button(
-                "left-stripe-sync",
-                ui::IconName::ArrowRightLeft,
-                "Sync / Fetch",
+                "left-stripe-file-transfer",
+                ui::IconName::ArrowUpDown,
+                "File Transfer",
                 false,
                 |_, window, cx| {
-                    window.dispatch_action(Box::new(git::Fetch), cx);
+                    window.dispatch_action(Box::new(zed_actions::php_panel::OpenFileTransferLog), cx);
                 },
                 cx,
             ))
@@ -1760,6 +1760,28 @@ impl Dock {
                 h_flex()
                     .items_center()
                     .gap(px(2.0))
+                    .when(entry.panel.persistent_name() == "ProjectPanel", |this| {
+                        this.child(
+                            div()
+                                .id("tool-window-search")
+                                .size(px(20.0))
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .hover(|s| s.bg(colors.element_hover))
+                                .tooltip(Tooltip::text("Search Files (Cmd+F)"))
+                                .on_click(move |_, window: &mut Window, cx: &mut App| {
+                                    window.dispatch_action(Box::new(zed_actions::project_panel::ToggleSearch), cx);
+                                })
+                                .child(
+                                    Icon::new(ui::IconName::MagnifyingGlass)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id("tool-window-settings")

@@ -425,7 +425,20 @@ pub mod project_panel {
             /// Toggles the project panel.
             Toggle,
             /// Toggles focus on the project panel.
-            ToggleFocus
+            ToggleFocus,
+            /// Toggles the filename search field in the project panel.
+            ToggleSearch
+        ]
+    );
+}
+pub mod php_panel {
+    use gpui::actions;
+
+    actions!(
+        php_panel,
+        [
+            /// Opens the File Transfer log console.
+            OpenFileTransferLog
         ]
     );
 }
