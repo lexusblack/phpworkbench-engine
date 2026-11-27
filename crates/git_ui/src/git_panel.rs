@@ -334,6 +334,7 @@ fn action_for_entry_menu_item(action_id: &str) -> Option<Box<dyn Action>> {
         ids::ASK_AI => Some(php_panel::LaunchActiveAiAgent.boxed_clone()),
         ids::DELETE => Some(DeleteFile.boxed_clone()),
         ids::ADD_TO_VCS => Some(git::StageFile.boxed_clone()),
+        ids::GIT_ADD => Some(git::StageFile.boxed_clone()),
         ids::ADD_TO_GITIGNORE => Some(git::AddToGitignore.boxed_clone()),
         ids::NEW_CHANGELIST => Some(git::ToggleStaged.boxed_clone()),
         ids::EDIT_CHANGELIST => Some(git::ToggleStaged.boxed_clone()),
@@ -9582,6 +9583,7 @@ impl GitPanel {
                             rel_path: rel.clone(),
                             server: srv.clone(),
                             paths: b_paths.clone(),
+                            choose_server: false,
                         }),
                     )
                     .action_disabled_when(
@@ -9592,6 +9594,7 @@ impl GitPanel {
                             rel_path: rel.clone(),
                             server: None,
                             paths: b_paths.clone(),
+                            choose_server: true,
                         }),
                     )
                     .action_disabled_when(
@@ -9602,6 +9605,7 @@ impl GitPanel {
                             rel_path: rel.clone(),
                             server: srv.clone(),
                             paths: b_paths.clone(),
+                            choose_server: false,
                         }),
                     )
                     .action_disabled_when(
@@ -9612,6 +9616,7 @@ impl GitPanel {
                             rel_path: rel.clone(),
                             server: None,
                             paths: b_paths.clone(),
+                            choose_server: true,
                         }),
                     );
                 if !is_dir && !multiple_deploy {
@@ -9623,6 +9628,7 @@ impl GitPanel {
                                 abs_path: abs.clone(),
                                 rel_path: rel.clone(),
                                 server: srv.clone(),
+                                choose_server: false,
                             }),
                         )
                         .action_disabled_when(
@@ -9632,6 +9638,7 @@ impl GitPanel {
                                 abs_path: abs.clone(),
                                 rel_path: rel.clone(),
                                 server: None,
+                                choose_server: true,
                             }),
                         );
                 }
@@ -9643,6 +9650,7 @@ impl GitPanel {
                             Box::new(php_panel::SyncWithDeployServer {
                                 rel_path: rel.clone(),
                                 server: srv.clone(),
+                                choose_server: false,
                             }),
                         )
                         .action_disabled_when(
@@ -9651,6 +9659,7 @@ impl GitPanel {
                             Box::new(php_panel::SyncWithDeployServer {
                                 rel_path: rel.clone(),
                                 server: None,
+                                choose_server: true,
                             }),
                         );
                 }
@@ -9713,11 +9722,15 @@ impl GitPanel {
         self.mark_section_entries(section);
         let entries = self.effective_status_entries();
         let has_files = !entries.is_empty();
+        let any_untracked = section == Section::New
+            || (has_files && entries.iter().any(|entry| entry.status.is_untracked()));
+        let all_staged = section == Section::Staged
+            || (has_files && entries.iter().all(|entry| entry.staging.is_fully_staged()) && !any_untracked);
+        let has_tracked = section != Section::New && entries.iter().any(|entry| !entry.status.is_untracked());
         let state = phpstorm::EntryMenuState {
-            staged: section == Section::Staged
-                || (has_files && entries.iter().all(|entry| entry.staging.is_fully_staged())),
-            untracked: section == Section::New
-                || (has_files && entries.iter().all(|entry| entry.status.is_untracked())),
+            staged: all_staged,
+            untracked: any_untracked,
+            has_tracked,
             deleted: has_files && entries.iter().all(|entry| entry.status.is_deleted()),
             multiple: true,
             has_files,
@@ -9755,12 +9768,16 @@ impl GitPanel {
             return;
         }
 
+        let any_untracked = entries.iter().any(|entry| entry.status.is_untracked());
+        let all_staged = entries.iter().all(|entry| entry.staging.is_fully_staged()) && !any_untracked;
+        let all_deleted = entries.iter().all(|entry| entry.status.is_deleted());
+        let has_tracked = entries.iter().any(|entry| !entry.status.is_untracked());
+
         let state = phpstorm::EntryMenuState {
-            staged: entries
-                .iter()
-                .all(|entry| entry.staging.is_fully_staged()),
-            untracked: entries.iter().all(|entry| entry.status.is_untracked()),
-            deleted: entries.iter().all(|entry| entry.status.is_deleted()),
+            staged: all_staged,
+            untracked: any_untracked,
+            has_tracked,
+            deleted: all_deleted,
             multiple: entries.len() > 1,
             has_files: true,
         };
@@ -9788,9 +9805,16 @@ impl GitPanel {
             self.change_entries_by_path().cloned().collect::<Vec<_>>()
         };
         let has_files = !entries.is_empty();
+        let any_untracked = has_files && entries.iter().any(|entry| entry.status.is_untracked());
+        let all_staged = has_files
+            && entries.iter().all(|entry| entry.staging.is_fully_staged())
+            && !any_untracked;
+        let has_tracked = has_files && entries.iter().any(|entry| !entry.status.is_untracked());
+
         let state = phpstorm::EntryMenuState {
-            staged: has_files && entries.iter().all(|entry| entry.staging.is_fully_staged()),
-            untracked: has_files && entries.iter().all(|entry| entry.status.is_untracked()),
+            staged: all_staged,
+            untracked: any_untracked,
+            has_tracked,
             deleted: has_files && entries.iter().all(|entry| entry.status.is_deleted()),
             multiple: true,
             has_files,

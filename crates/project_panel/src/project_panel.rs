@@ -1535,6 +1535,10 @@ impl ProjectPanel {
                                     if has_git_changes {
                                         sub = sub
                                             .action(
+                                                "+ Add",
+                                                Box::new(git::StageFile),
+                                            )
+                                            .action(
                                                 "Add to VCS",
                                                 Box::new(git::StageFile),
                                             )
@@ -1582,6 +1586,7 @@ impl ProjectPanel {
                                             rel_path: Some(rel.clone()),
                                             server: srv.clone(),
                                             paths: b_paths.clone(),
+                                            choose_server: false,
                                         }),
                                     )
                                     .action(
@@ -1591,6 +1596,7 @@ impl ProjectPanel {
                                             rel_path: Some(rel.clone()),
                                             server: None,
                                             paths: b_paths.clone(),
+                                            choose_server: true,
                                         }),
                                     )
                                     .action(
@@ -1600,6 +1606,7 @@ impl ProjectPanel {
                                             rel_path: Some(rel.clone()),
                                             server: srv.clone(),
                                             paths: b_paths.clone(),
+                                            choose_server: false,
                                         }),
                                     )
                                     .action(
@@ -1609,6 +1616,7 @@ impl ProjectPanel {
                                             rel_path: Some(rel.clone()),
                                             server: None,
                                             paths: b_paths.clone(),
+                                            choose_server: true,
                                         }),
                                     );
                                 if !is_dir && !is_multiple {
@@ -1619,6 +1627,7 @@ impl ProjectPanel {
                                                 abs_path: Some(abs.clone()),
                                                 rel_path: Some(rel.clone()),
                                                 server: srv.clone(),
+                                                choose_server: false,
                                             }),
                                         )
                                         .action(
@@ -1627,6 +1636,7 @@ impl ProjectPanel {
                                                 abs_path: Some(abs.clone()),
                                                 rel_path: Some(rel.clone()),
                                                 server: None,
+                                                choose_server: true,
                                             }),
                                         );
                                 }
@@ -1637,6 +1647,7 @@ impl ProjectPanel {
                                             Box::new(php_panel::SyncWithDeployServer {
                                                 rel_path: Some(rel.clone()),
                                                 server: srv.clone(),
+                                                choose_server: false,
                                             }),
                                         )
                                         .action(
@@ -1644,6 +1655,7 @@ impl ProjectPanel {
                                             Box::new(php_panel::SyncWithDeployServer {
                                                 rel_path: Some(rel.clone()),
                                                 server: None,
+                                                choose_server: true,
                                             }),
                                         );
                                 }
@@ -1844,7 +1856,12 @@ impl ProjectPanel {
                     git_entry.git_summary.index.modified + git_entry.git_summary.worktree.modified;
                 let total_deleted =
                     git_entry.git_summary.index.deleted + git_entry.git_summary.worktree.deleted;
-                return total_modified > 0 || total_deleted > 0;
+                let total_added = git_entry.git_summary.index.added;
+                return total_modified > 0
+                    || total_deleted > 0
+                    || total_added > 0
+                    || git_entry.git_summary.untracked > 0
+                    || git_entry.git_summary.conflict > 0;
             }
         }
         false

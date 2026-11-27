@@ -192,6 +192,8 @@ pub struct UploadToDeployServer {
     pub server: Option<String>,
     #[serde(default)]
     pub paths: Option<Vec<(String, String)>>,
+    #[serde(default)]
+    pub choose_server: bool,
 }
 
 /// Downloads a file, directory, or project from the target deployment server.
@@ -207,6 +209,8 @@ pub struct DownloadFromDeployServer {
     pub server: Option<String>,
     #[serde(default)]
     pub paths: Option<Vec<(String, String)>>,
+    #[serde(default)]
+    pub choose_server: bool,
 }
 
 /// Compares a local file with the deployed version on the target deployment server.
@@ -220,6 +224,8 @@ pub struct CompareWithDeployServer {
     pub rel_path: Option<String>,
     #[serde(default)]
     pub server: Option<String>,
+    #[serde(default)]
+    pub choose_server: bool,
 }
 
 /// Synchronizes files with the target deployment server.
@@ -231,6 +237,8 @@ pub struct SyncWithDeployServer {
     pub rel_path: Option<String>,
     #[serde(default)]
     pub server: Option<String>,
+    #[serde(default)]
+    pub choose_server: bool,
 }
 
 /// Uploads all open files in editor tabs to the target deployment server.
@@ -13445,7 +13453,11 @@ impl PhpPanel {
                 } else {
                     None
                 }.or_else(|| load_active_deploy_server(&root));
-                let target_server = action.server.clone().or_else(|| default_server.clone());
+                let target_server = if action.choose_server {
+                    None
+                } else {
+                    action.server.clone().or_else(|| default_server.clone())
+                };
 
                 if let Some(files) = action.paths.clone().filter(|p| !p.is_empty()) {
                     if files.len() > 1 {
@@ -13534,7 +13546,11 @@ impl PhpPanel {
                 } else {
                     None
                 }.or_else(|| load_active_deploy_server(&root));
-                let target_server = action.server.clone().or_else(|| default_server.clone());
+                let target_server = if action.choose_server {
+                    None
+                } else {
+                    action.server.clone().or_else(|| default_server.clone())
+                };
 
                 if let Some(files) = action.paths.clone().filter(|p| !p.is_empty()) {
                     if files.len() > 1 {
@@ -13623,7 +13639,11 @@ impl PhpPanel {
                 } else {
                     None
                 }.or_else(|| load_active_deploy_server(&root));
-                let target_server = action.server.clone().or_else(|| default_server.clone());
+                let target_server = if action.choose_server {
+                    None
+                } else {
+                    action.server.clone().or_else(|| default_server.clone())
+                };
 
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, action.abs_path.clone(), action.rel_path.clone(), cx);
 
@@ -13658,7 +13678,11 @@ impl PhpPanel {
                 } else {
                     None
                 }.or_else(|| load_active_deploy_server(&root));
-                let target_server = action.server.clone().or_else(|| default_server.clone());
+                let target_server = if action.choose_server {
+                    None
+                } else {
+                    action.server.clone().or_else(|| default_server.clone())
+                };
 
                 let (abs_path, rel_path) = resolve_deploy_target_paths(workspace, &root, None, action.rel_path.clone(), cx);
 
@@ -26710,6 +26734,7 @@ impl Render for DeployServerIndicator {
                                                     abs_path: None,
                                                     rel_path: None,
                                                     paths: None,
+                                                    choose_server: false,
                                                 }),
                                                 cx,
                                             );
@@ -26727,6 +26752,7 @@ impl Render for DeployServerIndicator {
                                                     abs_path: None,
                                                     rel_path: None,
                                                     paths: None,
+                                                    choose_server: false,
                                                 }),
                                                 cx,
                                             );
@@ -26742,6 +26768,7 @@ impl Render for DeployServerIndicator {
                                                 Box::new(SyncWithDeployServer {
                                                     server: Some(s_sync.clone()),
                                                     rel_path: None,
+                                                    choose_server: false,
                                                 }),
                                                 cx,
                                             );

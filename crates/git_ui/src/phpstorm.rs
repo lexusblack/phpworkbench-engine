@@ -281,6 +281,7 @@ pub mod entry_menu_action {
     pub const COPY_AS_PATCH: &str = "copy_as_patch";
     pub const SHELVE: &str = "shelve";
     pub const REFRESH: &str = "refresh";
+    pub const GIT_ADD: &str = "git.add";
     pub const COMPARE_WITH_BRANCH: &str = "git.compare_branch";
     pub const SHOW_HISTORY: &str = "git.show_history";
     pub const BRANCHES: &str = "git.branches";
@@ -327,6 +328,8 @@ pub struct EntryMenuState {
     pub staged: bool,
     /// Every affected file is new/untracked.
     pub untracked: bool,
+    /// Whether any affected file is tracked.
+    pub has_tracked: bool,
     /// Every affected file is deleted from the worktree.
     pub deleted: bool,
     /// Whether multiple files or a section header is selected.
@@ -340,6 +343,7 @@ impl Default for EntryMenuState {
         Self {
             staged: false,
             untracked: false,
+            has_tracked: true,
             deleted: false,
             multiple: false,
             has_files: true,
@@ -352,6 +356,7 @@ impl EntryMenuState {
         Self {
             staged,
             untracked,
+            has_tracked: !untracked,
             deleted,
             multiple: false,
             has_files: true,
@@ -362,6 +367,7 @@ impl EntryMenuState {
         Self {
             staged,
             untracked,
+            has_tracked: !untracked || staged,
             deleted,
             multiple: true,
             has_files,
@@ -376,7 +382,7 @@ impl EntryMenuState {
 pub fn menu_items_for(state: EntryMenuState) -> Vec<MenuItemSpec> {
     use entry_menu_action as ids;
 
-    let tracked = (!state.untracked || state.staged) && state.has_files;
+    let tracked = (state.has_tracked || !state.untracked || state.staged) && state.has_files;
     let commit_label = if state.multiple {
         "Commit Files..."
     } else {
@@ -411,6 +417,7 @@ pub fn menu_items_for(state: EntryMenuState) -> Vec<MenuItemSpec> {
         item("Shelve Changes...", tracked, ids::SHELVE),
         MenuItemSpec::separator(),
         item("Refresh", true, ids::REFRESH),
+        item("+ Add", state.has_files && (state.untracked || !state.staged), ids::GIT_ADD),
         item("Compare with Branch...", tracked, ids::COMPARE_WITH_BRANCH),
         item("Show History", tracked, ids::SHOW_HISTORY),
         item("Branches...", true, ids::BRANCHES),
@@ -465,6 +472,7 @@ mod entry_menu_tests {
                 "Copy as Patch to Clipboard",
                 "Shelve Changes...",
                 "Refresh",
+                "+ Add",
                 "Compare with Branch...",
                 "Show History",
                 "Branches...",
@@ -503,6 +511,8 @@ mod entry_menu_tests {
 
         assert!(!enabled(staged, ids::ADD_TO_VCS));
         assert!(enabled(unstaged, ids::ADD_TO_VCS));
+        assert!(!enabled(staged, ids::GIT_ADD));
+        assert!(enabled(unstaged, ids::GIT_ADD));
 
         for action_id in [
             ids::COMMIT_FILE,
@@ -535,6 +545,7 @@ mod entry_menu_tests {
         assert!(!enabled(untracked, ids::SHOW_DIFF));
         assert!(!enabled(untracked, ids::SHOW_DIFF_NEW_TAB));
         assert!(enabled(untracked, ids::ADD_TO_VCS));
+        assert!(enabled(untracked, ids::GIT_ADD));
         assert!(enabled(untracked, ids::ADD_TO_GITIGNORE));
         assert!(enabled(untracked, ids::JUMP_TO_SOURCE));
     }
@@ -578,6 +589,7 @@ mod entry_menu_tests {
         assert_eq!(
             git_actions,
             vec![
+                ids::GIT_ADD,
                 ids::COMPARE_WITH_BRANCH,
                 ids::SHOW_HISTORY,
                 ids::BRANCHES,
