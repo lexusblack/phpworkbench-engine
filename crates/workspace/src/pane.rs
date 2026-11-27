@@ -1637,7 +1637,12 @@ impl Pane {
                 .when_closing_with_no_tabs
                 .should_close()
             {
-                window.dispatch_action(Box::new(CloseWindow), cx);
+                let has_projects = self.project.upgrade().map_or(false, |p| {
+                    p.read(cx).visible_worktrees(cx).next().is_some()
+                });
+                if !has_projects {
+                    window.dispatch_action(Box::new(CloseWindow), cx);
+                }
             }
 
             return Task::ready(Ok(()));

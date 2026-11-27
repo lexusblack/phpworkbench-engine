@@ -895,26 +895,36 @@ impl<T: Item> ItemHandle for Entity<T> {
                                 && !item.is_dirty(cx)
                                 && item.workspace_settings(cx).close_on_file_delete
                             {
-                                let item_id = item.item_id();
-                                let close_item_task = pane.update(cx, |pane, cx| {
-                                    pane.close_item_by_id(
-                                        item_id,
-                                        crate::SaveIntent::Close,
-                                        window,
-                                        cx,
-                                    )
+                                let actually_deleted = item.project_path(cx).map_or(false, |pp| {
+                                    workspace.project().read(cx).absolute_path(&pp, cx).map_or(true, |abs| !abs.exists())
                                 });
-                                cx.spawn_in(window, {
-                                    let pane = pane.clone();
-                                    async move |_workspace, cx| {
-                                        close_item_task.await?;
-                                        pane.update(cx, |pane, _cx| {
-                                            pane.nav_history_mut().remove_item(item_id);
-                                        });
-                                        anyhow::Ok(())
-                                    }
-                                })
-                                .detach_and_log_err(cx);
+                                if actually_deleted {
+                                    let item_id = item.item_id();
+                                    let close_item_task = pane.update(cx, |pane, cx| {
+                                        pane.close_item_by_id(
+                                            item_id,
+                                            crate::SaveIntent::Close,
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                    cx.spawn_in(window, {
+                                        let pane = pane.clone();
+                                        async move |_workspace, cx| {
+                                            close_item_task.await?;
+                                            pane.update(cx, |pane, _cx| {
+                                                pane.nav_history_mut().remove_item(item_id);
+                                            });
+                                            anyhow::Ok(())
+                                        }
+                                    })
+                                    .detach_and_log_err(cx);
+                                } else {
+                                    pane.update(cx, |_, cx| {
+                                        cx.emit(pane::Event::ChangeItemTitle);
+                                        cx.notify();
+                                    });
+                                }
                             } else {
                                 pane.update(cx, |_, cx| {
                                     cx.emit(pane::Event::ChangeItemTitle);

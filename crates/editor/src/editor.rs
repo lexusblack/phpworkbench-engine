@@ -2962,7 +2962,7 @@ impl Editor {
         None
     }
 
-    pub fn target_file_abs_path(&self, cx: &mut Context<Self>) -> Option<PathBuf> {
+    pub fn target_file_abs_path(&self, cx: &App) -> Option<PathBuf> {
         self.active_buffer(cx).and_then(|buffer| {
             let buffer = buffer.read(cx);
             if let Some(project_path) = buffer.project_path(cx) {

@@ -6532,6 +6532,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.panes.len() <= 1 {
+            self.active_item_path_changed(true, window, cx);
+            cx.notify();
+            return;
+        }
+
         if self.center.remove(&pane, cx).unwrap() {
             if self
                 .maximized_pane

@@ -5499,26 +5499,32 @@ impl ProjectPanel {
     ) {
         self.project.update(cx, |project, cx| {
             let expanded_dir_ids = self.state.expanded_dir_ids.entry(worktree_id).or_default();
-            if let Some(worktree) = project.worktree_for_id(worktree_id, cx) {
-                project.expand_entry(worktree_id, entry_id, cx);
-                let worktree = worktree.read(cx);
-
-                if let Some(mut entry) = worktree.entry_for_id(entry_id) {
-                    loop {
-                        if entry.is_dir()
-                            && let Err(ix) = expanded_dir_ids.binary_search(&entry.id)
-                        {
-                            expanded_dir_ids.insert(ix, entry.id);
-                        }
-
-                        if let Some(parent_entry) =
-                            entry.path.parent().and_then(|p| worktree.entry_for_path(p))
-                        {
-                            entry = parent_entry;
+            if let Some(worktree_handle) = project.worktree_for_id(worktree_id, cx) {
+                let dir_ids_to_expand = {
+                    let worktree = worktree_handle.read(cx);
+                    let mut dir_ids = Vec::new();
+                    if let Some(entry) = worktree.entry_for_id(entry_id) {
+                        let mut current = if entry.is_dir() {
+                            Some(entry)
                         } else {
-                            break;
+                            entry.path.parent().and_then(|p| worktree.entry_for_path(p))
+                        };
+
+                        while let Some(dir_entry) = current {
+                            if dir_entry.is_dir() {
+                                dir_ids.push(dir_entry.id);
+                            }
+                            current = dir_entry.path.parent().and_then(|p| worktree.entry_for_path(p));
                         }
                     }
+                    dir_ids
+                };
+
+                for dir_id in dir_ids_to_expand {
+                    if let Err(ix) = expanded_dir_ids.binary_search(&dir_id) {
+                        expanded_dir_ids.insert(ix, dir_id);
+                    }
+                    project.expand_entry(worktree_id, dir_id, cx);
                 }
             }
         });
@@ -8217,7 +8223,11 @@ impl ProjectPanel {
                     continue;
                 }
                 let file_name = entry_file_name(entry, root_name);
-                if let Some(indices) = find_match_indices(file_name, &query) {
+                let path_str = entry.path.to_string();
+                let match_indices = find_match_indices(file_name, &query)
+                    .or_else(|| find_match_indices(&path_str, &query));
+
+                if let Some(indices) = match_indices {
                     let selection = SelectedEntry {
                         worktree_id,
                         entry_id: entry.id,

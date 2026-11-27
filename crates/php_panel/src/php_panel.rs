@@ -4626,171 +4626,174 @@ pub fn trigger_auto_upload_on_save(abs_path: PathBuf, workspace: Option<WeakEnti
     if let Ok(mut last) = LAST_AUTO_UPLOAD.lock() {
         let now = std::time::Instant::now();
         if let Some((ref last_path, last_time)) = *last {
-            if last_path == &abs_path && now.duration_since(last_time) < std::time::Duration::from_millis(400) {
+            if last_path == &abs_path && now.duration_since(last_time) < std::time::Duration::from_millis(600) {
                 return;
             }
         }
         *last = Some((abs_path.clone(), now));
     }
-    if !cx.has_global::<DeployShared>() || cx.global::<DeployShared>().servers.is_empty() {
-        if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
-            ws.update(cx, |workspace, cx| {
-                init_workspace_deployment(workspace, cx);
-            });
-        }
+
+    cx.defer(move |cx| {
         if !cx.has_global::<DeployShared>() || cx.global::<DeployShared>().servers.is_empty() {
-            if let Some(root) = find_root_for_path(&abs_path) {
-                sync_deploy_shared_for_root(&root, cx);
+            if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
+                ws.update(cx, |workspace, cx| {
+                    init_workspace_deployment(workspace, cx);
+                });
+            }
+            if !cx.has_global::<DeployShared>() || cx.global::<DeployShared>().servers.is_empty() {
+                if let Some(root) = find_root_for_path(&abs_path) {
+                    sync_deploy_shared_for_root(&root, cx);
+                }
             }
         }
-    }
-    if !cx.has_global::<DeployShared>() {
-        return;
-    }
-    let shared = cx.global::<DeployShared>();
-    let Some(active_name) = shared.active.clone().or_else(|| shared.servers.first().cloned()) else {
-        return;
-    };
-    if !shared.auto_upload {
-        let file_display = abs_path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
-        record_transfer_log(
-            "Auto-Upload (skipped)",
-            &active_name,
-            file_display,
-            false,
-            format!("Auto-upload skipped: Automatic Upload is disabled for server '{active_name}'. Enable via status bar (⚏ ftp: {active_name}) or Tools > Deployment > Automatic Upload"),
-            cx,
-        );
-        return;
-    }
-    let Some(root) = shared.root.clone() else {
-        return;
-    };
-
-    let config_path = deploy_config_path(&root);
-    let config = load_config_object(&config_path).unwrap_or_default();
-    let servers = config.get("servers").and_then(Value::as_array);
-    let server_entry = servers.and_then(|arr| {
-        arr.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(&active_name))
-    });
-    let local_root = server_entry.and_then(|s| s.get("local_root")).and_then(Value::as_str);
-
-    let Some(rel_path) = relative_upload_path(&abs_path, &root, local_root) else {
-        return;
-    };
-
-    let server_name = active_name.clone();
-    let server_root = root.clone();
-    let file_display = Path::new(&rel_path).file_name().and_then(|f| f.to_str()).unwrap_or(&rel_path);
-    let start_msg = format!("Uploading {} to {}…", file_display, server_name);
-    set_deploy_transfer_started(start_msg.clone(), cx);
-    record_transfer_log(
-        "Auto-Upload",
-        &server_name,
-        &rel_path,
-        true,
-        format!("Uploading {rel_path} to {server_name}…"),
-        cx,
-    );
-
-    if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
-        ws.update(cx, |workspace, cx| {
-            workspace.show_toast(
-                Toast::new(
-                    NotificationId::unique::<DeployNotification>(),
-                    format!("Uploading {} to {}…", rel_path, server_name),
-                )
-                .autohide(),
+        if !cx.has_global::<DeployShared>() {
+            return;
+        }
+        let shared = cx.global::<DeployShared>();
+        let Some(active_name) = shared.active.clone().or_else(|| shared.servers.first().cloned()) else {
+            return;
+        };
+        if !shared.auto_upload {
+            let file_display = abs_path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+            record_transfer_log(
+                "Auto-Upload (skipped)",
+                &active_name,
+                file_display,
+                false,
+                format!("Auto-upload skipped: Automatic Upload is disabled for server '{active_name}'. Enable via status bar (⚏ ftp: {active_name}) or Tools > Deployment > Automatic Upload"),
                 cx,
             );
-        });
-    }
-
-    let ws_clone = workspace.clone();
-    let task_server = server_name.clone();
-    let task_server2 = server_name.clone();
-    let task_rel = rel_path.clone();
-    let task_rel2 = rel_path.clone();
-    let task: Task<Result<String, String>> = cx.background_spawn(async move {
-        let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
-        command
-            .current_dir(&server_root)
-            .arg("upload")
-            .arg("--server")
-            .arg(&task_server)
-            .arg("--path")
-            .arg(&task_rel)
-            .arg("--from")
-            .arg(&abs_path);
-        let output = command.output().await.map_err(|error| error.to_string())?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Ok(if stdout.is_empty() {
-                format!("uploaded {} to {}", task_rel, task_server)
-            } else {
-                stdout
-            })
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(if stderr.is_empty() {
-                format!("exit {}", output.status.code().unwrap_or(1))
-            } else {
-                stderr
-            })
+            return;
         }
-    });
+        let Some(root) = shared.root.clone().or_else(|| find_root_for_path(&abs_path)) else {
+            return;
+        };
 
-    cx.spawn(async move |cx| {
-        let result = task.await;
-        cx.update(|cx| match result {
-            Ok(msg) => {
-                set_deploy_transfer_finished(true, msg.clone(), cx);
-                record_transfer_log(
-                    "Auto-Upload",
-                    &task_server2,
-                    &task_rel2,
-                    true,
-                    msg.clone(),
+        let config_path = deploy_config_path(&root);
+        let config = load_config_object(&config_path).unwrap_or_default();
+        let servers = config.get("servers").and_then(Value::as_array);
+        let server_entry = servers.and_then(|arr| {
+            arr.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(&active_name))
+        });
+        let local_root = server_entry.and_then(|s| s.get("local_root")).and_then(Value::as_str);
+
+        let Some(rel_path) = relative_upload_path(&abs_path, &root, local_root) else {
+            return;
+        };
+
+        let server_name = active_name.clone();
+        let server_root = root.clone();
+        let file_display = Path::new(&rel_path).file_name().and_then(|f| f.to_str()).unwrap_or(&rel_path);
+        let start_msg = format!("Uploading {} to {}…", file_display, server_name);
+        set_deploy_transfer_started(start_msg.clone(), cx);
+        record_transfer_log(
+            "Auto-Upload",
+            &server_name,
+            &rel_path,
+            true,
+            format!("Uploading {rel_path} to {server_name}…"),
+            cx,
+        );
+
+        if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
+            ws.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<DeployNotification>(),
+                        format!("Uploading {} to {}…", rel_path, server_name),
+                    )
+                    .autohide(),
                     cx,
                 );
-                if let Some(ws) = ws_clone.and_then(|w| w.upgrade()) {
-                    ws.update(cx, |workspace, cx| {
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<DeployNotification>(),
-                                msg,
-                            )
-                            .autohide(),
-                            cx,
-                        );
-                    });
-                }
-            }
-            Err(err) => {
-                set_deploy_transfer_finished(false, format!("Auto-upload failed: {err}"), cx);
-                record_transfer_log(
-                    "Auto-Upload (failed)",
-                    &task_server2,
-                    &task_rel2,
-                    false,
-                    format!("Auto-upload failed: {err}"),
-                    cx,
-                );
-                if let Some(ws) = ws_clone.and_then(|w| w.upgrade()) {
-                    ws.update(cx, |workspace, cx| {
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<DeployNotification>(),
-                                format!("Auto-upload to {} failed: {}", task_server2, err),
-                            ),
-                            cx,
-                        );
-                    });
-                }
+            });
+        }
+
+        let ws_clone = workspace.clone();
+        let task_server = server_name.clone();
+        let task_server2 = server_name.clone();
+        let task_rel = rel_path.clone();
+        let task_rel2 = rel_path.clone();
+        let task: Task<Result<String, String>> = cx.background_spawn(async move {
+            let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
+            command
+                .current_dir(&server_root)
+                .arg("upload")
+                .arg("--server")
+                .arg(&task_server)
+                .arg("--path")
+                .arg(&task_rel)
+                .arg("--from")
+                .arg(&abs_path);
+            let output = command.output().await.map_err(|error| error.to_string())?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(if stdout.is_empty() {
+                    format!("uploaded {} to {}", task_rel, task_server)
+                } else {
+                    stdout
+                })
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(if stderr.is_empty() {
+                    format!("exit {}", output.status.code().unwrap_or(1))
+                } else {
+                    stderr
+                })
             }
         });
-    })
-    .detach();
+
+        cx.spawn(async move |cx| {
+            let result = task.await;
+            cx.update(|cx| match result {
+                Ok(msg) => {
+                    set_deploy_transfer_finished(true, msg.clone(), cx);
+                    record_transfer_log(
+                        "Auto-Upload",
+                        &task_server2,
+                        &task_rel2,
+                        true,
+                        msg.clone(),
+                        cx,
+                    );
+                    if let Some(ws) = ws_clone.and_then(|w| w.upgrade()) {
+                        ws.update(cx, |workspace, cx| {
+                            workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::unique::<DeployNotification>(),
+                                    msg,
+                                )
+                                .autohide(),
+                                cx,
+                            );
+                        });
+                    }
+                }
+                Err(err) => {
+                    set_deploy_transfer_finished(false, format!("Auto-upload failed: {err}"), cx);
+                    record_transfer_log(
+                        "Auto-Upload (failed)",
+                        &task_server2,
+                        &task_rel2,
+                        false,
+                        format!("Auto-upload failed: {err}"),
+                        cx,
+                    );
+                    if let Some(ws) = ws_clone.and_then(|w| w.upgrade()) {
+                        ws.update(cx, |workspace, cx| {
+                            workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::unique::<DeployNotification>(),
+                                    format!("Auto-upload to {} failed: {}", task_server2, err),
+                                ),
+                                cx,
+                            );
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
+    });
 }
 
 pub fn find_root_for_path(path: &Path) -> Option<PathBuf> {
@@ -13057,13 +13060,13 @@ impl PhpPanel {
 
             let ws_weak = workspace.weak_handle();
             let ws_weak_user_save = ws_weak.clone();
-            cx.subscribe_self(move |workspace, event: &workspace::Event, cx| {
+            cx.subscribe_self(move |_workspace, event: &workspace::Event, cx| {
                 if let workspace::Event::UserSavedItem { item, .. } = event {
                     if let Some(item_handle) = item.upgrade() {
                         let abs_path = if let Some(diff_view) = item_handle.act_as::<git_ui_core::file_diff_view::FileDiffView>(cx) {
                             diff_view.read(cx).new_buffer().read(cx).file().and_then(|f| f.file_system_abs_path(cx))
                         } else if let Some(editor) = item_handle.act_as::<Editor>(cx) {
-                            editor.update(cx, |editor, cx| editor.target_file_abs_path(cx))
+                            editor.read(cx).target_file_abs_path(cx)
                                 .or_else(|| {
                                     editor.read(cx).active_buffer(cx).and_then(|b| {
                                         b.read(cx).file().and_then(|f| f.file_system_abs_path(cx))
@@ -13071,12 +13074,15 @@ impl PhpPanel {
                                 })
                                 .or_else(|| {
                                     item_handle.project_path(cx).and_then(|pp| {
-                                        workspace.project().read(cx).absolute_path(&pp, cx)
+                                        ws_weak_user_save.upgrade().and_then(|ws| {
+                                            ws.read(cx).project().read(cx).absolute_path(&pp, cx)
+                                        })
                                     })
                                 })
                         } else if let Some(project_path) = item_handle.project_path(cx) {
-                            let project = workspace.project().read(cx);
-                            project.absolute_path(&project_path, cx)
+                            ws_weak_user_save.upgrade().and_then(|ws| {
+                                ws.read(cx).project().read(cx).absolute_path(&project_path, cx)
+                            })
                         } else {
                             None
                         };
@@ -13099,7 +13105,6 @@ impl PhpPanel {
                         if matches!(event, language::BufferEvent::Saved) {
                             let abs_path = if let Some(file) = buffer.read(cx).file() {
                                 file.file_system_abs_path(cx)
-                                    .or_else(|| worktree::File::from_dyn(Some(file)).map(|f| f.worktree.read(cx).absolutize(&f.path)))
                                     .or_else(|| {
                                         let full = file.full_path(cx);
                                         if full.is_absolute() { Some(full) } else { None }
@@ -13952,7 +13957,8 @@ impl PhpPanel {
                             if let Some(item_handle) = item.upgrade() {
                                 if let Some(editor) = item_handle.act_as::<Editor>(cx) {
                                     if let Some(abs_path) = editor
-                                        .update(cx, |editor, cx| editor.target_file_abs_path(cx))
+                                        .read(cx)
+                                        .target_file_abs_path(cx)
                                     {
                                         panel.maybe_upload_saved_local_file(abs_path, cx);
                                     }
@@ -17390,97 +17396,7 @@ impl PhpPanel {
     }
 
     fn maybe_upload_saved_local_file(&mut self, abs_path: PathBuf, cx: &mut Context<Self>) {
-        // Remote temp files opened from the Remote Host tree auto-upload via RemoteFileBanner.
-        if remote_file_banner::parse_remote_path(&abs_path).is_some() {
-            return;
-        }
-        if self.remote_servers.is_empty() {
-            self.refresh(cx);
-        }
-        let shared_active = cx
-            .try_global::<DeployShared>()
-            .and_then(|shared| shared.active.clone());
-        let selected_name = shared_active.or_else(|| self.active_server.clone());
-        let server = selected_name
-            .as_deref()
-            .and_then(|name| self.remote_servers.iter().find(|s| s.name == name))
-            .or_else(|| self.remote_servers.first())
-            .cloned();
-        let Some(server) = server else {
-            return;
-        };
-        if !server.upload_on_save {
-            return;
-        }
-        let Some(rel_path) =
-            relative_upload_path(&abs_path, &server.root, server.local_root.as_deref())
-        else {
-            return;
-        };
-
-        let server_name = server.name.clone();
-        let server_root = server.root.clone();
-        self.sync_status
-            .insert(server_name.clone(), SyncStatus::Syncing);
-        let start_msg = format!("uploading {} to {}…", rel_path, server_name);
-        set_deploy_transfer_started(start_msg.clone(), cx);
-        self.saved_message = Some(start_msg);
-        cx.notify();
-
-        let task_server = server_name.clone();
-        let task_rel = rel_path.clone();
-        let task: Task<Result<String, String>> = cx.background_spawn(async move {
-            let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
-            command
-                .current_dir(&server_root)
-                .arg("upload")
-                .arg("--server")
-                .arg(&task_server)
-                .arg("--path")
-                .arg(&task_rel)
-                .arg("--from")
-                .arg(&abs_path);
-            let output = command.output().await.map_err(|error| error.to_string())?;
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                Ok(if stdout.is_empty() {
-                    format!("uploaded {} to {}", task_rel, task_server)
-                } else {
-                    stdout
-                })
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                Err(if stderr.is_empty() {
-                    format!("exit {}", output.status.code().unwrap_or(1))
-                } else {
-                    stderr
-                })
-            }
-        });
-
-        cx.spawn(async move |panel, cx| {
-            let result = task.await;
-            panel
-                .update(cx, |panel, cx| {
-                    match &result {
-                        Ok(msg) => {
-                            panel.sync_status.insert(server_name.clone(), SyncStatus::Ok);
-                            panel.saved_message = Some(msg.clone());
-                            set_deploy_transfer_finished(true, msg.clone(), cx);
-                        }
-                        Err(err) => {
-                            panel
-                                .sync_status
-                                .insert(server_name.clone(), SyncStatus::Failed(err.clone()));
-                            panel.saved_message = Some(format!("auto-upload failed: {err}"));
-                            set_deploy_transfer_finished(false, format!("Auto-upload failed: {err}"), cx);
-                        }
-                    }
-                    cx.notify();
-                })
-                .log_err();
-        })
-        .detach();
+        trigger_auto_upload_on_save(abs_path, Some(self.workspace.clone()), cx);
     }
 
     fn run_server_check(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
